@@ -12,6 +12,9 @@ import {
 } from "@prood/application";
 import { MCP_REQUIRED_WHOAMI_SCOPE } from "@prood/contracts";
 
+const DEFAULT_SESSION_IDLE_TTL_MS = 30 * 60 * 1000;
+const DEFAULT_MAX_ACTIVE_SESSIONS = 1000;
+
 export interface ProodMcpServerDeps {
   resource: string;
   tokenVerifier: McpTokenVerifier;
@@ -19,9 +22,18 @@ export interface ProodMcpServerDeps {
   idGenerator: IdGenerator;
   clock: Clock;
   onWhoamiExecuted?: () => void;
+  sessionIdleTtlMs?: number;
+  maxActiveSessions?: number;
 }
 
 type ProodMcpSessionAuth = McpVerifiedToken & Record<string, unknown>;
+
+interface ActiveSessionEntry {
+  transport: WebStreamableHTTPServerTransport;
+  session: FastMCPSession<ProodMcpSessionAuth>;
+  lastActivityAtMs: number;
+  tokenExpiresAtMs: number;
+}
 
 function buildUnauthorizedResponse(
   status: 401 | 403,
@@ -57,7 +69,7 @@ function buildUnauthorizedResponse(
 
 /**
  * Creates a FastMCP server exposing Prood tools over Web-Standard Streamable HTTP,
- * verifying OAuth bearer tokens and per-tool scopes on every request.
+ * verifying OAuth bearer tokens, per-tool scopes, and bounded session retention.
  */
 export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
   const identityUseCase = createMcpIdentityUseCase({
@@ -65,6 +77,15 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
     idGenerator: deps.idGenerator,
     clock: deps.clock,
   });
+
+  const sessionIdleTtlMs = Math.max(
+    1,
+    Math.trunc(deps.sessionIdleTtlMs ?? DEFAULT_SESSION_IDLE_TTL_MS),
+  );
+  const maxActiveSessions = Math.max(
+    1,
+    Math.trunc(deps.maxActiveSessions ?? DEFAULT_MAX_ACTIVE_SESSIONS),
+  );
 
   const resourceUrl = new URL(deps.resource);
   const resourceMetadataUrl = `${resourceUrl.origin}/.well-known/oauth-protected-resource`;
@@ -104,13 +125,62 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
     },
   });
 
-  const activeSessions = new Map<
-    string,
-    {
-      transport: WebStreamableHTTPServerTransport;
-      session: FastMCPSession<ProodMcpSessionAuth>;
+  const activeSessions = new Map<string, ActiveSessionEntry>();
+
+  async function closeSessionEntry(entry: ActiveSessionEntry): Promise<void> {
+    await Promise.allSettled([entry.session.close(), entry.transport.close()]);
+  }
+
+  function collectEvictions(
+    nowMs: number,
+    maxAllowed: number,
+  ): ActiveSessionEntry[] {
+    const evicted: ActiveSessionEntry[] = [];
+    for (const [sid, entry] of activeSessions) {
+      const idleExpired = nowMs - entry.lastActivityAtMs >= sessionIdleTtlMs;
+      const tokenExpired =
+        entry.tokenExpiresAtMs > 0 && nowMs >= entry.tokenExpiresAtMs;
+      if (idleExpired || tokenExpired) {
+        activeSessions.delete(sid);
+        evicted.push(entry);
+      }
     }
-  >();
+    while (activeSessions.size > maxAllowed) {
+      const oldest = activeSessions.entries().next().value;
+      if (!oldest) {
+        break;
+      }
+      const [oldestId, oldestEntry] = oldest;
+      activeSessions.delete(oldestId);
+      evicted.push(oldestEntry);
+    }
+    return evicted;
+  }
+
+  async function evictSessions(
+    nowMs: number,
+    reserveSlotForNew = false,
+  ): Promise<void> {
+    const maxAllowed = reserveSlotForNew
+      ? Math.max(0, maxActiveSessions - 1)
+      : maxActiveSessions;
+    const evicted = collectEvictions(nowMs, maxAllowed);
+    if (evicted.length > 0) {
+      await Promise.allSettled(evicted.map(closeSessionEntry));
+    }
+  }
+
+  function touchSession(
+    sessionId: string,
+    entry: ActiveSessionEntry,
+    nowMs: number,
+    token: McpVerifiedToken,
+  ): void {
+    entry.lastActivityAtMs = nowMs;
+    entry.tokenExpiresAtMs = token.expiresAt > 0 ? token.expiresAt * 1000 : 0;
+    activeSessions.delete(sessionId);
+    activeSessions.set(sessionId, entry);
+  }
 
   function checkSessionScopes(
     session: FastMCPSession<ProodMcpSessionAuth>,
@@ -135,6 +205,9 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
 
   return {
     async handleRequest(request: Request): Promise<Response> {
+      const nowMs = deps.clock.now().getTime();
+      await evictSessions(nowMs);
+
       const authResult = await deps.tokenVerifier.verifyBearerToken(
         request.headers,
       );
@@ -181,6 +254,7 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
               { status: 404, headers: { "content-type": "application/json" } },
             );
           }
+          touchSession(sessionId, existing, nowMs, authResult.token);
           existing.session.updateAuth(sessionAuth);
           const scopeError = checkSessionScopes(existing.session, parsedBody);
           if (scopeError) {
@@ -189,15 +263,30 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
           return existing.transport.handleRequest(request, parsedBody);
         }
 
+        await evictSessions(nowMs, true);
+
         let connectedSession: FastMCPSession<ProodMcpSessionAuth> | undefined;
         const transport = new WebStreamableHTTPServerTransport({
           sessionIdGenerator: () => globalThis.crypto.randomUUID(),
           enableJsonResponse: true,
           onsessioninitialized: (newSessionId) => {
+            const callbackNowMs = deps.clock.now().getTime();
+            const overflow = collectEvictions(
+              callbackNowMs,
+              Math.max(0, maxActiveSessions - 1),
+            );
+            for (const entry of overflow) {
+              void closeSessionEntry(entry);
+            }
             if (connectedSession) {
               activeSessions.set(newSessionId, {
                 transport,
                 session: connectedSession,
+                lastActivityAtMs: callbackNowMs,
+                tokenExpiresAtMs:
+                  authResult.token.expiresAt > 0
+                    ? authResult.token.expiresAt * 1000
+                    : 0,
               });
             }
           },
@@ -238,6 +327,7 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
         );
       }
 
+      touchSession(sessionId, existing, nowMs, authResult.token);
       existing.session.updateAuth(sessionAuth);
       return existing.transport.handleRequest(request);
     },
