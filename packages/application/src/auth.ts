@@ -85,6 +85,15 @@ export function createIdentityUseCases(deps: IdentityUseCaseDeps) {
 
           if (user) {
             if (session.emailVerified !== true) {
+              // Under READ COMMITTED, a concurrent request for this exact identity
+              // may have committed both users + auth_identities after our first lookup.
+              const linkedIdentity = await repos.users.findByAuthIdentity(
+                session.authProvider,
+                session.authSubject,
+              );
+              if (linkedIdentity) {
+                return linkedIdentity;
+              }
               throw new EmailVerificationRequiredError(email);
             }
           } else {

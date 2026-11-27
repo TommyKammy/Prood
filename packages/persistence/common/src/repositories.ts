@@ -2,23 +2,31 @@ import { sql, type Kysely, type Transaction } from "kysely";
 import type {
   AppendOutboxEventInput,
   AuthIdentityRecord,
+  CreateIssueKeyNamespaceInput,
   CreateMembershipInput,
   CreateProjectInput,
   CreateProjectStatusInput,
   CreateTaskInput,
+  CreateTaskIssueKeyInput,
   CreateUserInput,
   CreateWorkspaceInput,
+  IssueKeyNamespaceRecord,
+  IssueKeyPrefixRecord,
+  IssueKeyRepository,
   LinkAuthIdentityInput,
   OutboxEventRecord,
   OutboxRepository,
+  PatchWorkspaceSettingsInput,
   ProjectMembershipRecord,
   ProjectRecord,
   ProjectRepository,
   ProjectStatusRecord,
   ProjectStatusRepository,
+  TaskIssueKeyView,
   TaskRecord,
   TaskRepository,
   TransactionRepositories,
+  UpdateIssueKeyNamespaceInput,
   UpdateTaskInput,
   UpsertProjectMembershipInput,
   UpsertWorkspaceSettingsInput,
@@ -31,8 +39,9 @@ import type {
   WorkspaceSettingsRecord,
   WorkspaceSettingsRepository,
 } from "@prood/application";
-import type { WorkspaceMembershipSummary } from "@prood/contracts";
+import type { DbDriverKind, WorkspaceMembershipSummary } from "@prood/contracts";
 import {
+  DEFAULT_LOCALE,
   normalizeEmail,
   type ActorType,
   type EventChannel,
@@ -40,6 +49,7 @@ import {
   type EventOutcome,
   type LocaleCode,
   type MembershipId,
+  type NamespaceId,
   type OutboxId,
   type ProjectId,
   type ProjectKind,
@@ -54,6 +64,8 @@ import {
 } from "@prood/domain";
 import type {
   AuthIdentityTable,
+  IssueKeyNamespaceTable,
+  IssueKeyPrefixTable,
   OutboxEventTable,
   ProodDatabase,
   ProjectMembershipTable,
@@ -219,9 +231,38 @@ function toOutboxEventRecord(row: OutboxEventTable): OutboxEventRecord {
   };
 }
 
+function toIssueKeyNamespaceRecord(
+  row: IssueKeyNamespaceTable,
+): IssueKeyNamespaceRecord {
+  return {
+    id: row.id as NamespaceId,
+    workspaceId: row.workspace_id as WorkspaceId,
+    projectId: row.project_id as ProjectId | null,
+    currentPrefix: row.current_prefix,
+    branchPrefix: row.branch_prefix,
+    startStatusId: row.start_status_id as StatusId | null,
+    enabledBy: row.enabled_by as UserId | null,
+    enabledAt: row.enabled_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toIssueKeyPrefixRecord(
+  row: IssueKeyPrefixTable,
+): IssueKeyPrefixRecord {
+  return {
+    workspaceId: row.workspace_id as WorkspaceId,
+    prefix: row.prefix,
+    namespaceId: row.namespace_id as NamespaceId,
+    createdAt: row.created_at,
+  };
+}
+
 function normalizeSlug(slug: string): string {
   return slug.trim().toLowerCase();
 }
+
+const IN_CLAUSE_BATCH_SIZE = 200;
 
 async function runQuery<T>(
   fn: () => Promise<T>,
@@ -243,7 +284,7 @@ export function createKyselyRepositories(
   executor: DbExecutor,
   mapError: (error: unknown) => never,
   assertActive?: () => void,
-  postgres = false,
+  driver: DbDriverKind = "sqlite",
 ): TransactionRepositories {
   const workspaces: WorkspaceRepository = {
     async create(input: CreateWorkspaceInput): Promise<WorkspaceRecord> {
@@ -338,6 +379,44 @@ export function createKyselyRepositories(
                 dev_projects_enabled: enabledInt,
                 updated_at: input.updatedAt,
               }),
+            )
+            .returningAll()
+            .executeTakeFirstOrThrow(),
+        mapError,
+        assertActive,
+      );
+      return toWorkspaceSettingsRecord(row);
+    },
+
+    async patch(
+      input: PatchWorkspaceSettingsInput,
+    ): Promise<WorkspaceSettingsRecord> {
+      const updatePatch: {
+        updated_at: string;
+        default_locale?: string;
+        dev_projects_enabled?: number;
+      } = {
+        updated_at: input.updatedAt,
+      };
+      if (input.defaultLocale !== undefined) {
+        updatePatch.default_locale = input.defaultLocale;
+      }
+      if (input.devProjectsEnabled !== undefined) {
+        updatePatch.dev_projects_enabled = input.devProjectsEnabled ? 1 : 0;
+      }
+
+      const row = await runQuery(
+        () =>
+          executor
+            .insertInto("workspace_settings")
+            .values({
+              workspace_id: input.workspaceId,
+              default_locale: input.defaultLocale ?? DEFAULT_LOCALE,
+              dev_projects_enabled: input.devProjectsEnabled ? 1 : 0,
+              updated_at: input.updatedAt,
+            })
+            .onConflict((oc) =>
+              oc.column("workspace_id").doUpdateSet(updatePatch),
             )
             .returningAll()
             .executeTakeFirstOrThrow(),
@@ -582,6 +661,64 @@ export function createKyselyRepositories(
       return row ? toProjectRecord(row) : null;
     },
 
+    async findByIdForUpdate(id: ProjectId): Promise<ProjectRecord | null> {
+      const row = await runQuery(
+        () => {
+          let query = executor
+            .selectFrom("projects")
+            .selectAll()
+            .where("id", "=", id)
+            .where("archived_at", "is", null);
+          if (driver === "postgres") {
+            query = query.forUpdate();
+          }
+          return query.executeTakeFirst();
+        },
+        mapError,
+        assertActive,
+      );
+      return row ? toProjectRecord(row) : null;
+    },
+
+    async lockForTaskWrite(id: ProjectId): Promise<boolean> {
+      const row = await runQuery(
+        () => {
+          let query = executor
+            .selectFrom("projects")
+            .select("id")
+            .where("id", "=", id)
+            .where("archived_at", "is", null);
+          if (driver === "postgres") {
+            query = query.forKeyShare();
+          }
+          return query.executeTakeFirst();
+        },
+        mapError,
+        assertActive,
+      );
+      return row !== undefined;
+    },
+
+    async updateKind(
+      id: ProjectId,
+      kind: ProjectKind,
+      updatedAt: string,
+    ): Promise<ProjectRecord | null> {
+      const row = await runQuery(
+        () =>
+          executor
+            .updateTable("projects")
+            .set({ kind, updated_at: updatedAt })
+            .where("id", "=", id)
+            .where("archived_at", "is", null)
+            .returningAll()
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return row ? toProjectRecord(row) : null;
+    },
+
     async listByWorkspace(workspaceId: WorkspaceId): Promise<ProjectRecord[]> {
       const rows = await runQuery(
         () =>
@@ -740,7 +877,7 @@ export function createKyselyRepositories(
             .selectFrom("tasks")
             .selectAll()
             .where("id", "=", id)
-            .$if(postgres && forUpdate, q=>q.forUpdate())
+            .$if(driver === "postgres" && forUpdate, q=>q.forUpdate())
             .executeTakeFirst(),
         mapError,
         assertActive,
@@ -871,6 +1008,387 @@ export function createKyselyRepositories(
         assertActive,
       );
       return row ? toTaskRecord(row) : null;
+    },
+
+    async deleteById(id: TaskPublicId): Promise<boolean> {
+      const row = await runQuery(
+        () =>
+          executor
+            .deleteFrom("tasks")
+            .where("id", "=", id)
+            .returning("id")
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return row !== undefined;
+    },
+  };
+
+  const issueKeys: IssueKeyRepository = {
+    async createNamespace(
+      input: CreateIssueKeyNamespaceInput,
+    ): Promise<IssueKeyNamespaceRecord> {
+      const row = await runQuery(
+        () =>
+          executor
+            .insertInto("issue_key_namespaces")
+            .values({
+              id: input.id,
+              workspace_id: input.workspaceId,
+              project_id: input.projectId,
+              current_prefix: input.currentPrefix,
+              branch_prefix: input.branchPrefix,
+              start_status_id: input.startStatusId,
+              enabled_by: input.enabledBy,
+              enabled_at: input.enabledAt,
+              updated_at: input.enabledAt,
+            })
+            .returningAll()
+            .executeTakeFirstOrThrow(),
+        mapError,
+        assertActive,
+      );
+      return toIssueKeyNamespaceRecord(row);
+    },
+
+    async findNamespaceByProjectId(
+      projectId: ProjectId,
+    ): Promise<IssueKeyNamespaceRecord | null> {
+      const row = await runQuery(
+        () =>
+          executor
+            .selectFrom("issue_key_namespaces")
+            .selectAll()
+            .where("project_id", "=", projectId)
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return row ? toIssueKeyNamespaceRecord(row) : null;
+    },
+
+    async findNamespaceByProjectIdForUpdate(
+      projectId: ProjectId,
+    ): Promise<IssueKeyNamespaceRecord | null> {
+      const row = await runQuery(
+        () => {
+          let query = executor
+            .selectFrom("issue_key_namespaces")
+            .selectAll()
+            .where("project_id", "=", projectId);
+          if (driver === "postgres") {
+            query = query.forUpdate();
+          }
+          return query.executeTakeFirst();
+        },
+        mapError,
+        assertActive,
+      );
+      return row ? toIssueKeyNamespaceRecord(row) : null;
+    },
+
+    async findNamespacesByProjectIds(
+      projectIds: readonly ProjectId[],
+    ): Promise<IssueKeyNamespaceRecord[]> {
+      const uniqueIds = Array.from(new Set(projectIds));
+      if (uniqueIds.length === 0) {
+        return [];
+      }
+      const results: IssueKeyNamespaceRecord[] = [];
+      for (let i = 0; i < uniqueIds.length; i += IN_CLAUSE_BATCH_SIZE) {
+        const chunk = uniqueIds.slice(i, i + IN_CLAUSE_BATCH_SIZE);
+        const rows = await runQuery(
+          () =>
+            executor
+              .selectFrom("issue_key_namespaces")
+              .selectAll()
+              .where("project_id", "in", chunk)
+              .execute(),
+          mapError,
+          assertActive,
+        );
+        for (const row of rows) {
+          results.push(toIssueKeyNamespaceRecord(row));
+        }
+      }
+      return results;
+    },
+
+    async updateNamespace(
+      id: NamespaceId,
+      input: UpdateIssueKeyNamespaceInput,
+    ): Promise<IssueKeyNamespaceRecord | null> {
+      const patch: Record<string, unknown> = {
+        updated_at: input.updatedAt,
+      };
+      if (input.currentPrefix !== undefined) {
+        patch.current_prefix = input.currentPrefix;
+      }
+      if (input.startStatusId !== undefined) {
+        patch.start_status_id = input.startStatusId;
+      }
+      const row = await runQuery(
+        () =>
+          executor
+            .updateTable("issue_key_namespaces")
+            .set(patch)
+            .where("id", "=", id)
+            .returningAll()
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return row ? toIssueKeyNamespaceRecord(row) : null;
+    },
+
+    async listPrefixesByNamespace(
+      namespaceId: NamespaceId,
+    ): Promise<IssueKeyPrefixRecord[]> {
+      const rows = await runQuery(
+        () =>
+          executor
+            .selectFrom("issue_key_prefixes")
+            .selectAll()
+            .where("namespace_id", "=", namespaceId)
+            .orderBy("created_at", "asc")
+            .orderBy("prefix", "asc")
+            .execute(),
+        mapError,
+        assertActive,
+      );
+      return rows.map(toIssueKeyPrefixRecord);
+    },
+
+    async listPrefixesByNamespaceIds(
+      namespaceIds: readonly NamespaceId[],
+    ): Promise<IssueKeyPrefixRecord[]> {
+      const uniqueIds = Array.from(new Set(namespaceIds));
+      if (uniqueIds.length === 0) {
+        return [];
+      }
+      const results: IssueKeyPrefixRecord[] = [];
+      let chunkCount = 0;
+      for (let i = 0; i < uniqueIds.length; i += IN_CLAUSE_BATCH_SIZE) {
+        const chunk = uniqueIds.slice(i, i + IN_CLAUSE_BATCH_SIZE);
+        chunkCount += 1;
+        const rows = await runQuery(
+          () =>
+            executor
+              .selectFrom("issue_key_prefixes")
+              .selectAll()
+              .where("namespace_id", "in", chunk)
+              .orderBy("created_at", "asc")
+              .orderBy("prefix", "asc")
+              .execute(),
+          mapError,
+          assertActive,
+        );
+        for (const row of rows) {
+          results.push(toIssueKeyPrefixRecord(row));
+        }
+      }
+      if (chunkCount > 1) {
+        results.sort((a, b) => {
+          if (a.createdAt !== b.createdAt) {
+            return a.createdAt < b.createdAt ? -1 : 1;
+          }
+          if (a.prefix !== b.prefix) {
+            return a.prefix < b.prefix ? -1 : 1;
+          }
+          return 0;
+        });
+      }
+      return results;
+    },
+
+    async findPrefixOwner(
+      workspaceId: WorkspaceId,
+      prefix: string,
+    ): Promise<IssueKeyPrefixRecord | null> {
+      const row = await runQuery(
+        () =>
+          executor
+            .selectFrom("issue_key_prefixes")
+            .selectAll()
+            .where("workspace_id", "=", workspaceId)
+            .where("prefix", "=", prefix)
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return row ? toIssueKeyPrefixRecord(row) : null;
+    },
+
+    async reservePrefix(
+      input: IssueKeyPrefixRecord,
+    ): Promise<IssueKeyPrefixRecord | null> {
+      const row = await runQuery(
+        () =>
+          executor
+            .insertInto("issue_key_prefixes")
+            .values({
+              workspace_id: input.workspaceId,
+              prefix: input.prefix,
+              namespace_id: input.namespaceId,
+              created_at: input.createdAt,
+            })
+            .onConflict((oc) =>
+              oc.columns(["workspace_id", "prefix"]).doNothing(),
+            )
+            .returningAll()
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return row ? toIssueKeyPrefixRecord(row) : null;
+    },
+
+    async initCounter(
+      namespaceId: NamespaceId,
+      nextNumber: number,
+    ): Promise<void> {
+      await runQuery(
+        () =>
+          executor
+            .insertInto("issue_key_counters")
+            .values({
+              namespace_id: namespaceId,
+              next_number: nextNumber,
+            })
+            .execute(),
+        mapError,
+        assertActive,
+      );
+    },
+
+    async allocateNextNumber(namespaceId: NamespaceId): Promise<number> {
+      const row = await runQuery(
+        () =>
+          executor
+            .updateTable("issue_key_counters")
+            .set((eb) => ({
+              next_number: eb("next_number", "+", 1),
+            }))
+            .where("namespace_id", "=", namespaceId)
+            .returning("next_number")
+            .executeTakeFirstOrThrow(),
+        mapError,
+        assertActive,
+      );
+      return Number(row.next_number) - 1;
+    },
+
+    async createTaskKeys(
+      entries: readonly CreateTaskIssueKeyInput[],
+    ): Promise<void> {
+      if (entries.length === 0) {
+        return;
+      }
+      const INSERT_BATCH_SIZE = 150;
+      for (let i = 0; i < entries.length; i += INSERT_BATCH_SIZE) {
+        const chunk = entries.slice(i, i + INSERT_BATCH_SIZE);
+        await runQuery(
+          () =>
+            executor
+              .insertInto("task_issue_keys")
+              .values(
+                chunk.map((entry) => ({
+                  task_id: entry.taskId,
+                  namespace_id: entry.namespaceId,
+                  issue_number: entry.issueNumber,
+                  created_at: entry.createdAt,
+                })),
+              )
+              .execute(),
+          mapError,
+          assertActive,
+        );
+      }
+    },
+
+    async findByTaskId(
+      taskId: TaskPublicId,
+    ): Promise<TaskIssueKeyView | null> {
+      const row = await runQuery(
+        () =>
+          executor
+            .selectFrom("task_issue_keys")
+            .innerJoin(
+              "issue_key_namespaces",
+              "issue_key_namespaces.id",
+              "task_issue_keys.namespace_id",
+            )
+            .select([
+              "task_issue_keys.task_id",
+              "task_issue_keys.namespace_id",
+              "task_issue_keys.issue_number",
+              "issue_key_namespaces.current_prefix",
+              "issue_key_namespaces.branch_prefix",
+              "task_issue_keys.created_at",
+            ])
+            .where("task_issue_keys.task_id", "=", taskId)
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return row
+        ? {
+            taskId: row.task_id as TaskPublicId,
+            namespaceId: row.namespace_id as NamespaceId,
+            issueNumber: Number(row.issue_number),
+            currentPrefix: row.current_prefix,
+            branchPrefix: row.branch_prefix,
+            createdAt: row.created_at,
+          }
+        : null;
+    },
+
+    async findByTaskIds(
+      taskIds: readonly TaskPublicId[],
+    ): Promise<Map<TaskPublicId, TaskIssueKeyView>> {
+      const result = new Map<TaskPublicId, TaskIssueKeyView>();
+      const uniqueIds = Array.from(new Set(taskIds));
+      if (uniqueIds.length === 0) {
+        return result;
+      }
+      for (let i = 0; i < uniqueIds.length; i += IN_CLAUSE_BATCH_SIZE) {
+        const chunk = uniqueIds.slice(i, i + IN_CLAUSE_BATCH_SIZE);
+        const rows = await runQuery(
+          () =>
+            executor
+              .selectFrom("task_issue_keys")
+              .innerJoin(
+                "issue_key_namespaces",
+                "issue_key_namespaces.id",
+                "task_issue_keys.namespace_id",
+              )
+              .select([
+                "task_issue_keys.task_id",
+                "task_issue_keys.namespace_id",
+                "task_issue_keys.issue_number",
+                "issue_key_namespaces.current_prefix",
+                "issue_key_namespaces.branch_prefix",
+                "task_issue_keys.created_at",
+              ])
+              .where("task_issue_keys.task_id", "in", chunk)
+              .execute(),
+          mapError,
+          assertActive,
+        );
+        for (const row of rows) {
+          const taskId = row.task_id as TaskPublicId;
+          result.set(taskId, {
+            taskId,
+            namespaceId: row.namespace_id as NamespaceId,
+            issueNumber: Number(row.issue_number),
+            currentPrefix: row.current_prefix,
+            branchPrefix: row.branch_prefix,
+            createdAt: row.created_at,
+          });
+        }
+      }
+      return result;
     },
   };
 
@@ -1042,7 +1560,7 @@ export function createKyselyRepositories(
             .orderBy("event")
             .orderBy("rule")
             .limit(1)
-            .$if(postgres, (q) => q.forUpdate().skipLocked())
+            .$if(driver === "postgres", (q) => q.forUpdate().skipLocked())
             .executeTakeFirst(),
         mapError,
         assertActive,
@@ -1125,6 +1643,7 @@ export function createKyselyRepositories(
   };
   return {
     automation,
+    driver,
     workspaces,
     workspaceSettings,
     users,
@@ -1132,6 +1651,7 @@ export function createKyselyRepositories(
     projects,
     statuses,
     tasks,
+    issueKeys,
     outbox,
   };
 }

@@ -5,6 +5,7 @@ import type {
   EventOutcome,
   LocaleCode,
   MembershipId,
+  NamespaceId,
   OutboxId,
   ProjectId,
   ProjectKind,
@@ -99,6 +100,17 @@ export interface ProjectStatusDto {
   position: number;
 }
 
+export interface DevProjectSettingsDto {
+  namespaceId: NamespaceId;
+  projectId: ProjectId;
+  prefix: string;
+  branchPrefix: string;
+  startStatusId: StatusId | null;
+  oldPrefixes: string[];
+  enabledAt: string;
+  updatedAt: string;
+}
+
 export interface ProjectDto {
   id: ProjectId;
   workspaceId: WorkspaceId;
@@ -107,8 +119,50 @@ export interface ProjectDto {
   name: string;
   description: string;
   statuses: ProjectStatusDto[];
+  devSettings: DevProjectSettingsDto | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface WorkspaceSettingsDto {
+  workspaceId: WorkspaceId;
+  defaultLocale: LocaleCode;
+  devProjectsEnabled: boolean;
+  updatedAt: string;
+}
+
+export interface WorkspaceSettingsResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  settings: WorkspaceSettingsDto;
+}
+
+export interface UpdateWorkspaceSettingsRequest {
+  devProjectsEnabled?: boolean;
+  defaultLocale?: LocaleCode;
+}
+
+export interface ProjectDevSettingsResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  allowed: boolean;
+  dev: DevProjectSettingsDto | null;
+  statuses: ProjectStatusDto[];
+}
+
+export interface EnableDevProjectRequest {
+  prefix: string;
+  startStatusId?: StatusId | null;
+}
+
+export interface EnableDevProjectResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  allowed: boolean;
+  dev: DevProjectSettingsDto;
+  keyedCount: number;
+}
+
+export interface UpdateDevProjectSettingsRequest {
+  prefix?: string;
+  startStatusId?: StatusId | null;
 }
 
 export interface ProjectResponse {
@@ -135,6 +189,8 @@ export interface TaskDto {
   effectiveProjectId: ProjectId;
   parentTaskId: TaskPublicId | null;
   statusId: StatusId | null;
+  issueKey: string | null;
+  branchName: string | null;
   title: string;
   description: string;
   assigneeId: UserId | null;
@@ -144,6 +200,18 @@ export interface TaskDto {
   position: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface CopyTaskRequest {
+  title?: string;
+  projectId?: ProjectId;
+  parentTaskId?: TaskPublicId | null;
+  inheritParentProject?: boolean;
+}
+
+export interface DeleteTaskResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  deletedTaskId: TaskPublicId;
 }
 
 export interface TaskResponse {

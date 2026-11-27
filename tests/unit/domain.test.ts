@@ -3,10 +3,14 @@ import {
   createMonotonicIdGenerator,
   decodeEntityIdTimestamp,
   DEFAULT_LOCALE,
+  formatBranchName,
+  formatIssueKey,
   generateEntityId,
   isValidEntityId,
   isValidIssueKeyFormat,
   isValidTaskPublicIdFormat,
+  normalizeDevPrefix,
+  parseIssueKey,
 } from "@prood/domain";
 
 describe("@prood/domain", () => {
@@ -114,5 +118,28 @@ describe("@prood/domain", () => {
     const recovered = gen.next("tsk");
     expect(recovered.endsWith("0000000000000001")).toBe(false);
     expect(decodeEntityIdTimestamp(recovered)).toBe(currentMs);
+  });
+
+  it("normalizes dev prefixes, parses issue keys, and formats keys and branch names", () => {
+    expect(normalizeDevPrefix(" prd ")).toBe("PRD");
+    expect(normalizeDevPrefix("ab12")).toBe("AB12");
+    expect(normalizeDevPrefix("1ab")).toBeNull();
+    expect(normalizeDevPrefix("a")).toBeNull();
+    expect(normalizeDevPrefix("ABCDEFGHIJK")).toBeNull();
+    expect(normalizeDevPrefix("PR-D")).toBeNull();
+    expect(normalizeDevPrefix(42)).toBeNull();
+
+    expect(parseIssueKey(" prd-42 ")).toEqual({ prefix: "PRD", number: 42 });
+    expect(parseIssueKey("AB1-1")).toEqual({ prefix: "AB1", number: 1 });
+    expect(parseIssueKey("PRD-0")).toBeNull();
+    expect(parseIssueKey("PRD-")).toBeNull();
+    expect(parseIssueKey("tsk_01jf8x9z2k3m4n5p6q7r8s9t0v")).toBeNull();
+
+    expect(formatIssueKey("PRD", 42)).toBe("PRD-42");
+    expect(formatBranchName("prd", 42)).toBe("prd-42");
+
+    const insId = generateEntityId("ins", 1_795_000_000_000, new Uint8Array(10).fill(9));
+    expect(isValidEntityId("ins", insId)).toBe(true);
+    expect(isValidEntityId("tsk", insId)).toBe(false);
   });
 });

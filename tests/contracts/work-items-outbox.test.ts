@@ -259,7 +259,7 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
     });
 
     const v5 = await db.migrate();
-    expect(v5).toEqual({ appliedVersions: [5, 8], currentVersion: 8 });
+    expect(v5).toEqual({ appliedVersions: [5, 6, 8], currentVersion: 8 });
 
     const loaded = await db.uow.run(async (repos) => ({
       ws: await repos.workspaces.findById(wksId),

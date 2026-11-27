@@ -131,6 +131,37 @@ export interface TaskTable {
   updated_at: string;
 }
 
+export interface TaskIssueKeyTable {
+  task_id: string;
+  namespace_id: string;
+  issue_number: number;
+  created_at: string;
+}
+
+export interface IssueKeyNamespaceTable {
+  id: string;
+  workspace_id: string;
+  project_id: string | null;
+  current_prefix: string;
+  branch_prefix: string;
+  start_status_id: string | null;
+  enabled_by: string | null;
+  enabled_at: string;
+  updated_at: string;
+}
+
+export interface IssueKeyCounterTable {
+  namespace_id: string;
+  next_number: number;
+}
+
+export interface IssueKeyPrefixTable {
+  workspace_id: string;
+  prefix: string;
+  namespace_id: string;
+  created_at: string;
+}
+
 export interface OutboxEventTable {
   id: string;
   event_id: string;
@@ -194,5 +225,9 @@ export interface ProodDatabase {
   project_memberships: ProjectMembershipTable;
   project_statuses: ProjectStatusTable;
   tasks: TaskTable;
+  issue_key_namespaces: IssueKeyNamespaceTable;
+  issue_key_counters: IssueKeyCounterTable;
+  issue_key_prefixes: IssueKeyPrefixTable;
+  task_issue_keys: TaskIssueKeyTable;
   outbox_events: OutboxEventTable;
 }

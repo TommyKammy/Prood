@@ -1,6 +1,7 @@
 import { isValidEntityId, type TaskPublicId } from "./id.js";
 
 export * from "./access.js";
+export * from "./dev-projects.js";
 export * from "./events.js";
 export * from "./id.js";
 export * from "./identity.js";

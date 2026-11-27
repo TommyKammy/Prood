@@ -339,5 +339,42 @@ export const SQLITE_MIGRATIONS: readonly MigrationDefinition[] = [
       `CREATE INDEX IF NOT EXISTS outbox_events_target_idx ON outbox_events (target_type, target_id)`,
     ],
   },
+  {
+    version: 6,
+    name: "0006_init_dev_projects_and_issue_keys",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS issue_key_namespaces (
+        id TEXT NOT NULL PRIMARY KEY,
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        project_id TEXT UNIQUE REFERENCES projects(id) ON DELETE SET NULL,
+        current_prefix TEXT NOT NULL CHECK (length(current_prefix) BETWEEN 2 AND 10 AND current_prefix GLOB '[A-Z]*' AND current_prefix NOT GLOB '*[^A-Z0-9]*'),
+        branch_prefix TEXT NOT NULL CHECK (length(branch_prefix) BETWEEN 2 AND 10 AND branch_prefix GLOB '[a-z]*' AND branch_prefix NOT GLOB '*[^a-z0-9]*'),
+        start_status_id TEXT REFERENCES project_statuses(id) ON DELETE SET NULL,
+        enabled_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        enabled_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+      `CREATE INDEX IF NOT EXISTS issue_key_namespaces_workspace_idx ON issue_key_namespaces (workspace_id, id)`,
+      `CREATE TABLE IF NOT EXISTS issue_key_counters (
+        namespace_id TEXT NOT NULL PRIMARY KEY REFERENCES issue_key_namespaces(id) ON DELETE CASCADE,
+        next_number INTEGER NOT NULL DEFAULT 1 CHECK (next_number > 0)
+      )`,
+      `CREATE TABLE IF NOT EXISTS issue_key_prefixes (
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        prefix TEXT NOT NULL CHECK (length(prefix) BETWEEN 2 AND 10 AND prefix GLOB '[A-Z]*' AND prefix NOT GLOB '*[^A-Z0-9]*'),
+        namespace_id TEXT NOT NULL REFERENCES issue_key_namespaces(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (workspace_id, prefix)
+      )`,
+      `CREATE INDEX IF NOT EXISTS issue_key_prefixes_namespace_idx ON issue_key_prefixes (namespace_id, created_at, prefix)`,
+      `CREATE TABLE IF NOT EXISTS task_issue_keys (
+        task_id TEXT NOT NULL PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        namespace_id TEXT NOT NULL REFERENCES issue_key_namespaces(id) ON DELETE CASCADE,
+        issue_number INTEGER NOT NULL CHECK (issue_number > 0),
+        created_at TEXT NOT NULL,
+        UNIQUE (namespace_id, issue_number)
+      )`,
+    ],
+  },
   automationMigration,
 ];
