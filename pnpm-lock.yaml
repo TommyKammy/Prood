@@ -110,15 +110,30 @@ importers:
       '@prood/contracts':
         specifier: workspace:*
         version: link:../../contracts
+      '@prood/domain':
+        specifier: workspace:*
+        version: link:../../domain
+      kysely:
+        specifier: ^0.29.9
+        version: 0.29.9
 
   packages/persistence/postgres:
     dependencies:
+      '@prood/application':
+        specifier: workspace:*
+        version: link:../../application
       '@prood/contracts':
         specifier: workspace:*
         version: link:../../contracts
+      '@prood/domain':
+        specifier: workspace:*
+        version: link:../../domain
       '@prood/persistence-common':
         specifier: workspace:*
         version: link:../common
+      kysely:
+        specifier: ^0.29.9
+        version: 0.29.9
       pg:
         specifier: ^8.23.1
         version: 8.23.1
@@ -129,15 +144,24 @@ importers:
 
   packages/persistence/sqlite:
     dependencies:
+      '@prood/application':
+        specifier: workspace:*
+        version: link:../../application
       '@prood/contracts':
         specifier: workspace:*
         version: link:../../contracts
+      '@prood/domain':
+        specifier: workspace:*
+        version: link:../../domain
       '@prood/persistence-common':
         specifier: workspace:*
         version: link:../common
       better-sqlite3:
         specifier: ^13.2.0
         version: 13.2.0
+      kysely:
+        specifier: ^0.29.9
+        version: 0.29.9
     devDependencies:
       '@types/better-sqlite3':
         specifier: ^9.6.0
@@ -729,6 +753,10 @@ packages:
 
   js-tokens@9.0.1:
     resolution: {integrity: sha512-mxa9E9ITFOt0ban3j6L5MpjwegGz6lBQmM1IJkWeBZGcMxto50+eWdjC/52xDbS2vy0k7vIMK0Fe2wfL9OQSpQ==}
+
+  kysely@0.29.9:
+    resolution: {integrity: sha512-K48ErswC3MlIcBqR0pYIIEl+n9rIgwxgzaM1FxKHMXn7egxr1NHj7bCeF98mXl9A3/QoL5I7mo5S/mLXgeDgGA==}
+    engines: {node: '>=22.0.0'}
 
   loupe@3.2.1:
     resolution: {integrity: sha512-CdzqowRJCeLU72bHvWqwRBBlLcMEtIvGrlvef74kMnV2AolS9Y8xUv1I0U/MNAWMhBlKIoyuEgoJ0t/bbwHbLQ==}
@@ -1360,6 +1388,8 @@ snapshots:
   hono@4.13.23: {}
 
   js-tokens@9.0.1: {}
+
+  kysely@0.29.9: {}
 
   loupe@3.2.1: {}
 

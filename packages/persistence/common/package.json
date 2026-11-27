@@ -14,6 +14,8 @@
   },
   "dependencies": {
     "@prood/application": "workspace:*",
-    "@prood/contracts": "workspace:*"
+    "@prood/contracts": "workspace:*",
+    "@prood/domain": "workspace:*",
+    "kysely": "^0.29.9"
   }
 }

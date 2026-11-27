@@ -5,6 +5,8 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../../domain" },
+    { "path": "../../application" },
     { "path": "../../contracts" },
     { "path": "../common" }
   ],
