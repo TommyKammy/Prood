@@ -3,6 +3,8 @@ import { createI18n, type I18nInstance } from "./i18n/messages.js";
 const BaseElement =
   typeof HTMLElement !== "undefined" ? HTMLElement : (class {} as typeof HTMLElement);
 
+let nextLoginFormId = 0;
+
 export function extractSignedOAuthQuery(search: string): string | undefined {
   const trimmed = search.replace(/^\?/, "");
   if (!trimmed) {
@@ -12,7 +14,24 @@ export function extractSignedOAuthQuery(search: string): string | undefined {
   return params.has("sig") && params.has("client_id") ? trimmed : undefined;
 }
 
+export function isSafeRedirectUrl(url: string): boolean {
+  const trimmed = url.trim();
+  if (!trimmed) {
+    return false;
+  }
+  if (trimmed.startsWith("/") && !trimmed.startsWith("//")) {
+    return true;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 export class ProodLoginFormElement extends BaseElement {
+  private readonly instanceId = ++nextLoginFormId;
   private i18n: I18nInstance = createI18n();
   private email = "";
   private password = "";
@@ -21,6 +40,8 @@ export class ProodLoginFormElement extends BaseElement {
   private inFlight = false;
   private searchOverride?: string;
   private redirectHandler?: (url: string) => void;
+  private emailInputEl: HTMLInputElement | null = null;
+  private passwordInputEl: HTMLInputElement | null = null;
 
   connectedCallback(): void {
     this.render();
@@ -34,6 +55,10 @@ export class ProodLoginFormElement extends BaseElement {
   setCredentials(email: string, password: string): void {
     this.email = email;
     this.password = password;
+  }
+
+  getErrorMessage(): string {
+    return this.errorMessage;
   }
 
   setOAuthContext(context: {
@@ -70,14 +95,15 @@ export class ProodLoginFormElement extends BaseElement {
     subtitle.textContent = t("auth.signInSubtitle");
     headingGroup.append(title, subtitle);
 
+    const emailId = `prood-login-email-${this.instanceId}`;
     const emailGroup = document.createElement("div");
     emailGroup.className = "prood-field";
     const emailLabel = document.createElement("label");
-    emailLabel.htmlFor = "prood-login-email";
+    emailLabel.htmlFor = emailId;
     emailLabel.className = "prood-label";
     emailLabel.textContent = t("auth.emailLabel");
     const emailInput = document.createElement("input");
-    emailInput.id = "prood-login-email";
+    emailInput.id = emailId;
     emailInput.name = "email";
     emailInput.type = "email";
     emailInput.required = true;
@@ -88,16 +114,18 @@ export class ProodLoginFormElement extends BaseElement {
     emailInput.addEventListener("input", () => {
       this.email = emailInput.value;
     });
+    this.emailInputEl = emailInput;
     emailGroup.append(emailLabel, emailInput);
 
+    const passwordId = `prood-login-password-${this.instanceId}`;
     const passwordGroup = document.createElement("div");
     passwordGroup.className = "prood-field";
     const passwordLabel = document.createElement("label");
-    passwordLabel.htmlFor = "prood-login-password";
+    passwordLabel.htmlFor = passwordId;
     passwordLabel.className = "prood-label";
     passwordLabel.textContent = t("auth.passwordLabel");
     const passwordInput = document.createElement("input");
-    passwordInput.id = "prood-login-password";
+    passwordInput.id = passwordId;
     passwordInput.name = "password";
     passwordInput.type = "password";
     passwordInput.required = true;
@@ -108,6 +136,7 @@ export class ProodLoginFormElement extends BaseElement {
     passwordInput.addEventListener("input", () => {
       this.password = passwordInput.value;
     });
+    this.passwordInputEl = passwordInput;
     passwordGroup.append(passwordLabel, passwordInput);
 
     form.append(headingGroup, emailGroup, passwordGroup);
@@ -130,6 +159,12 @@ export class ProodLoginFormElement extends BaseElement {
 
     form.addEventListener("submit", (event) => {
       event.preventDefault();
+      if (this.emailInputEl) {
+        this.email = this.emailInputEl.value;
+      }
+      if (this.passwordInputEl) {
+        this.password = this.passwordInputEl.value;
+      }
       void this.submit();
     });
 
@@ -146,6 +181,7 @@ export class ProodLoginFormElement extends BaseElement {
     this.errorMessage = "";
     this.render();
 
+    let redirecting = false;
     try {
       const search =
         this.searchOverride ??
@@ -170,6 +206,11 @@ export class ProodLoginFormElement extends BaseElement {
           url?: string;
         } | null;
         if (data?.redirect === true && typeof data.url === "string") {
+          if (!isSafeRedirectUrl(data.url)) {
+            this.errorMessage = this.i18n.t("error.generic");
+            return;
+          }
+          redirecting = true;
           if (this.redirectHandler) {
             this.redirectHandler(data.url);
           } else if (typeof window !== "undefined") {
@@ -186,12 +227,27 @@ export class ProodLoginFormElement extends BaseElement {
         return;
       }
 
-      this.errorMessage = this.i18n.t("auth.invalidCredentials");
+      const errData = (await res.json().catch(() => null)) as {
+        error?: string;
+        code?: string;
+      } | null;
+      if (
+        res.status === 400 &&
+        (errData?.error === "invalid_signature" || errData?.code === "invalid_signature")
+      ) {
+        this.errorMessage = this.i18n.t("auth.oauthQueryExpired");
+      } else if (res.status >= 500) {
+        this.errorMessage = this.i18n.t("auth.serverError");
+      } else {
+        this.errorMessage = this.i18n.t("auth.invalidCredentials");
+      }
     } catch {
       this.errorMessage = this.i18n.t("auth.networkError");
     } finally {
       this.inFlight = false;
-      this.busy = false;
+      if (!redirecting) {
+        this.busy = false;
+      }
       this.render();
     }
   }

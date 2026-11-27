@@ -5,6 +5,7 @@ import { CONTRACT_VERSION, type MeResponse } from "@prood/contracts";
 import { generateEntityId } from "@prood/domain";
 import {
   extractSignedOAuthQuery,
+  isSafeRedirectUrl,
   ProodLoginFormElement,
   ProodShellElement,
 } from "@prood/web";
@@ -158,5 +159,82 @@ describe("@prood/web login & asset paths", () => {
     );
     expect(html).toContain('href="/shell.css"');
     expect(html).toContain('src="/shell.js"');
+  });
+
+  it("validates redirect URLs safely and distinguishes expired oauth_query / 500 / 401 on login", async () => {
+    expect(isSafeRedirectUrl("/oauth/consent?client_id=c1")).toBe(true);
+    expect(isSafeRedirectUrl("https://prood.example/cb")).toBe(true);
+    expect(isSafeRedirectUrl("//evil.example/phish")).toBe(false);
+    expect(isSafeRedirectUrl("javascript:alert(1)")).toBe(false);
+    expect(isSafeRedirectUrl("data:text/html,hi")).toBe(false);
+
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: "invalid_signature" }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(new Response("boom", { status: 500 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: "INVALID_EMAIL_OR_PASSWORD" }), { status: 401 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const form = new ProodLoginFormElement();
+    form.setCredentials("alice@example.com", "pw");
+
+    form.setOAuthContext({ search: "?client_id=c1&sig=expired" });
+    await form.submit();
+    expect(form.getErrorMessage()).toContain("authorization request has expired");
+
+    await form.submit();
+    expect(form.getErrorMessage()).toContain("Server error");
+
+    await form.submit();
+    expect(form.getErrorMessage()).toBe("Invalid email or password.");
+  });
+
+  it("guards stale refreshSession races and missing oauth_query on submitConsent", async () => {
+    let resolveDelayedMe!: (value: Response) => void;
+    const delayedMe = new Promise<Response>((resolve) => {
+      resolveDelayedMe = resolve;
+    });
+
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(sampleProfile()), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockReturnValueOnce(delayedMe) // inflight refreshSession started before signOut
+      .mockResolvedValueOnce(new Response(null, { status: 200 })); // signOut
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const shell = new ProodShellElement();
+    expect(shell.getAuthState()).toBe("loading");
+    await shell.refreshSession();
+    expect(shell.getAuthState()).toBe("authenticated");
+
+    const inflightRefresh = shell.refreshSession();
+    await shell.signOut();
+    expect(shell.getAuthState()).toBe("unauthenticated");
+
+    // Late 200 response from earlier refreshSession must NOT flip state back to authenticated
+    resolveDelayedMe(
+      new Response(JSON.stringify(sampleProfile()), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    await inflightRefresh;
+    expect(shell.getAuthState()).toBe("unauthenticated");
+
+    // Missing signed oauth_query on consent submit sets explicit error without calling fetch
+    vi.stubGlobal("window", { location: { pathname: "/oauth/consent", search: "" } });
+    await shell.submitConsent(true);
+    expect(shell.getConsentError()).toBe("This authorization request is missing or invalid.");
   });
 });

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import Database from "better-sqlite3";
 import { Kysely, SqliteDialect, sql } from "kysely";
 import type { TransactionRepositories, UnitOfWork } from "@prood/application";
@@ -5,6 +6,7 @@ import {
   createKyselyRepositories,
   executeWithTransientRetry,
   isPersistenceError,
+  PersistenceError,
   type KyselyBackedDatabaseClient,
   type MigrationRunOptions,
   type MigrationRunResult,
@@ -20,20 +22,36 @@ export interface SqliteDatabaseOptions {
   retryBaseDelayMs?: number;
 }
 
+function assertValidNonNegativeNumber(name: string, value: number): number {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new RangeError(`Invalid ${name}: ${value}`);
+  }
+  return Math.trunc(value);
+}
+
 /**
  * Opens a SQLite connection with per-connection PRAGMAs required by Prood:
- * WAL mode, foreign key enforcement, and bounded busy timeout.
+ * bounded busy timeout first, then foreign key enforcement and WAL mode.
  */
 export function openSqliteConnection(
   filePath: string,
   busyTimeoutMs = 5000,
 ): Database.Database {
-  const safeTimeout = Math.max(0, Math.trunc(busyTimeoutMs));
+  const safeTimeout = assertValidNonNegativeNumber("busyTimeoutMs", busyTimeoutMs);
   const db = new Database(filePath);
-  db.pragma("journal_mode = WAL");
-  db.pragma("foreign_keys = ON");
-  db.pragma(`busy_timeout = ${safeTimeout}`);
-  return db;
+  try {
+    db.pragma(`busy_timeout = ${safeTimeout}`);
+    db.pragma("foreign_keys = ON");
+    db.pragma("journal_mode = WAL");
+    return db;
+  } catch (error) {
+    try {
+      db.close();
+    } catch {
+      // Preserve initial PRAGMA error
+    }
+    throw error;
+  }
 }
 
 /**
@@ -43,22 +61,44 @@ export function openSqliteConnection(
 export function createSqliteDatabase(
   options: SqliteDatabaseOptions,
 ): KyselyBackedDatabaseClient {
-  const busyTimeoutMs = options.busyTimeoutMs ?? 5000;
+  const busyTimeoutMs = assertValidNonNegativeNumber(
+    "busyTimeoutMs",
+    options.busyTimeoutMs ?? 5000,
+  );
   const retryPolicy = {
-    maxRetryAttempts: options.maxRetryAttempts ?? 3,
-    retryBaseDelayMs: options.retryBaseDelayMs ?? 25,
+    maxRetryAttempts: assertValidNonNegativeNumber(
+      "maxRetryAttempts",
+      options.maxRetryAttempts ?? 3,
+    ),
+    retryBaseDelayMs: assertValidNonNegativeNumber(
+      "retryBaseDelayMs",
+      options.retryBaseDelayMs ?? 25,
+    ),
   };
 
   const nativeDb = openSqliteConnection(options.filePath, busyTimeoutMs);
   const db = new Kysely<ProodDatabase>({
     dialect: new SqliteDialect({ database: nativeDb }),
   });
+  const txStorage = new AsyncLocalStorage<boolean>();
+  let closePromise: Promise<void> | null = null;
 
   async function runImmediateTx<T>(
     conn: Kysely<ProodDatabase>,
-    fn: (txConn: Kysely<ProodDatabase>) => Promise<T>,
+    fn: (txConn: Kysely<ProodDatabase>, assertActive: () => void) => Promise<T>,
   ): Promise<T> {
     let inTx = false;
+    let txActive = true;
+    const assertActive = (): void => {
+      if (!txActive) {
+        throw new PersistenceError("Transaction is already finished", {
+          code: "UNKNOWN_DB_ERROR",
+          driver: "sqlite",
+          retryable: false,
+        });
+      }
+    };
+
     try {
       try {
         await sql`BEGIN IMMEDIATE`.execute(conn);
@@ -67,7 +107,8 @@ export function createSqliteDatabase(
         mapSqliteError(error);
       }
 
-      const result = await fn(conn);
+      const result = await fn(conn, assertActive);
+      txActive = false;
 
       try {
         await sql`COMMIT`.execute(conn);
@@ -77,6 +118,7 @@ export function createSqliteDatabase(
       }
       return result;
     } catch (error) {
+      txActive = false;
       if (inTx) {
         try {
           await sql`ROLLBACK`.execute(conn);
@@ -90,12 +132,41 @@ export function createSqliteDatabase(
 
   const uow: UnitOfWork = {
     async run<T>(fn: (repos: TransactionRepositories) => Promise<T>): Promise<T> {
+      if (txStorage.getStore() === true) {
+        throw new PersistenceError("Reentrant UnitOfWork.run() is not supported", {
+          code: "UNKNOWN_DB_ERROR",
+          driver: "sqlite",
+          retryable: false,
+        });
+      }
+
       return executeWithTransientRetry(retryPolicy, async () => {
-        return db.connection().execute(async (conn) =>
-          runImmediateTx(conn, async (txConn) =>
-            fn(createKyselyRepositories(txConn, mapSqliteError)),
-          ),
-        );
+        let hasBusinessError = false;
+        let businessError: unknown;
+        try {
+          return await db.connection().execute(async (conn) =>
+            runImmediateTx(conn, async (txConn, assertActive) =>
+              txStorage.run(true, async () => {
+                try {
+                  return await fn(
+                    createKyselyRepositories(txConn, mapSqliteError, assertActive),
+                  );
+                } catch (error) {
+                  if (!isPersistenceError(error)) {
+                    hasBusinessError = true;
+                    businessError = error;
+                  }
+                  throw error;
+                }
+              }),
+            ),
+          );
+        } catch (error) {
+          if ((hasBusinessError && error === businessError) || isPersistenceError(error)) {
+            throw error;
+          }
+          return mapSqliteError(error);
+        }
       });
     },
   };
@@ -104,7 +175,7 @@ export function createSqliteDatabase(
     try {
       await sql`
         CREATE TABLE IF NOT EXISTS prood_schema_migrations (
-          version INTEGER PRIMARY KEY,
+          version INTEGER NOT NULL PRIMARY KEY,
           name TEXT NOT NULL,
           applied_at TEXT NOT NULL
         )
@@ -151,64 +222,51 @@ export function createSqliteDatabase(
 
     async migrate(runOptions?: MigrationRunOptions): Promise<MigrationRunResult> {
       const targetVersion = runOptions?.targetVersion;
-      return executeWithTransientRetry(retryPolicy, async () =>
-        db.connection().execute(async (conn) =>
-          runImmediateTx(conn, async (txConn) => {
-            await ensureMigrationTable(txConn);
-            const appliedList = await readAppliedVersions(txConn);
-            const appliedSet = new Set(appliedList);
-
-            const pending = SQLITE_MIGRATIONS.filter(
-              (m) =>
-                !appliedSet.has(m.version) &&
-                (targetVersion === undefined || m.version <= targetVersion),
-            ).sort((a, b) => a.version - b.version);
-
-            const newlyApplied: number[] = [];
-            for (const migration of pending) {
-              try {
-                for (const statement of migration.statements) {
-                  await sql.raw(statement).execute(txConn);
-                }
-                await txConn
-                  .insertInto("prood_schema_migrations")
-                  .values({
-                    version: migration.version,
-                    name: migration.name,
-                    applied_at: new Date().toISOString(),
-                  })
-                  .execute();
-              } catch (error) {
-                mapSqliteError(error);
-              }
-              newlyApplied.push(migration.version);
-            }
-
-            const finalVersions = await readAppliedVersions(txConn);
-            const currentVersion =
-              finalVersions.length > 0
-                ? finalVersions[finalVersions.length - 1]!
-                : 0;
-            return {
-              appliedVersions: newlyApplied,
-              currentVersion,
-            };
-          }),
-        ),
-      );
-    },
-
-    async getAppliedMigrationVersions(): Promise<number[]> {
-      return db.connection().execute(async (conn) => {
+      return executeWithTransientRetry(retryPolicy, async () => {
         try {
-          const tableCheck = await sql<{ name: string }>`
-            SELECT name FROM sqlite_master
-            WHERE type = 'table' AND name = 'prood_schema_migrations'
-          `.execute(conn);
-          if (tableCheck.rows.length === 0) {
-            return [];
-          }
-          return readAppliedVersions(conn);
+          return await db.connection().execute(async (conn) =>
+            runImmediateTx(conn, async (txConn) => {
+              await ensureMigrationTable(txConn);
+              const appliedList = await readAppliedVersions(txConn);
+              const appliedSet = new Set(appliedList);
+
+              const pending = SQLITE_MIGRATIONS.filter(
+                (m) =>
+                  !appliedSet.has(m.version) &&
+                  (targetVersion === undefined || m.version <= targetVersion),
+              ).sort((a, b) => a.version - b.version);
+
+              const newlyApplied: number[] = [];
+              for (const migration of pending) {
+                try {
+                  for (const statement of migration.statements) {
+                    await sql.raw(statement).execute(txConn);
+                  }
+                  await txConn
+                    .insertInto("prood_schema_migrations")
+                    .values({
+                      version: migration.version,
+                      name: migration.name,
+                      applied_at: new Date().toISOString(),
+                    })
+                    .execute();
+                } catch (error) {
+                  mapSqliteError(error);
+                }
+                newlyApplied.push(migration.version);
+              }
+
+              const finalVersions = await readAppliedVersions(txConn);
+              const currentVersion =
+                finalVersions.length > 0
+                  ? finalVersions[finalVersions.length - 1]!
+                  : 0;
+              return {
+                appliedVersions: newlyApplied,
+                currentVersion,
+              };
+            }),
+          );
         } catch (error) {
           if (isPersistenceError(error)) {
             throw error;
@@ -218,8 +276,36 @@ export function createSqliteDatabase(
       });
     },
 
-    async close(): Promise<void> {
-      await db.destroy();
+    async getAppliedMigrationVersions(): Promise<number[]> {
+      try {
+        return await db.connection().execute(async (conn) => {
+          const tableCheck = await sql<{ name: string }>`
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name = 'prood_schema_migrations'
+          `.execute(conn);
+          if (tableCheck.rows.length === 0) {
+            return [];
+          }
+          return readAppliedVersions(conn);
+        });
+      } catch (error) {
+        if (isPersistenceError(error)) {
+          throw error;
+        }
+        mapSqliteError(error);
+      }
+    },
+
+    close(): Promise<void> {
+      if (!closePromise) {
+        closePromise = (async () => {
+          await db.destroy();
+          if (nativeDb.open) {
+            nativeDb.close();
+          }
+        })();
+      }
+      return closePromise;
     },
   };
 }

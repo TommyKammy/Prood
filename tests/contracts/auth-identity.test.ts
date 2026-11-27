@@ -450,4 +450,93 @@ describe(`Better Auth, Prood users & workspace memberships (${targetDb})`, () =>
       "FORBIDDEN",
     );
   });
+
+  it("blocks unverified email sign-up from hijacking pre-existing users and handles concurrent first-login resolution", async () => {
+    const ctx = await createIsolatedAuthDb();
+    const db = ctx.openClient();
+    await db.migrate();
+    const ids = createSystemIdGenerator();
+    const wksId = ids.next("wks");
+    const preUserId = ids.next("usr");
+    const mbrId = ids.next("mbr");
+    const now = "2026-11-27T11:30:00.000Z";
+
+    await db.uow.run(async (repos) => {
+      await repos.workspaces.create({
+        id: wksId,
+        slug: "invited-ws",
+        name: "Invited Workspace",
+        createdAt: now,
+      });
+      await repos.users.create({
+        id: preUserId,
+        email: "victim@example.com",
+        displayName: "Invited Admin",
+        createdAt: now,
+      });
+      await repos.memberships.create({
+        id: mbrId,
+        workspaceId: wksId,
+        userId: preUserId,
+        role: "admin",
+        createdAt: now,
+      });
+    });
+
+    const { request } = buildTestServer(db);
+
+    // 1. Unverified attacker signs up with victim@example.com -> /api/v1/me MUST return 403 and must not link
+    const attackerJar = new CookieJar();
+    const attackerSignUp = await request("/api/auth/sign-up/email", {
+      method: "POST",
+      json: {
+        email: "victim@example.com",
+        password: "attacker-password-123",
+        name: "Attacker",
+      },
+    });
+    expect(attackerSignUp.status).toBe(200);
+    attackerJar.updateFrom(attackerSignUp);
+
+    const hijackMe = await request("/api/v1/me", {
+      cookieHeader: attackerJar.toHeader(),
+    });
+    expect(hijackMe.status).toBe(403);
+    expect(((await hijackMe.json()) as ApiErrorResponse).error.messageKey).toBe(
+      "error.emailVerificationRequired",
+    );
+
+    const hijackWs = await request(`/api/v1/workspaces/${wksId}/membership`, {
+      cookieHeader: attackerJar.toHeader(),
+    });
+    expect(hijackWs.status).toBe(403);
+
+    // 2. Fresh verified user hitting /api/v1/me concurrently creates exactly one Prood user
+    const concurrentJar = new CookieJar();
+    const freshSignUp = await request("/api/auth/sign-up/email", {
+      method: "POST",
+      json: {
+        email: "concurrent@example.com",
+        password: "concurrent-password-123",
+        name: "Concurrent",
+      },
+    });
+    expect(freshSignUp.status).toBe(200);
+    concurrentJar.updateFrom(freshSignUp);
+
+    const [resA, resB, resC] = await Promise.all([
+      request("/api/v1/me", { cookieHeader: concurrentJar.toHeader() }),
+      request("/api/v1/me", { cookieHeader: concurrentJar.toHeader() }),
+      request("/api/v1/me", { cookieHeader: concurrentJar.toHeader() }),
+    ]);
+    expect(resA.status).toBe(200);
+    expect(resB.status).toBe(200);
+    expect(resC.status).toBe(200);
+    const profiles = (await Promise.all([
+      resA.json(),
+      resB.json(),
+      resC.json(),
+    ])) as MeResponse[];
+    expect(new Set(profiles.map((p) => p.user.id)).size).toBe(1);
+  });
 });

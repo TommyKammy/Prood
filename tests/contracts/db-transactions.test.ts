@@ -2,19 +2,21 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createSystemIdGenerator } from "@prood/application";
+import { createSystemIdGenerator, type WorkspaceRepository } from "@prood/application";
 import type { DbDriverKind } from "@prood/contracts";
 import {
   isPersistenceError,
   sleep,
   type DatabaseClient,
+  type KyselyBackedDatabaseClient,
 } from "@prood/persistence-common";
 import {
   createPostgresDatabase,
   createPostgresSchema,
   dropPostgresSchema,
+  mapPostgresError,
 } from "@prood/persistence-postgres";
-import { createSqliteDatabase } from "@prood/persistence-sqlite";
+import { createSqliteDatabase, mapSqliteError } from "@prood/persistence-sqlite";
 
 const targetDb = process.env.PROOD_TEST_DB as DbDriverKind | undefined;
 if (targetDb !== "sqlite" && targetDb !== "postgres") {
@@ -498,5 +500,164 @@ describe(`DB migrations, UnitOfWork, error mapping & concurrency (${targetDb})`,
     ]);
     expect(holderResult).toBe("holder-done");
     expect(contenderResult?.name).toBe("Contender After Retry");
+  });
+
+  it("closes cleanly before first query, maps post-close calls to PersistenceError, and rejects reentrant uow.run and post-tx repos", async () => {
+    const ctx = await createIsolatedDbContext();
+    // 1. Close immediately before any query -> must cleanly dispose and fail with PersistenceError afterward
+    const unusedDb = ctx.openClient();
+    await unusedDb.close();
+
+    let postCloseMigrateErr: unknown;
+    try {
+      await unusedDb.migrate();
+    } catch (error) {
+      postCloseMigrateErr = error;
+    }
+    expect(isPersistenceError(postCloseMigrateErr)).toBe(true);
+
+    // 2. Reentrant uow.run fails fast with PersistenceError rather than deadlocking
+    const db = ctx.openClient() as KyselyBackedDatabaseClient;
+    await db.migrate();
+
+    let reentrantErr: unknown;
+    try {
+      await db.uow.run(async () => {
+        await db.uow.run(async () => "never");
+      });
+    } catch (error) {
+      reentrantErr = error;
+    }
+    expect(isPersistenceError(reentrantErr)).toBe(true);
+
+    // 3. Leaked repository called after uow.run finishes rejects cleanly
+    let leakedRepo!: WorkspaceRepository;
+    await db.uow.run(async (repos) => {
+      leakedRepo = repos.workspaces;
+    });
+    let leakedErr: unknown;
+    try {
+      await leakedRepo.findBySlug("anything");
+    } catch (error) {
+      leakedErr = error;
+    }
+    expect(isPersistenceError(leakedErr)).toBe(true);
+
+    // 4. Rejects NULL primary key with NOT_NULL_VIOLATION on both SQLite and PostgreSQL
+    let nullPkErr: unknown;
+    try {
+      await db.kysely
+        .insertInto("workspaces")
+        .values({
+          id: null as unknown as string,
+          slug: "null-pk",
+          name: "Null PK",
+          created_at: "2026-11-27T00:00:00.000Z",
+          updated_at: "2026-11-27T00:00:00.000Z",
+        })
+        .execute();
+    } catch (error) {
+      nullPkErr = error;
+    }
+    try {
+      if (targetDb === "sqlite") {
+        mapSqliteError(nullPkErr);
+      } else {
+        mapPostgresError(nullPkErr);
+      }
+    } catch (mapped) {
+      expect(isPersistenceError(mapped, "NOT_NULL_VIOLATION")).toBe(true);
+    }
+
+    // 5. Case-insensitive email & slug normalization in repositories
+    const ids = createSystemIdGenerator();
+    const wksId = ids.next("wks");
+    const usrId = ids.next("usr");
+    const now = "2026-11-27T10:35:00.000Z";
+    await db.uow.run(async (repos) => {
+      await repos.workspaces.create({
+        id: wksId,
+        slug: "Mixed-Slug",
+        name: "Mixed Slug",
+        createdAt: now,
+      });
+      await repos.users.create({
+        id: usrId,
+        email: "Mixed.Case@Example.COM",
+        displayName: "Mixed Case",
+        createdAt: now,
+      });
+    });
+    const normalizedLookup = await db.uow.run(async (repos) => ({
+      workspace: await repos.workspaces.findBySlug("mixed-slug"),
+      user: await repos.users.findByEmail("mixed.case@example.com"),
+    }));
+    expect(normalizedLookup.workspace?.id).toBe(wksId);
+    expect(normalizedLookup.user?.id).toBe(usrId);
+
+    // 5b. Pre-existing mixed-case records inserted prior to normalization remain reachable
+    const legacyWksId = ids.next("wks");
+    const legacyUsrId = ids.next("usr");
+    await db.kysely
+      .insertInto("workspaces")
+      .values({
+        id: legacyWksId,
+        slug: "Legacy-Mixed",
+        name: "Legacy Mixed Workspace",
+        created_at: now,
+        updated_at: now,
+      })
+      .execute();
+    await db.kysely
+      .insertInto("users")
+      .values({
+        id: legacyUsrId,
+        email: "Legacy.Mixed@Example.COM",
+        display_name: "Legacy Mixed User",
+        created_at: now,
+        updated_at: now,
+      })
+      .execute();
+    const legacyLookup = await db.uow.run(async (repos) => ({
+      wsExact: await repos.workspaces.findBySlug("Legacy-Mixed"),
+      wsLower: await repos.workspaces.findBySlug("legacy-mixed"),
+      usrExact: await repos.users.findByEmail("Legacy.Mixed@Example.COM"),
+      usrLower: await repos.users.findByEmail("legacy.mixed@example.com"),
+    }));
+    expect(legacyLookup.wsExact?.id).toBe(legacyWksId);
+    expect(legacyLookup.wsLower?.id).toBe(legacyWksId);
+    expect(legacyLookup.usrExact?.id).toBe(legacyUsrId);
+    expect(legacyLookup.usrLower?.id).toBe(legacyUsrId);
+
+    // 6. Error mappers unwrap nested cause / AggregateError, classify CONNECTION_ERROR, and make PG 57014 non-retryable
+    try {
+      mapPostgresError(
+        new Error("wrapped", {
+          cause: new AggregateError(
+            [Object.assign(new Error("refused"), { code: "ECONNREFUSED" })],
+            "connect",
+          ),
+        }),
+      );
+    } catch (mapped) {
+      expect(isPersistenceError(mapped, "CONNECTION_ERROR")).toBe(true);
+    }
+    try {
+      mapPostgresError(Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" }));
+    } catch (mapped) {
+      expect(isPersistenceError(mapped, "TRANSIENT_CONFLICT")).toBe(false);
+      if (isPersistenceError(mapped)) {
+        expect(mapped.retryable).toBe(false);
+      }
+    }
+    try {
+      mapSqliteError(
+        new Error("wrapped", {
+          cause: Object.assign(new Error("cannot open"), { code: "SQLITE_CANTOPEN" }),
+        }),
+      );
+    } catch (mapped) {
+      expect(isPersistenceError(mapped, "CONNECTION_ERROR")).toBe(true);
+    }
   });
 });

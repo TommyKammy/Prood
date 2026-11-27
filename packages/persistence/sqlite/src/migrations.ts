@@ -6,7 +6,7 @@ export const SQLITE_MIGRATIONS: readonly MigrationDefinition[] = [
     name: "0001_init_workspaces",
     statements: [
       `CREATE TABLE IF NOT EXISTS workspaces (
-        id TEXT PRIMARY KEY,
+        id TEXT NOT NULL PRIMARY KEY,
         slug TEXT NOT NULL UNIQUE,
         name TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -19,7 +19,7 @@ export const SQLITE_MIGRATIONS: readonly MigrationDefinition[] = [
     name: "0002_init_workspace_settings",
     statements: [
       `CREATE TABLE IF NOT EXISTS workspace_settings (
-        workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
+        workspace_id TEXT NOT NULL PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
         default_locale TEXT NOT NULL DEFAULT 'en',
         dev_projects_enabled INTEGER NOT NULL DEFAULT 0 CHECK (dev_projects_enabled IN (0, 1)),
         updated_at TEXT NOT NULL
@@ -42,14 +42,14 @@ export const SQLITE_MIGRATIONS: readonly MigrationDefinition[] = [
         email TEXT NOT NULL UNIQUE,
         emailVerified INTEGER NOT NULL,
         image TEXT,
-        createdAt DATE NOT NULL,
-        updatedAt DATE NOT NULL
+        createdAt DATE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+        updatedAt DATE DEFAULT CURRENT_TIMESTAMP NOT NULL
       )`,
       `CREATE TABLE IF NOT EXISTS auth_session (
         id TEXT NOT NULL PRIMARY KEY,
         expiresAt DATE NOT NULL,
         token TEXT NOT NULL UNIQUE,
-        createdAt DATE NOT NULL,
+        createdAt DATE DEFAULT CURRENT_TIMESTAMP NOT NULL,
         updatedAt DATE NOT NULL,
         ipAddress TEXT,
         userAgent TEXT,
@@ -68,7 +68,7 @@ export const SQLITE_MIGRATIONS: readonly MigrationDefinition[] = [
         refreshTokenExpiresAt DATE,
         scope TEXT,
         password TEXT,
-        createdAt DATE NOT NULL,
+        createdAt DATE DEFAULT CURRENT_TIMESTAMP NOT NULL,
         updatedAt DATE NOT NULL
       )`,
       `CREATE INDEX IF NOT EXISTS auth_account_userId_idx ON auth_account (userId)`,
@@ -77,12 +77,12 @@ export const SQLITE_MIGRATIONS: readonly MigrationDefinition[] = [
         identifier TEXT NOT NULL,
         value TEXT NOT NULL,
         expiresAt DATE NOT NULL,
-        createdAt DATE NOT NULL,
+        createdAt DATE DEFAULT CURRENT_TIMESTAMP NOT NULL,
         updatedAt DATE NOT NULL
       )`,
       `CREATE INDEX IF NOT EXISTS auth_verification_identifier_idx ON auth_verification (identifier)`,
       `CREATE TABLE IF NOT EXISTS users (
-        id TEXT PRIMARY KEY,
+        id TEXT NOT NULL PRIMARY KEY,
         email TEXT NOT NULL UNIQUE,
         display_name TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -97,7 +97,7 @@ export const SQLITE_MIGRATIONS: readonly MigrationDefinition[] = [
       )`,
       `CREATE INDEX IF NOT EXISTS auth_identities_user_id_idx ON auth_identities (user_id)`,
       `CREATE TABLE IF NOT EXISTS workspace_memberships (
-        id TEXT PRIMARY KEY,
+        id TEXT NOT NULL PRIMARY KEY,
         workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         role TEXT NOT NULL CHECK (role IN ('admin', 'member', 'viewer')),
@@ -116,7 +116,7 @@ export const SQLITE_MIGRATIONS: readonly MigrationDefinition[] = [
         id TEXT NOT NULL PRIMARY KEY,
         publicKey TEXT NOT NULL,
         privateKey TEXT NOT NULL,
-        createdAt DATE NOT NULL,
+        createdAt DATE DEFAULT CURRENT_TIMESTAMP NOT NULL,
         expiresAt DATE,
         alg TEXT,
         crv TEXT

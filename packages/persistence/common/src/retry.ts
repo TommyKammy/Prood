@@ -19,7 +19,17 @@ export async function executeWithTransientRetry<T>(
   policy: RetryPolicy,
   operation: () => Promise<T>,
 ): Promise<T> {
-  const maxAttempts = Math.max(0, policy.maxRetryAttempts);
+  if (!Number.isFinite(policy.maxRetryAttempts) || policy.maxRetryAttempts < 0) {
+    throw new RangeError(
+      `Invalid maxRetryAttempts: ${policy.maxRetryAttempts}`,
+    );
+  }
+  if (!Number.isFinite(policy.retryBaseDelayMs) || policy.retryBaseDelayMs < 0) {
+    throw new RangeError(
+      `Invalid retryBaseDelayMs: ${policy.retryBaseDelayMs}`,
+    );
+  }
+  const maxAttempts = Math.trunc(policy.maxRetryAttempts);
   for (let attempt = 0; ; attempt += 1) {
     try {
       return await operation();

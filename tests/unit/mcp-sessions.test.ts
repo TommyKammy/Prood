@@ -7,16 +7,42 @@ function createTestDeps(nowMsRef: { value: number }) {
   const tokenVerifier: McpTokenVerifier = {
     async verifyBearerToken(headers) {
       const authHeader = headers.get("authorization");
-      const scopes =
-        authHeader === "Bearer limited"
-          ? ["openid"]
-          : [MCP_REQUIRED_WHOAMI_SCOPE];
+      const tokenPresets: Record<
+        string,
+        { subject: string; clientId: string; scopes: string[] }
+      > = {
+        "Bearer valid": {
+          subject: "ba_sub_1",
+          clientId: "client_1",
+          scopes: [MCP_REQUIRED_WHOAMI_SCOPE],
+        },
+        "Bearer limited": {
+          subject: "ba_sub_1",
+          clientId: "client_1",
+          scopes: ["openid"],
+        },
+        "Bearer other-user": {
+          subject: "ba_sub_2",
+          clientId: "client_1",
+          scopes: [MCP_REQUIRED_WHOAMI_SCOPE],
+        },
+        "Bearer other-client": {
+          subject: "ba_sub_1",
+          clientId: "client_2",
+          scopes: [MCP_REQUIRED_WHOAMI_SCOPE],
+        },
+      };
+      const preset = (authHeader ? tokenPresets[authHeader] : undefined) ?? {
+        subject: "ba_sub_1",
+        clientId: "client_1",
+        scopes: [MCP_REQUIRED_WHOAMI_SCOPE],
+      };
       return {
         ok: true,
         token: {
-          subject: "ba_sub_1",
-          clientId: "client_1",
-          scopes,
+          subject: preset.subject,
+          clientId: preset.clientId,
+          scopes: preset.scopes,
           audience: "http://127.0.0.1:3000/mcp",
           expiresAt: Math.floor((nowMsRef.value + 3_600_000) / 1000),
           issuer: "http://127.0.0.1:3000/api/auth",
@@ -42,6 +68,7 @@ function createTestDeps(nowMsRef: { value: number }) {
 
 async function initializeMcpSession(
   handler: ReturnType<typeof createProodMcpServer>,
+  authHeader = "Bearer valid",
 ): Promise<string> {
   const res = await handler.handleRequest(
     new Request("http://127.0.0.1:3000/mcp", {
@@ -49,7 +76,7 @@ async function initializeMcpSession(
       headers: {
         "content-type": "application/json",
         accept: "application/json, text/event-stream",
-        authorization: "Bearer valid",
+        authorization: authHeader,
       },
       body: JSON.stringify({
         jsonrpc: "2.0",
@@ -192,5 +219,186 @@ describe("@prood/integration-fastmcp bounded session retention", () => {
     // Both existing sessions must still be active
     expect((await listToolsInSession(handler, session1)).status).toBe(200);
     expect((await listToolsInSession(handler, session2)).status).toBe(200);
+  });
+
+  it("blocks cross-user and cross-client session access and preserves session state on rejected scope call", async () => {
+    const nowMs = { value: 1_795_000_000_000 };
+    const handler = createProodMcpServer({
+      ...createTestDeps(nowMs),
+      sessionIdleTtlMs: 5_000,
+    });
+
+    const ownerSession = await initializeMcpSession(handler, "Bearer valid");
+
+    // Cross-user POST, GET, DELETE must all be rejected with 403 and must not close ownerSession
+    for (const method of ["POST", "GET", "DELETE"] as const) {
+      const res = await handler.handleRequest(
+        new Request("http://127.0.0.1:3000/mcp", {
+          method,
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json, text/event-stream",
+            authorization: "Bearer other-user",
+            "mcp-session-id": ownerSession,
+          },
+          body:
+            method === "POST"
+              ? JSON.stringify({ jsonrpc: "2.0", id: 20, method: "tools/list", params: {} })
+              : undefined,
+        }),
+      );
+      expect(res.status).toBe(403);
+    }
+
+    // Cross-client POST must also be rejected with 403
+    const crossClientRes = await handler.handleRequest(
+      new Request("http://127.0.0.1:3000/mcp", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          authorization: "Bearer other-client",
+          "mcp-session-id": ownerSession,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 21, method: "tools/list", params: {} }),
+      }),
+    );
+    expect(crossClientRes.status).toBe(403);
+
+    // Owner advances near TTL; a rejected 403 insufficient-scope call must NOT refresh lastActivityAtMs
+    nowMs.value += 4_500;
+    const limitedCall = await handler.handleRequest(
+      new Request("http://127.0.0.1:3000/mcp", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          authorization: "Bearer limited",
+          "mcp-session-id": ownerSession,
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 22,
+          method: "tools/call",
+          params: { name: "whoami", arguments: {} },
+        }),
+      }),
+    );
+    expect(limitedCall.status).toBe(403);
+    expect(limitedCall.headers.get("www-authenticate")).toContain("insufficient_scope");
+
+    // 600ms later (total 5_100ms since init): session must expire because 403 call did not refresh TTL
+    nowMs.value += 600;
+    expect((await listToolsInSession(handler, ownerSession)).status).toBe(404);
+  });
+
+  it("enforces per-principal session cap, Origin header allowlist, DELETE cleanup, and header sanitization", async () => {
+    const nowMs = { value: 1_795_000_000_000 };
+    const handler = createProodMcpServer({
+      resource: "http://127.0.0.1:3000/mcp",
+      tokenVerifier: {
+        async verifyBearerToken(headers) {
+          const authHeader = headers.get("authorization");
+          if (authHeader === "Bearer multiline-fail") {
+            return {
+              ok: false,
+              status: 401,
+              error: "invalid_token",
+              description: "bad\r\nheader \"value\"",
+            };
+          }
+          return {
+            ok: true,
+            token: {
+              subject: authHeader === "Bearer victim" ? "ba_victim" : "ba_spammer",
+              clientId: "client_1",
+              scopes: [MCP_REQUIRED_WHOAMI_SCOPE],
+              audience: "http://127.0.0.1:3000/mcp",
+              expiresAt: Math.floor((nowMs.value + 3_600_000) / 1000),
+              issuer: "http://127.0.0.1:3000/api/auth",
+            },
+          };
+        },
+        getProtectedResourceMetadata: () => ({}),
+        getAuthorizationServerMetadata: async () => ({}),
+      },
+      uow: { run: async () => null } as unknown as UnitOfWork,
+      idGenerator: { next: () => "usr_01jf8x9z2k3m4n5p6q7r8s9t0v" as never },
+      clock: { now: () => new Date(nowMs.value) },
+      maxActiveSessions: 5,
+      maxSessionsPerPrincipal: 2,
+      trustedOrigins: ["http://127.0.0.1:3000"],
+    });
+
+    // Rejects untrusted Origin with 403
+    const evilOriginRes = await handler.handleRequest(
+      new Request("http://127.0.0.1:3000/mcp", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          origin: "https://evil.example",
+          authorization: "Bearer victim",
+        },
+        body: "{}",
+      }),
+    );
+    expect(evilOriginRes.status).toBe(403);
+
+    // Multi-line WWW-Authenticate description is sanitized without throwing TypeError
+    const sanitizedRes = await handler.handleRequest(
+      new Request("http://127.0.0.1:3000/mcp", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer multiline-fail",
+        },
+        body: "{}",
+      }),
+    );
+    expect(sanitizedRes.status).toBe(401);
+    expect(sanitizedRes.headers.get("www-authenticate")).not.toMatch(/[\r\n]/);
+
+    // Victim opens 1 session; spammer opens 3 sessions -> per-principal cap evicts spammer's own oldest, NOT victim's
+    const victimSession = await initializeMcpSession(handler, "Bearer victim");
+    nowMs.value += 10;
+    const spam1 = await initializeMcpSession(handler, "Bearer spammer");
+    nowMs.value += 10;
+    const spam2 = await initializeMcpSession(handler, "Bearer spammer");
+    nowMs.value += 10;
+    const spam3 = await initializeMcpSession(handler, "Bearer spammer");
+
+    expect((await listToolsInSession(handler, spam1)).status).toBe(404);
+    expect((await listToolsInSession(handler, spam2)).status).toBe(200);
+    expect((await listToolsInSession(handler, spam3)).status).toBe(200);
+
+    // Victim's session must still be alive
+    const victimCheck = await handler.handleRequest(
+      new Request("http://127.0.0.1:3000/mcp", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          authorization: "Bearer victim",
+          "mcp-session-id": victimSession,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 30, method: "tools/list", params: {} }),
+      }),
+    );
+    expect(victimCheck.status).toBe(200);
+
+    // DELETE cleans up session and subsequent access returns 404
+    const delRes = await handler.handleRequest(
+      new Request("http://127.0.0.1:3000/mcp", {
+        method: "DELETE",
+        headers: {
+          authorization: "Bearer victim",
+          "mcp-session-id": victimSession,
+        },
+      }),
+    );
+    expect(delRes.status).toBe(204);
+    expect((await listToolsInSession(handler, victimSession)).status).toBe(404);
+
+    await handler.close?.();
   });
 });

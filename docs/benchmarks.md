@@ -26,3 +26,11 @@ Measured on 2026-11-27 (macOS arm64, Apple M3 Ultra, Node.js v22.23.0) after `pn
 - `shell.js`: `3,207` bytes raw (`1,352` bytes gzip level-9)
 - `shell.css`: `1,340` bytes raw (`584` bytes gzip level-9)
 - Total: `4,547` bytes raw (`1,936` bytes gzip level-9)
+
+### Phase 0 Exit (PR 04 Hardening) — Common Web Shell Baseline
+Measured on 2026-11-27 (macOS arm64, Apple M3 Ultra, Node.js v22.23.0) after `pnpm build` via `pnpm measure:shell` (enforced budget `<= 16,384` bytes gzip):
+
+- `index.html`: `340` bytes raw (`221` bytes gzip level-9)
+- `shell.js`: `17,309` bytes raw (`5,118` bytes gzip level-9)
+- `shell.css`: `3,325` bytes raw (`979` bytes gzip level-9)
+- Total: `20,974` bytes raw (`6,318` bytes gzip level-9)

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { Pool } from "pg";
 import { Kysely, PostgresDialect, sql } from "kysely";
 import type { TransactionRepositories, UnitOfWork } from "@prood/application";
@@ -5,6 +6,7 @@ import {
   createKyselyRepositories,
   executeWithTransientRetry,
   isPersistenceError,
+  PersistenceError,
   type KyselyBackedDatabaseClient,
   type MigrationRunOptions,
   type MigrationRunResult,
@@ -24,6 +26,13 @@ export interface PostgresDatabaseOptions {
 }
 
 const VALID_PG_IDENTIFIER = /^[a-z_][a-z0-9_]*$/;
+
+function assertValidNonNegativeNumber(name: string, value: number): number {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new RangeError(`Invalid ${name}: ${value}`);
+  }
+  return Math.trunc(value);
+}
 
 function attachPoolErrorHandler(
   pool: Pool,
@@ -82,14 +91,23 @@ export function createPostgresDatabase(
     throw new RangeError(`Invalid PostgreSQL schema identifier: ${options.schema}`);
   }
 
-  const lockTimeoutMs = Math.max(0, Math.trunc(options.lockTimeoutMs ?? 5000));
-  const statementTimeoutMs = Math.max(
-    0,
-    Math.trunc(options.statementTimeoutMs ?? 15000),
+  const lockTimeoutMs = assertValidNonNegativeNumber(
+    "lockTimeoutMs",
+    options.lockTimeoutMs ?? 5000,
+  );
+  const statementTimeoutMs = assertValidNonNegativeNumber(
+    "statementTimeoutMs",
+    options.statementTimeoutMs ?? 15000,
   );
   const retryPolicy = {
-    maxRetryAttempts: options.maxRetryAttempts ?? 3,
-    retryBaseDelayMs: options.retryBaseDelayMs ?? 25,
+    maxRetryAttempts: assertValidNonNegativeNumber(
+      "maxRetryAttempts",
+      options.maxRetryAttempts ?? 3,
+    ),
+    retryBaseDelayMs: assertValidNonNegativeNumber(
+      "retryBaseDelayMs",
+      options.retryBaseDelayMs ?? 25,
+    ),
   };
 
   const pool = new Pool({
@@ -103,6 +121,8 @@ export function createPostgresDatabase(
   const db = new Kysely<ProodDatabase>({
     dialect: new PostgresDialect({ pool }),
   });
+  const txStorage = new AsyncLocalStorage<boolean>();
+  let closePromise: Promise<void> | null = null;
 
   async function applyLocalTimeouts(executor: Kysely<ProodDatabase>): Promise<void> {
     try {
@@ -119,23 +139,35 @@ export function createPostgresDatabase(
 
   const uow: UnitOfWork = {
     async run<T>(fn: (repos: TransactionRepositories) => Promise<T>): Promise<T> {
+      if (txStorage.getStore() === true) {
+        throw new PersistenceError("Reentrant UnitOfWork.run() is not supported", {
+          code: "UNKNOWN_DB_ERROR",
+          driver: "postgres",
+          retryable: false,
+        });
+      }
+
       return executeWithTransientRetry(retryPolicy, async () => {
         let hasBusinessError = false;
+        let businessError: unknown;
         try {
           return await db.transaction().execute(async (trx) => {
             await applyLocalTimeouts(trx);
 
-            try {
-              return await fn(createKyselyRepositories(trx, mapPostgresError));
-            } catch (error) {
-              if (!isPersistenceError(error)) {
-                hasBusinessError = true;
+            return txStorage.run(true, async () => {
+              try {
+                return await fn(createKyselyRepositories(trx, mapPostgresError));
+              } catch (error) {
+                if (!isPersistenceError(error)) {
+                  hasBusinessError = true;
+                  businessError = error;
+                }
+                throw error;
               }
-              throw error;
-            }
+            });
           });
         } catch (error) {
-          if (hasBusinessError || isPersistenceError(error)) {
+          if ((hasBusinessError && error === businessError) || isPersistenceError(error)) {
             throw error;
           }
           return mapPostgresError(error);
@@ -265,8 +297,16 @@ export function createPostgresDatabase(
       }
     },
 
-    async close(): Promise<void> {
-      await db.destroy();
+    close(): Promise<void> {
+      if (!closePromise) {
+        closePromise = (async () => {
+          await db.destroy();
+          if (!pool.ended) {
+            await pool.end();
+          }
+        })();
+      }
+      return closePromise;
     },
   };
 }

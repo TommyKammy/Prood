@@ -1,8 +1,16 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { AuthPort, AuthSessionInfo, UnitOfWork } from "@prood/application";
 import { CONTRACT_VERSION } from "@prood/contracts";
 import { generateEntityId } from "@prood/domain";
-import { createApp } from "@prood/server/app";
+import {
+  createApp,
+  mountWebShellAssets,
+  resolveServerConfig,
+  shutdownServerResources,
+} from "@prood/server";
 
 describe("@prood/server Web-Standard app", () => {
   it("handles /healthz and /api/v1/health via Fetch Request/Response without Node HTTP", async () => {
@@ -162,5 +170,129 @@ describe("@prood/server Web-Standard app", () => {
       headers: { authorization: "Bearer valid" },
     });
     expect(forbiddenWsRes.status).toBe(403);
+    expect(meRes.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("returns structured JSON 500 via app.onError and enforces server startup config & web security headers", async () => {
+    const failingApp = createApp({
+      clock: { now: () => new Date("2026-11-27T09:00:00.000Z") },
+      dbHealth: {
+        driver: "sqlite",
+        ping: async () => {
+          throw new Error("DB unreachable");
+        },
+      },
+    });
+    const errRes = await failingApp.request("/api/v1/health");
+    expect(errRes.status).toBe(500);
+    expect(await errRes.json()).toEqual({
+      contractVersion: CONTRACT_VERSION,
+      error: { code: "INTERNAL_ERROR", messageKey: "error.generic" },
+    });
+
+    // Server config guards
+    expect(() =>
+      resolveServerConfig({ NODE_ENV: "production" }),
+    ).toThrow(/PROOD_AUTH_SECRET/);
+    expect(() =>
+      resolveServerConfig({ NODE_ENV: "production", PROOD_AUTH_SECRET: "short" }),
+    ).toThrow(/32 characters/);
+    expect(() =>
+      resolveServerConfig({ PORT: "not-a-port" }),
+    ).toThrow(/Invalid PORT/);
+    expect(resolveServerConfig({})).toMatchObject({
+      port: 3000,
+      hostname: "127.0.0.1",
+      baseURL: "http://127.0.0.1:3000",
+    });
+
+    // IPv6 host bracketing
+    const ipv6Cfg = resolveServerConfig({ HOST: "::1", PORT: "3000" });
+    expect(ipv6Cfg).toMatchObject({
+      port: 3000,
+      hostname: "::1",
+      baseURL: "http://[::1]:3000",
+      mcpResource: "http://[::1]:3000/mcp",
+    });
+    expect(() => new URL(ipv6Cfg.baseURL)).not.toThrow();
+    expect(resolveServerConfig({ HOST: "[::1]", PORT: "4000" })).toMatchObject({
+      hostname: "::1",
+      baseURL: "http://[::1]:4000",
+    });
+
+    // Shutdown closes MCP streams before HTTP server finishes draining
+    let closeCallback!: () => void;
+    const steps: string[] = [];
+    await shutdownServerResources({
+      server: {
+        close(cb) {
+          steps.push("server.close");
+          closeCallback = cb;
+        },
+        closeIdleConnections() {
+          steps.push("server.closeIdleConnections");
+        },
+      },
+      closeMcp: async () => {
+        steps.push("closeMcp");
+        closeCallback();
+      },
+      closeDb: async () => {
+        steps.push("closeDb");
+      },
+      timeoutMs: 500,
+    });
+    expect(steps).toEqual([
+      "server.close",
+      "closeMcp",
+      "server.closeIdleConnections",
+      "closeDb",
+    ]);
+
+    // Bounded shutdown fallback triggers closeAllConnections if a stream stalls
+    let forcedAll = false;
+    await shutdownServerResources({
+      server: {
+        close() {
+          // Intentionally never fires callback
+        },
+        closeAllConnections() {
+          forcedAll = true;
+        },
+      },
+      closeMcp: async () => {},
+      closeDb: async () => {},
+      timeoutMs: 20,
+    });
+    expect(forcedAll).toBe(true);
+
+    // Static web asset security headers on /, /oauth/consent, /oauth/consent/
+    const assetDir = mkdtempSync(join(tmpdir(), "prood-web-assets-"));
+    try {
+      writeFileSync(join(assetDir, "index.html"), "<html></html>");
+      writeFileSync(join(assetDir, "shell.js"), "console.log(1);");
+      writeFileSync(join(assetDir, "shell.css"), "body{}");
+
+      const rootApp = createApp({
+        clock: { now: () => new Date("2026-11-27T09:00:00.000Z") },
+        dbHealth: { driver: "sqlite", ping: async () => ({ ok: true }) },
+      });
+      mountWebShellAssets(rootApp, assetDir);
+
+      for (const route of ["/", "/oauth/consent", "/oauth/consent/"]) {
+        const res = await rootApp.request(route);
+        expect(res.status).toBe(200);
+        expect(res.headers.get("x-frame-options")).toBe("DENY");
+        expect(res.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+        expect(res.headers.get("referrer-policy")).toBe("no-referrer");
+        expect(res.headers.get("cache-control")).toBe("no-store");
+        expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+      }
+      const jsRes = await rootApp.request("/shell.js");
+      expect(jsRes.status).toBe(200);
+      expect(jsRes.headers.get("x-content-type-options")).toBe("nosniff");
+    } finally {
+      rmSync(assetDir, { recursive: true, force: true });
+    }
   });
 });

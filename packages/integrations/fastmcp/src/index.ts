@@ -14,6 +14,7 @@ import { MCP_REQUIRED_WHOAMI_SCOPE } from "@prood/contracts";
 
 const DEFAULT_SESSION_IDLE_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_ACTIVE_SESSIONS = 1000;
+const DEFAULT_MAX_SESSIONS_PER_PRINCIPAL = 20;
 
 export interface ProodMcpServerDeps {
   resource: string;
@@ -24,15 +25,33 @@ export interface ProodMcpServerDeps {
   onWhoamiExecuted?: () => void;
   sessionIdleTtlMs?: number;
   maxActiveSessions?: number;
+  maxSessionsPerPrincipal?: number;
+  trustedOrigins?: string[];
 }
 
 type ProodMcpSessionAuth = McpVerifiedToken & Record<string, unknown>;
 
 interface ActiveSessionEntry {
+  ownerSubject: string;
+  ownerClientId: string;
   transport: WebStreamableHTTPServerTransport;
   session: FastMCPSession<ProodMcpSessionAuth>;
   lastActivityAtMs: number;
   tokenExpiresAtMs: number;
+  closed: boolean;
+  queue: Promise<void>;
+}
+
+const TOOL_REQUIRED_SCOPES = new Map<string, readonly string[]>([
+  ["whoami", [MCP_REQUIRED_WHOAMI_SCOPE]],
+]);
+
+function sanitizeHeaderValue(value: string): string {
+  return value
+    .replace(/[\r\n\t\x00-\x1f\x7f]+/g, " ")
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, "'")
+    .trim();
 }
 
 function buildUnauthorizedResponse(
@@ -42,14 +61,14 @@ function buildUnauthorizedResponse(
   resourceMetadataUrl: string,
   requiredScope?: string,
 ): Response {
-  const safeDesc = description.replaceAll('"', "'");
+  const safeDesc = sanitizeHeaderValue(description);
   const parts = [
-    `Bearer resource_metadata="${resourceMetadataUrl}"`,
+    `Bearer resource_metadata="${sanitizeHeaderValue(resourceMetadataUrl)}"`,
     `error="${error}"`,
     `error_description="${safeDesc}"`,
   ];
   if (requiredScope) {
-    parts.push(`scope="${requiredScope}"`);
+    parts.push(`scope="${sanitizeHeaderValue(requiredScope)}"`);
   }
   return new Response(
     JSON.stringify({
@@ -67,9 +86,28 @@ function buildUnauthorizedResponse(
   );
 }
 
+function jsonRpcErrorResponse(
+  status: number,
+  code: number,
+  message: string,
+): Response {
+  return new Response(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      error: { code, message },
+      id: null,
+    }),
+    {
+      status,
+      headers: { "content-type": "application/json" },
+    },
+  );
+}
+
 /**
  * Creates a FastMCP server exposing Prood tools over Web-Standard Streamable HTTP,
- * verifying OAuth bearer tokens, per-tool scopes, and bounded session retention.
+ * verifying Origin headers, OAuth bearer tokens, per-tool scopes, principal isolation,
+ * and bounded session retention.
  */
 export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
   const identityUseCase = createMcpIdentityUseCase({
@@ -86,6 +124,27 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
     1,
     Math.trunc(deps.maxActiveSessions ?? DEFAULT_MAX_ACTIVE_SESSIONS),
   );
+  const maxSessionsPerPrincipal = Math.min(
+    maxActiveSessions,
+    Math.max(
+      1,
+      Math.trunc(deps.maxSessionsPerPrincipal ?? DEFAULT_MAX_SESSIONS_PER_PRINCIPAL),
+    ),
+  );
+
+  const trustedOriginSet = deps.trustedOrigins
+    ? new Set(
+        deps.trustedOrigins
+          .map((origin) => {
+            try {
+              return new URL(origin).origin;
+            } catch {
+              return origin.replace(/\/+$/, "");
+            }
+          })
+          .filter(Boolean),
+      )
+    : null;
 
   const resourceUrl = new URL(deps.resource);
   const resourceMetadataUrl = `${resourceUrl.origin}/.well-known/oauth-protected-resource`;
@@ -128,13 +187,14 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
   const activeSessions = new Map<string, ActiveSessionEntry>();
 
   async function closeSessionEntry(entry: ActiveSessionEntry): Promise<void> {
+    if (entry.closed) {
+      return;
+    }
+    entry.closed = true;
     await Promise.allSettled([entry.session.close(), entry.transport.close()]);
   }
 
-  function collectEvictions(
-    nowMs: number,
-    maxAllowed: number,
-  ): ActiveSessionEntry[] {
+  function collectExpiredEvictions(nowMs: number): ActiveSessionEntry[] {
     const evicted: ActiveSessionEntry[] = [];
     for (const [sid, entry] of activeSessions) {
       const idleExpired = nowMs - entry.lastActivityAtMs >= sessionIdleTtlMs;
@@ -145,20 +205,49 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
         evicted.push(entry);
       }
     }
-    while (activeSessions.size > maxAllowed) {
+    return evicted;
+  }
+
+  function collectCapacityEvictions(
+    nowMs: number,
+    ownerSubject: string,
+    ownerClientId: string,
+  ): ActiveSessionEntry[] {
+    const evicted = collectExpiredEvictions(nowMs);
+
+    const principalEntries: Array<[string, ActiveSessionEntry]> = [];
+    for (const [sid, entry] of activeSessions) {
+      if (
+        entry.ownerSubject === ownerSubject &&
+        entry.ownerClientId === ownerClientId
+      ) {
+        principalEntries.push([sid, entry]);
+      }
+    }
+    const maxAllowedForPrincipal = Math.max(0, maxSessionsPerPrincipal - 1);
+    while (principalEntries.length > maxAllowedForPrincipal) {
+      const oldest = principalEntries.shift();
+      if (!oldest) {
+        break;
+      }
+      activeSessions.delete(oldest[0]);
+      evicted.push(oldest[1]);
+    }
+
+    const maxAllowedGlobal = Math.max(0, maxActiveSessions - 1);
+    while (activeSessions.size > maxAllowedGlobal) {
       const oldest = activeSessions.entries().next().value;
       if (!oldest) {
         break;
       }
-      const [oldestId, oldestEntry] = oldest;
-      activeSessions.delete(oldestId);
-      evicted.push(oldestEntry);
+      activeSessions.delete(oldest[0]);
+      evicted.push(oldest[1]);
     }
     return evicted;
   }
 
-  async function evictSessions(nowMs: number): Promise<void> {
-    const evicted = collectEvictions(nowMs, maxActiveSessions);
+  async function evictExpiredSessions(nowMs: number): Promise<void> {
+    const evicted = collectExpiredEvictions(nowMs);
     if (evicted.length > 0) {
       await Promise.allSettled(evicted.map(closeSessionEntry));
     }
@@ -174,6 +263,36 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
     entry.tokenExpiresAtMs = token.expiresAt > 0 ? token.expiresAt * 1000 : 0;
     activeSessions.delete(sessionId);
     activeSessions.set(sessionId, entry);
+  }
+
+  function checkTokenScopes(
+    parsedBody: unknown,
+    tokenScopes: readonly string[],
+  ): Response | null {
+    const messages = Array.isArray(parsedBody) ? parsedBody : [parsedBody];
+    for (const msg of messages) {
+      if (!msg || typeof msg !== "object") {
+        continue;
+      }
+      const record = msg as { method?: unknown; params?: { name?: unknown } };
+      if (record.method === "tools/call" && typeof record.params?.name === "string") {
+        const required = TOOL_REQUIRED_SCOPES.get(record.params.name);
+        if (required && required.length > 0) {
+          const missing = required.filter((scope) => !tokenScopes.includes(scope));
+          if (missing.length > 0) {
+            const requiredScope = missing.join(" ");
+            return buildUnauthorizedResponse(
+              403,
+              "insufficient_scope",
+              `Insufficient scope: ${requiredScope} required`,
+              resourceMetadataUrl,
+              requiredScope,
+            );
+          }
+        }
+      }
+    }
+    return null;
   }
 
   function checkSessionScopes(
@@ -197,10 +316,35 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
     return null;
   }
 
+  function enqueueSessionWork<T>(
+    entry: ActiveSessionEntry,
+    work: () => Promise<T>,
+  ): Promise<T> {
+    const next = entry.queue.then(work, work);
+    entry.queue = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
   return {
     async handleRequest(request: Request): Promise<Response> {
+      const originHeader = request.headers.get("origin");
+      if (originHeader && trustedOriginSet && trustedOriginSet.size > 0) {
+        let normalizedOrigin = originHeader;
+        try {
+          normalizedOrigin = new URL(originHeader).origin;
+        } catch {
+          return jsonRpcErrorResponse(403, -32003, "Invalid Origin header");
+        }
+        if (!trustedOriginSet.has(normalizedOrigin)) {
+          return jsonRpcErrorResponse(403, -32003, "Origin not allowed");
+        }
+      }
+
       const nowMs = deps.clock.now().getTime();
-      await evictSessions(nowMs);
+      await evictExpiredSessions(nowMs);
 
       const authResult = await deps.tokenVerifier.verifyBearerToken(
         request.headers,
@@ -226,35 +370,45 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
           const text = await request.text();
           parsedBody = text ? JSON.parse(text) : undefined;
         } catch {
-          return new Response(
-            JSON.stringify({
-              jsonrpc: "2.0",
-              error: { code: -32700, message: "Parse error" },
-              id: null,
-            }),
-            { status: 400, headers: { "content-type": "application/json" } },
-          );
+          return jsonRpcErrorResponse(400, -32700, "Parse error");
         }
 
         if (sessionId) {
           const existing = activeSessions.get(sessionId);
-          if (!existing) {
-            return new Response(
-              JSON.stringify({
-                jsonrpc: "2.0",
-                error: { code: -32001, message: "Session not found" },
-                id: null,
-              }),
-              { status: 404, headers: { "content-type": "application/json" } },
+          if (!existing || existing.closed) {
+            return jsonRpcErrorResponse(404, -32001, "Session not found");
+          }
+          if (
+            existing.ownerSubject !== authResult.token.subject ||
+            existing.ownerClientId !== authResult.token.clientId
+          ) {
+            return jsonRpcErrorResponse(
+              403,
+              -32003,
+              "Session belongs to a different principal",
             );
           }
-          touchSession(sessionId, existing, nowMs, authResult.token);
-          existing.session.updateAuth(sessionAuth);
-          const scopeError = checkSessionScopes(existing.session, parsedBody);
-          if (scopeError) {
-            return scopeError;
+          const earlyScopeError = checkTokenScopes(
+            parsedBody,
+            authResult.token.scopes,
+          );
+          if (earlyScopeError) {
+            return earlyScopeError;
           }
-          return existing.transport.handleRequest(request, parsedBody);
+
+          return enqueueSessionWork(existing, async () => {
+            if (existing.closed || activeSessions.get(sessionId) !== existing) {
+              return jsonRpcErrorResponse(404, -32001, "Session not found");
+            }
+            const reqNowMs = deps.clock.now().getTime();
+            touchSession(sessionId, existing, reqNowMs, authResult.token);
+            existing.session.updateAuth(sessionAuth);
+            const scopeError = checkSessionScopes(existing.session, parsedBody);
+            if (scopeError) {
+              return scopeError;
+            }
+            return existing.transport.handleRequest(request, parsedBody);
+          });
         }
 
         let connectedSession: FastMCPSession<ProodMcpSessionAuth> | undefined;
@@ -266,15 +420,18 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
           onsessioninitialized: (newSessionId) => {
             initializedSessionId = newSessionId;
             const callbackNowMs = deps.clock.now().getTime();
-            const overflow = collectEvictions(
+            const overflow = collectCapacityEvictions(
               callbackNowMs,
-              Math.max(0, maxActiveSessions - 1),
+              authResult.token.subject,
+              authResult.token.clientId,
             );
             for (const entry of overflow) {
               pendingEvictionCloses.push(closeSessionEntry(entry));
             }
             if (connectedSession) {
               activeSessions.set(newSessionId, {
+                ownerSubject: authResult.token.subject,
+                ownerClientId: authResult.token.clientId,
                 transport,
                 session: connectedSession,
                 lastActivityAtMs: callbackNowMs,
@@ -282,11 +439,17 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
                   authResult.token.expiresAt > 0
                     ? authResult.token.expiresAt * 1000
                     : 0,
+                closed: false,
+                queue: Promise.resolve(),
               });
             }
           },
           onsessionclosed: (closedSessionId) => {
+            const entry = activeSessions.get(closedSessionId);
             activeSessions.delete(closedSessionId);
+            if (entry) {
+              pendingEvictionCloses.push(closeSessionEntry(entry));
+            }
           },
         });
 
@@ -309,31 +472,40 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
       }
 
       if (!sessionId) {
-        return new Response(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            error: { code: -32000, message: "Missing mcp-session-id header" },
-            id: null,
-          }),
-          { status: 400, headers: { "content-type": "application/json" } },
-        );
+        return jsonRpcErrorResponse(400, -32000, "Missing mcp-session-id header");
       }
 
       const existing = activeSessions.get(sessionId);
-      if (!existing) {
-        return new Response(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            error: { code: -32001, message: "Session not found" },
-            id: null,
-          }),
-          { status: 404, headers: { "content-type": "application/json" } },
+      if (!existing || existing.closed) {
+        return jsonRpcErrorResponse(404, -32001, "Session not found");
+      }
+      if (
+        existing.ownerSubject !== authResult.token.subject ||
+        existing.ownerClientId !== authResult.token.clientId
+      ) {
+        return jsonRpcErrorResponse(
+          403,
+          -32003,
+          "Session belongs to a different principal",
         );
       }
 
       touchSession(sessionId, existing, nowMs, authResult.token);
       existing.session.updateAuth(sessionAuth);
-      return existing.transport.handleRequest(request);
+      const response = await existing.transport.handleRequest(request);
+      if (request.method === "DELETE") {
+        activeSessions.delete(sessionId);
+        await closeSessionEntry(existing);
+      }
+      return response;
+    },
+
+    async close(): Promise<void> {
+      const entries = Array.from(activeSessions.values());
+      activeSessions.clear();
+      if (entries.length > 0) {
+        await Promise.allSettled(entries.map(closeSessionEntry));
+      }
     },
   };
 }

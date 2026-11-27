@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server as HttpServer } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { afterEach, describe, expect, it } from "vitest";
@@ -24,7 +24,11 @@ import {
   dropPostgresSchema,
 } from "@prood/persistence-postgres";
 import { createSqliteDatabase } from "@prood/persistence-sqlite";
-import { createApp, createNodeAppListener } from "@prood/server";
+import {
+  createApp,
+  createNodeAppListener,
+  mountWebShellAssets,
+} from "@prood/server";
 
 const targetDb = process.env.PROOD_TEST_DB as DbDriverKind | undefined;
 if (targetDb !== "sqlite" && targetDb !== "postgres") {
@@ -194,6 +198,8 @@ async function startTestHttpServer(
     mcpAuth: auth,
     mcpHandler,
   });
+
+  mountWebShellAssets(app, resolve(process.cwd(), "apps/web/dist"));
 
   httpServer.on("request", createNodeAppListener(app));
 
@@ -743,6 +749,17 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
     const consentUrl = new URL(signInJson.url!, server.baseURL);
     expect(consentUrl.pathname).toBe("/oauth/consent");
 
+    // Verify mounted web shell assets serve /oauth/consent, /shell.js, /shell.css with security headers
+    const consentPageRes = await fetch(consentUrl.toString());
+    expect(consentPageRes.status).toBe(200);
+    expect(consentPageRes.headers.get("x-frame-options")).toBe("DENY");
+    expect(await consentPageRes.text()).toContain('src="/shell.js"');
+
+    const shellJsRes = await fetch(`${server.baseURL}/shell.js`);
+    expect(shellJsRes.status).toBe(200);
+    const shellCssRes = await fetch(`${server.baseURL}/shell.css`);
+    expect(shellCssRes.status).toBe(200);
+
     // 4. Approve consent and exchange code for JWT token
     const consentRes = await fetch(`${server.baseURL}/api/auth/oauth2/consent`, {
       method: "POST",
@@ -799,5 +816,151 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
     } finally {
       await client.close();
     }
+  });
+
+  it("enforces consent denial and rejects revoked sessions, disabled clients, and deleted users on /mcp", async () => {
+    const ctx = await createIsolatedOAuthDb();
+    const db = ctx.openClient();
+    await db.migrate();
+    const server = await startTestHttpServer(db);
+
+    const jar = new CookieJar();
+    const signUpRes = await fetch(`${server.baseURL}/api/auth/sign-up/email`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: server.baseURL,
+      },
+      body: JSON.stringify({
+        email: "revoke-user@example.com",
+        password: "revoke-password-1234",
+        name: "Revoke Tester",
+      }),
+    });
+    expect(signUpRes.status).toBe(200);
+    jar.updateFrom(signUpRes);
+
+    // 1. Consent denial returns access_denied redirect
+    const asMeta = (await (
+      await fetch(`${server.baseURL}/.well-known/oauth-authorization-server`)
+    ).json()) as { authorization_endpoint: string; registration_endpoint: string };
+    const redirectUri = "http://127.0.0.1:49154/callback";
+    const regJson = (await (
+      await fetch(asMeta.registration_endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          client_name: "Deny Test Client",
+          redirect_uris: [redirectUri],
+          grant_types: ["authorization_code"],
+          response_types: ["code"],
+          token_endpoint_auth_method: "none",
+          scope: `openid ${MCP_REQUIRED_WHOAMI_SCOPE}`,
+        }),
+      })
+    ).json()) as { client_id: string };
+    const { challenge } = createPkcePair();
+    const denyAuthUrl = new URL(asMeta.authorization_endpoint);
+    denyAuthUrl.searchParams.set("response_type", "code");
+    denyAuthUrl.searchParams.set("client_id", regJson.client_id);
+    denyAuthUrl.searchParams.set("redirect_uri", redirectUri);
+    denyAuthUrl.searchParams.set("scope", `openid ${MCP_REQUIRED_WHOAMI_SCOPE}`);
+    denyAuthUrl.searchParams.set("resource", server.mcpResource);
+    denyAuthUrl.searchParams.set("state", "deny-state");
+    denyAuthUrl.searchParams.set("code_challenge", challenge);
+    denyAuthUrl.searchParams.set("code_challenge_method", "S256");
+
+    const denyAuthRes = await fetch(denyAuthUrl.toString(), {
+      headers: { accept: "text/html", cookie: jar.toHeader() },
+      redirect: "manual",
+    });
+    let denyConsentLoc = denyAuthRes.headers.get("location");
+    if (denyAuthRes.status === 200) {
+      denyConsentLoc = ((await denyAuthRes.json()) as { url?: string }).url ?? null;
+    }
+    const denyQuery = new URL(denyConsentLoc!, server.baseURL).search.replace(/^\?/, "");
+    const deniedRes = await fetch(`${server.baseURL}/api/auth/oauth2/consent`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: server.baseURL,
+        cookie: jar.toHeader(),
+      },
+      body: JSON.stringify({ accept: false, oauth_query: denyQuery }),
+    });
+    expect(deniedRes.status).toBe(200);
+    const deniedCallback = new URL(((await deniedRes.json()) as { url: string }).url);
+    expect(deniedCallback.searchParams.get("error")).toBe("access_denied");
+    expect(deniedCallback.searchParams.get("state")).toBe("deny-state");
+
+    // 2. Issue valid token, confirm 200 on initialize, then test client disable & session/user revocation
+    const { accessToken, clientId } = await issueOAuthAccessToken({
+      baseURL: server.baseURL,
+      cookieJar: jar,
+      scope: `openid ${MCP_REQUIRED_WHOAMI_SCOPE}`,
+      resource: server.mcpResource,
+    });
+
+    const initBody = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-03-26",
+        capabilities: {},
+        clientInfo: { name: "revoke-check", version: "1.0.0" },
+      },
+    });
+    const okRes = await fetch(server.mcpResource, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: `Bearer ${accessToken}`,
+      },
+      body: initBody,
+    });
+    expect(okRes.status).toBe(200);
+
+    // Disable OAuth client -> must fail with 401 invalid_token
+    await db.kysely
+      .updateTable("oauthClient")
+      .set({ disabled: targetDb === "sqlite" ? 1 : true })
+      .where("clientId", "=", clientId)
+      .execute();
+    const disabledRes = await fetch(server.mcpResource, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: `Bearer ${accessToken}`,
+      },
+      body: initBody,
+    });
+    expect(disabledRes.status).toBe(401);
+
+    // Re-enable client, verify works again, then sign out (revokes auth_session) & delete auth_user
+    await db.kysely
+      .updateTable("oauthClient")
+      .set({ disabled: targetDb === "sqlite" ? 0 : false })
+      .where("clientId", "=", clientId)
+      .execute();
+
+    await fetch(`${server.baseURL}/api/auth/sign-out`, {
+      method: "POST",
+      headers: { origin: server.baseURL, cookie: jar.toHeader() },
+    });
+    // Also delete auth_user to verify subject revocation regardless of sid claim presence
+    await db.kysely.deleteFrom("auth_user").execute();
+    const revokedRes = await fetch(server.mcpResource, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: `Bearer ${accessToken}`,
+      },
+      body: initBody,
+    });
+    expect(revokedRes.status).toBe(401);
   });
 });

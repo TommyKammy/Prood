@@ -73,4 +73,38 @@ describe("@prood/web i18n", () => {
       i18n.formatDate(sampleDate, { year: "numeric", month: "numeric", day: "numeric", timeZone: "UTC" }),
     ).toContain("2026");
   });
+
+  it("supports BCP-47 base-language fallback and safely normalizes invalid locale tags", () => {
+    const regional = createI18n({
+      locale: "ja-JP",
+      catalogs: {
+        ja: {
+          "action.createTask": "タスクを作成",
+          "task.count.other": "{count}件のタスク",
+        },
+      },
+    });
+    expect(regional.getLocale()).toBe("ja-JP");
+    expect(regional.t("action.createTask")).toBe("タスクを作成");
+    expect(regional.formatTaskCount(2)).toBe("2件のタスク");
+
+    const invalid = createI18n({ locale: "en_US_invalid!!!" });
+    expect(invalid.getLocale()).toBe("en");
+    expect(invalid.formatNumber(1000)).toBe("1,000");
+
+    invalid.setLocale("");
+    expect(invalid.getLocale()).toBe("en");
+
+    // Noncanonical catalog keys are canonicalized alongside locale
+    const portuguese = createI18n({
+      locale: "pt-br",
+      catalogs: {
+        "pt-br": {
+          "action.createTask": "Criar tarefa",
+        },
+      },
+    });
+    expect(portuguese.getLocale()).toBe("pt-BR");
+    expect(portuguese.t("action.createTask")).toBe("Criar tarefa");
+  });
 });

@@ -1,14 +1,19 @@
 export const CROCKFORD_BASE32 = "0123456789abcdefghjkmnpqrstvwxyz";
 
-export type PublicEntityPrefix =
-  | "tsk"
-  | "prj"
-  | "wks"
-  | "usr"
-  | "sts"
-  | "evt"
-  | "mbr"
-  | "out";
+export const PUBLIC_ENTITY_PREFIXES = [
+  "tsk",
+  "prj",
+  "wks",
+  "usr",
+  "sts",
+  "evt",
+  "mbr",
+  "out",
+] as const;
+
+export type PublicEntityPrefix = (typeof PUBLIC_ENTITY_PREFIXES)[number];
+
+const VALID_PREFIX_SET = new Set<string>(PUBLIC_ENTITY_PREFIXES);
 
 export type EntityId<P extends PublicEntityPrefix> = `${P}_${string}`;
 
@@ -111,8 +116,9 @@ export function createMonotonicIdGenerator(
         }
         lastRandom += 1n;
       } else {
+        const nextRandom = bytesToBigInt80(deps.randomBytes(10));
         lastTime = nowMs;
-        lastRandom = bytesToBigInt80(deps.randomBytes(10));
+        lastRandom = nextRandom;
       }
 
       const ts = encodeBigIntBase32(BigInt(lastTime), TIMESTAMP_LENGTH);
@@ -123,7 +129,8 @@ export function createMonotonicIdGenerator(
 }
 
 /**
- * Validates that a string matches `<prefix>_<26 lowercase Crockford Base32 chars>`.
+ * Validates that a string matches `<prefix>_<26 lowercase Crockford Base32 chars>`
+ * within the valid 48-bit ULID timestamp range.
  */
 export function isValidEntityId<P extends PublicEntityPrefix>(
   prefix: P,
@@ -135,6 +142,10 @@ export function isValidEntityId<P extends PublicEntityPrefix>(
   }
   const suffix = value.slice(expectedPrefix.length);
   if (suffix.length !== ULID_LENGTH) {
+    return false;
+  }
+  const firstDigit = BASE32_LOOKUP.get(suffix[0]!);
+  if (firstDigit === undefined || firstDigit > 7n) {
     return false;
   }
   for (let i = 0; i < suffix.length; i += 1) {
@@ -153,17 +164,30 @@ export function decodeEntityIdTimestamp(id: string): number {
   if (sepIdx <= 0) {
     throw new RangeError(`Invalid entity ID format: ${id}`);
   }
+  const prefix = id.slice(0, sepIdx);
+  if (!VALID_PREFIX_SET.has(prefix)) {
+    throw new RangeError(`Invalid entity ID prefix: ${id}`);
+  }
   const suffix = id.slice(sepIdx + 1);
   if (suffix.length !== ULID_LENGTH) {
     throw new RangeError(`Invalid entity ID length: ${id}`);
   }
+  const firstDigit = BASE32_LOOKUP.get(suffix[0]!);
+  if (firstDigit === undefined) {
+    throw new RangeError(`Invalid Base32 character in entity ID: ${id}`);
+  }
+  if (firstDigit > 7n) {
+    throw new RangeError(`Timestamp overflow in entity ID: ${id}`);
+  }
   let ts = 0n;
-  for (let i = 0; i < TIMESTAMP_LENGTH; i += 1) {
+  for (let i = 0; i < suffix.length; i += 1) {
     const digit = BASE32_LOOKUP.get(suffix[i]!);
     if (digit === undefined) {
       throw new RangeError(`Invalid Base32 character in entity ID: ${id}`);
     }
-    ts = (ts << 5n) | digit;
+    if (i < TIMESTAMP_LENGTH) {
+      ts = (ts << 5n) | digit;
+    }
   }
   return Number(ts);
 }

@@ -1,11 +1,22 @@
 import type { MeResponse } from "@prood/contracts";
+import type { WorkspaceRole } from "@prood/domain";
 import { createI18n, type I18nInstance } from "./i18n/messages.js";
-import { ProodLoginFormElement } from "./login-form.js";
+import {
+  extractSignedOAuthQuery,
+  isSafeRedirectUrl,
+  ProodLoginFormElement,
+} from "./login-form.js";
 
 const BaseElement =
   typeof HTMLElement !== "undefined" ? HTMLElement : (class {} as typeof HTMLElement);
 
 export type ShellAuthState = "loading" | "authenticated" | "unauthenticated";
+
+const ROLE_LABEL_KEYS: Record<WorkspaceRole, "role.admin" | "role.member" | "role.viewer"> = {
+  admin: "role.admin",
+  member: "role.member",
+  viewer: "role.viewer",
+};
 
 export class ProodShellElement extends BaseElement {
   private i18n: I18nInstance = createI18n();
@@ -15,16 +26,57 @@ export class ProodShellElement extends BaseElement {
   private signOutError = "";
   private consentError = "";
   private consentSubmitting = false;
+  private consentClientName: string | null = null;
+  private consentClientFetchedFor: string | null = null;
+  private sessionRequestSeq = 0;
+  private listenersController: AbortController | null = null;
 
   connectedCallback(): void {
-    this.addEventListener("prood-authenticated", () => {
-      void this.refreshSession();
-    });
+    this.listenersController?.abort();
+    const controller = new AbortController();
+    this.listenersController = controller;
+
+    this.addEventListener(
+      "prood-authenticated",
+      () => {
+        void this.refreshSession();
+      },
+      { signal: controller.signal },
+    );
+
+    if (typeof window !== "undefined") {
+      window.addEventListener(
+        "pageshow",
+        (event) => {
+          if ((event as PageTransitionEvent).persisted) {
+            void this.refreshSession();
+          }
+        },
+        { signal: controller.signal },
+      );
+      window.addEventListener(
+        "popstate",
+        () => {
+          this.render();
+        },
+        { signal: controller.signal },
+      );
+    }
+
+    this.render();
     void this.refreshSession();
+  }
+
+  disconnectedCallback(): void {
+    this.listenersController?.abort();
+    this.listenersController = null;
   }
 
   setI18n(i18n: I18nInstance): void {
     this.i18n = i18n;
+    if (typeof document !== "undefined" && document.documentElement) {
+      document.documentElement.lang = i18n.getLocale();
+    }
     this.render();
   }
 
@@ -36,12 +88,20 @@ export class ProodShellElement extends BaseElement {
     return this.signOutError;
   }
 
+  getConsentError(): string {
+    return this.consentError;
+  }
+
   async refreshSession(): Promise<void> {
     if (typeof fetch === "undefined") {
       return;
     }
+    const seq = ++this.sessionRequestSeq;
     try {
       const res = await fetch("/api/v1/me", { credentials: "same-origin" });
+      if (seq !== this.sessionRequestSeq) {
+        return;
+      }
       if (res.ok) {
         this.sessionProfile = (await res.json()) as MeResponse;
         this.authState = "authenticated";
@@ -51,6 +111,9 @@ export class ProodShellElement extends BaseElement {
         this.authState = "unauthenticated";
       }
     } catch {
+      if (seq !== this.sessionRequestSeq) {
+        return;
+      }
       this.sessionProfile = null;
       this.authState = "unauthenticated";
     }
@@ -71,6 +134,7 @@ export class ProodShellElement extends BaseElement {
         credentials: "same-origin",
       });
       if (res.ok || res.status === 401) {
+        this.sessionRequestSeq += 1;
         this.sessionProfile = null;
         this.authState = "unauthenticated";
         this.signOutError = "";
@@ -87,7 +151,48 @@ export class ProodShellElement extends BaseElement {
     }
   }
 
-  private async submitConsent(accept: boolean): Promise<void> {
+  private isConsentRoute(): boolean {
+    if (typeof window === "undefined") {
+      return false;
+    }
+    return (
+      window.location.pathname === "/oauth/consent" ||
+      window.location.pathname === "/oauth/consent/"
+    );
+  }
+
+  private async fetchConsentClientName(clientId: string): Promise<void> {
+    if (
+      typeof fetch === "undefined" ||
+      !clientId ||
+      this.consentClientFetchedFor === clientId
+    ) {
+      return;
+    }
+    this.consentClientFetchedFor = clientId;
+    try {
+      const res = await fetch(
+        `/api/auth/oauth2/public-client?client_id=${encodeURIComponent(clientId)}`,
+        { credentials: "same-origin" },
+      );
+      if (!res.ok) {
+        return;
+      }
+      const data = (await res.json().catch(() => null)) as {
+        client_name?: string;
+        name?: string;
+      } | null;
+      const name = data?.client_name ?? data?.name;
+      if (typeof name === "string" && name.trim()) {
+        this.consentClientName = name.trim();
+        this.render();
+      }
+    } catch {
+      // Keep client_id fallback display
+    }
+  }
+
+  async submitConsent(accept: boolean): Promise<void> {
     if (
       typeof fetch === "undefined" ||
       typeof window === "undefined" ||
@@ -95,30 +200,46 @@ export class ProodShellElement extends BaseElement {
     ) {
       return;
     }
+    const signedQuery = extractSignedOAuthQuery(window.location.search);
+    if (!signedQuery) {
+      this.consentError = this.i18n.t("oauth.consentInvalid");
+      this.render();
+      return;
+    }
+
     this.consentSubmitting = true;
     this.consentError = "";
     this.render();
+
+    let redirecting = false;
     try {
-      const oauthQuery = window.location.search.replace(/^\?/, "");
       const res = await fetch("/api/auth/oauth2/consent", {
         method: "POST",
         credentials: "same-origin",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ accept, oauth_query: oauthQuery }),
+        body: JSON.stringify({ accept, oauth_query: signedQuery }),
       });
       if (!res.ok) {
         this.consentError = this.i18n.t("oauth.consentError");
         return;
       }
-      const data = (await res.json()) as { redirect_uri?: string; url?: string };
-      const target = data.redirect_uri ?? data.url;
-      if (target) {
+      const data = (await res.json().catch(() => null)) as {
+        redirect_uri?: string;
+        url?: string;
+      } | null;
+      const target = data?.redirect_uri ?? data?.url;
+      if (typeof target === "string" && isSafeRedirectUrl(target)) {
+        redirecting = true;
         window.location.assign(target);
+        return;
       }
+      this.consentError = this.i18n.t("oauth.consentError");
     } catch {
       this.consentError = this.i18n.t("oauth.consentError");
     } finally {
-      this.consentSubmitting = false;
+      if (!redirecting) {
+        this.consentSubmitting = false;
+      }
       this.render();
     }
   }
@@ -128,6 +249,7 @@ export class ProodShellElement extends BaseElement {
       return;
     }
     const { t, formatTaskCount } = this.i18n;
+    const isConsent = this.isConsentRoute();
 
     this.innerHTML = "";
 
@@ -163,19 +285,30 @@ export class ProodShellElement extends BaseElement {
       signOutBtn.addEventListener("click", () => {
         void this.signOut();
       });
+      actions.appendChild(signOutBtn);
 
-      const createBtn = document.createElement("button");
-      createBtn.type = "button";
-      createBtn.className = "prood-btn-primary";
-      createBtn.textContent = t("action.createTask");
-
-      actions.append(signOutBtn, createBtn);
+      if (!isConsent) {
+        const createBtn = document.createElement("button");
+        createBtn.type = "button";
+        createBtn.className = "prood-btn-primary";
+        createBtn.textContent = t("action.createTask");
+        actions.appendChild(createBtn);
+      }
     }
 
     header.append(brand, nav, actions);
 
     const main = document.createElement("main");
     main.className = "prood-main";
+
+    if (this.authState === "loading") {
+      const loadingEl = document.createElement("p");
+      loadingEl.className = "prood-count";
+      loadingEl.textContent = t("auth.loading");
+      main.appendChild(loadingEl);
+      this.append(header, main);
+      return;
+    }
 
     if (this.authState === "unauthenticated") {
       const loginForm = new ProodLoginFormElement();
@@ -186,10 +319,16 @@ export class ProodShellElement extends BaseElement {
     }
 
     if (this.authState === "authenticated" && this.sessionProfile) {
-      if (
-        typeof window !== "undefined" &&
-        window.location.pathname === "/oauth/consent"
-      ) {
+      if (this.signOutError) {
+        const errorBanner = document.createElement("p");
+        errorBanner.className = "prood-auth-feedback";
+        errorBanner.setAttribute("role", "alert");
+        errorBanner.setAttribute("data-signout-error", "");
+        errorBanner.textContent = this.signOutError;
+        main.appendChild(errorBanner);
+      }
+
+      if (isConsent) {
         const consentWrap = document.createElement("section");
         consentWrap.className = "prood-login-wrap";
 
@@ -201,17 +340,58 @@ export class ProodShellElement extends BaseElement {
         title.className = "prood-login-title";
         title.textContent = t("oauth.consentTitle");
 
+        const signedQuery = extractSignedOAuthQuery(window.location.search);
+        if (!signedQuery) {
+          const invalidEl = document.createElement("p");
+          invalidEl.className = "prood-auth-feedback";
+          invalidEl.setAttribute("role", "alert");
+          invalidEl.textContent = t("oauth.consentInvalid");
+
+          const backLink = document.createElement("a");
+          backLink.href = "/";
+          backLink.className = "prood-btn-secondary";
+          backLink.textContent = t("oauth.backHome");
+
+          consentCard.append(title, invalidEl, backLink);
+          consentWrap.appendChild(consentCard);
+          main.appendChild(consentWrap);
+          this.append(header, main);
+          return;
+        }
+
+        const params = new URLSearchParams(signedQuery);
+        const clientId = params.get("client_id") ?? "";
+        void this.fetchConsentClientName(clientId);
+
         const desc = document.createElement("p");
         desc.className = "prood-login-subtitle";
         desc.textContent = t("oauth.consentDescription");
 
-        const params = new URLSearchParams(window.location.search);
-        const scopes = params.get("scope") ?? "openid";
-        const scopeText = document.createElement("p");
-        scopeText.className = "prood-count";
-        scopeText.textContent = t("oauth.consentScopes", { scopes });
+        const clientEl = document.createElement("p");
+        clientEl.className = "prood-count";
+        clientEl.textContent = t("oauth.consentClient", {
+          client: this.consentClientName ?? clientId,
+        });
 
-        consentCard.append(title, desc, scopeText);
+        consentCard.append(title, desc, clientEl);
+
+        const resourceParam = params.get("resource");
+        if (resourceParam) {
+          const resourceEl = document.createElement("p");
+          resourceEl.className = "prood-count";
+          resourceEl.textContent = t("oauth.consentResource", {
+            resource: resourceParam,
+          });
+          consentCard.appendChild(resourceEl);
+        }
+
+        const scopes = params.get("scope") ?? "";
+        if (scopes) {
+          const scopeText = document.createElement("p");
+          scopeText.className = "prood-count";
+          scopeText.textContent = t("oauth.consentScopes", { scopes });
+          consentCard.appendChild(scopeText);
+        }
 
         if (this.consentError) {
           const errEl = document.createElement("p");
@@ -250,15 +430,6 @@ export class ProodShellElement extends BaseElement {
         return;
       }
 
-      if (this.signOutError) {
-        const errorBanner = document.createElement("p");
-        errorBanner.className = "prood-auth-feedback";
-        errorBanner.setAttribute("role", "alert");
-        errorBanner.setAttribute("data-signout-error", "");
-        errorBanner.textContent = this.signOutError;
-        main.appendChild(errorBanner);
-      }
-
       const identityBar = document.createElement("p");
       identityBar.className = "prood-identity-bar";
       identityBar.textContent = t("auth.signedInAs", {
@@ -285,7 +456,11 @@ export class ProodShellElement extends BaseElement {
         list.className = "prood-workspace-list";
         for (const membership of this.sessionProfile.memberships) {
           const li = document.createElement("li");
-          li.textContent = `${membership.workspaceName} (${membership.workspaceSlug}) — ${membership.role}`;
+          li.textContent = t("auth.workspaceItem", {
+            name: membership.workspaceName,
+            slug: membership.workspaceSlug,
+            role: t(ROLE_LABEL_KEYS[membership.role]),
+          });
           list.appendChild(li);
         }
         wsSection.appendChild(list);
