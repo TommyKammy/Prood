@@ -151,20 +151,20 @@ export function createSqliteDatabase(
     async migrate(runOptions?: MigrationRunOptions): Promise<MigrationRunResult> {
       const targetVersion = runOptions?.targetVersion;
       return executeWithTransientRetry(retryPolicy, async () =>
-        db.connection().execute(async (conn) => {
-          await ensureMigrationTable(conn);
-          const appliedList = await readAppliedVersions(conn);
-          const appliedSet = new Set(appliedList);
+        db.connection().execute(async (conn) =>
+          runImmediateTx(conn, async (txConn) => {
+            await ensureMigrationTable(txConn);
+            const appliedList = await readAppliedVersions(txConn);
+            const appliedSet = new Set(appliedList);
 
-          const pending = SQLITE_MIGRATIONS.filter(
-            (m) =>
-              !appliedSet.has(m.version) &&
-              (targetVersion === undefined || m.version <= targetVersion),
-          ).sort((a, b) => a.version - b.version);
+            const pending = SQLITE_MIGRATIONS.filter(
+              (m) =>
+                !appliedSet.has(m.version) &&
+                (targetVersion === undefined || m.version <= targetVersion),
+            ).sort((a, b) => a.version - b.version);
 
-          const newlyApplied: number[] = [];
-          for (const migration of pending) {
-            await runImmediateTx(conn, async (txConn) => {
+            const newlyApplied: number[] = [];
+            for (const migration of pending) {
               try {
                 for (const statement of migration.statements) {
                   await sql.raw(statement).execute(txConn);
@@ -180,27 +180,40 @@ export function createSqliteDatabase(
               } catch (error) {
                 mapSqliteError(error);
               }
-            });
-            newlyApplied.push(migration.version);
-          }
+              newlyApplied.push(migration.version);
+            }
 
-          const finalVersions = await readAppliedVersions(conn);
-          const currentVersion =
-            finalVersions.length > 0
-              ? finalVersions[finalVersions.length - 1]!
-              : 0;
-          return {
-            appliedVersions: newlyApplied,
-            currentVersion,
-          };
-        }),
+            const finalVersions = await readAppliedVersions(txConn);
+            const currentVersion =
+              finalVersions.length > 0
+                ? finalVersions[finalVersions.length - 1]!
+                : 0;
+            return {
+              appliedVersions: newlyApplied,
+              currentVersion,
+            };
+          }),
+        ),
       );
     },
 
     async getAppliedMigrationVersions(): Promise<number[]> {
       return db.connection().execute(async (conn) => {
-        await ensureMigrationTable(conn);
-        return readAppliedVersions(conn);
+        try {
+          const tableCheck = await sql<{ name: string }>`
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name = 'prood_schema_migrations'
+          `.execute(conn);
+          if (tableCheck.rows.length === 0) {
+            return [];
+          }
+          return readAppliedVersions(conn);
+        } catch (error) {
+          if (isPersistenceError(error)) {
+            throw error;
+          }
+          mapSqliteError(error);
+        }
       });
     },
 

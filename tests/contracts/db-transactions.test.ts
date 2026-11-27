@@ -138,6 +138,25 @@ describe(`DB migrations, UnitOfWork, error mapping & concurrency (${targetDb})`,
     expect(second).toEqual({ appliedVersions: [], currentVersion: 2 });
   });
 
+  it("serializes concurrent migrate() calls on a fresh DB without duplicate application", async () => {
+    const ctx = await createIsolatedDbContext();
+    const clientA = ctx.openClient({ maxRetryAttempts: 5, retryBaseDelayMs: 25 });
+    const clientB = ctx.openClient({ maxRetryAttempts: 5, retryBaseDelayMs: 25 });
+
+    expect(await clientA.getAppliedMigrationVersions()).toEqual([]);
+
+    const [resA, resB] = await Promise.all([clientA.migrate(), clientB.migrate()]);
+    const allApplied = [...resA.appliedVersions, ...resB.appliedVersions].sort(
+      (a, b) => a - b,
+    );
+
+    expect(allApplied).toEqual([1, 2]);
+    expect(resA.currentVersion).toBe(2);
+    expect(resB.currentVersion).toBe(2);
+    expect(await clientA.getAppliedMigrationVersions()).toEqual([1, 2]);
+    expect(await clientB.getAppliedMigrationVersions()).toEqual([1, 2]);
+  });
+
   it("upgrades from v1 with existing workspace rows and backfills workspace_settings", async () => {
     const ctx = await createIsolatedDbContext();
     const db = ctx.openClient();

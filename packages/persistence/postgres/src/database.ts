@@ -20,10 +20,23 @@ export interface PostgresDatabaseOptions {
   statementTimeoutMs?: number;
   maxRetryAttempts?: number;
   retryBaseDelayMs?: number;
+  onPoolError?: (error: Error) => void;
 }
 
 const VALID_PG_IDENTIFIER = /^[a-z_][a-z0-9_]*$/;
-const MIGRATION_LOCK_KEY = 42002001;
+
+function attachPoolErrorHandler(
+  pool: Pool,
+  onPoolError?: (error: Error) => void,
+): void {
+  pool.on("error", (error) => {
+    if (onPoolError) {
+      onPoolError(error);
+      return;
+    }
+    console.error("[prood:postgres] idle pool client error:", error);
+  });
+}
 
 export async function createPostgresSchema(
   connectionString: string,
@@ -33,6 +46,7 @@ export async function createPostgresSchema(
     throw new RangeError(`Invalid PostgreSQL schema identifier: ${schema}`);
   }
   const pool = new Pool({ connectionString });
+  attachPoolErrorHandler(pool);
   try {
     await pool.query(`CREATE SCHEMA IF NOT EXISTS "${schema}"`);
   } finally {
@@ -48,6 +62,7 @@ export async function dropPostgresSchema(
     throw new RangeError(`Invalid PostgreSQL schema identifier: ${schema}`);
   }
   const pool = new Pool({ connectionString });
+  attachPoolErrorHandler(pool);
   try {
     await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
   } finally {
@@ -57,7 +72,8 @@ export async function dropPostgresSchema(
 
 /**
  * Creates a Kysely-backed PostgreSQL DatabaseClient with per-transaction
- * lock/statement timeouts, bounded transient conflict retry, and migration tracking.
+ * lock/statement timeouts, bounded transient conflict retry, pool error handling,
+ * and advisory-locked migration tracking.
  */
 export function createPostgresDatabase(
   options: PostgresDatabaseOptions,
@@ -82,10 +98,24 @@ export function createPostgresDatabase(
       ? { options: `-c search_path=${options.schema}` }
       : {}),
   });
+  attachPoolErrorHandler(pool, options.onPoolError);
 
   const db = new Kysely<ProodDatabase>({
     dialect: new PostgresDialect({ pool }),
   });
+
+  async function applyLocalTimeouts(executor: Kysely<ProodDatabase>): Promise<void> {
+    try {
+      await sql
+        .raw(`SET LOCAL lock_timeout = '${lockTimeoutMs}ms'`)
+        .execute(executor);
+      await sql
+        .raw(`SET LOCAL statement_timeout = '${statementTimeoutMs}ms'`)
+        .execute(executor);
+    } catch (error) {
+      mapPostgresError(error);
+    }
+  }
 
   const uow: UnitOfWork = {
     async run<T>(fn: (repos: TransactionRepositories) => Promise<T>): Promise<T> {
@@ -93,16 +123,7 @@ export function createPostgresDatabase(
         let hasBusinessError = false;
         try {
           return await db.transaction().execute(async (trx) => {
-            try {
-              await sql
-                .raw(`SET LOCAL lock_timeout = '${lockTimeoutMs}ms'`)
-                .execute(trx);
-              await sql
-                .raw(`SET LOCAL statement_timeout = '${statementTimeoutMs}ms'`)
-                .execute(trx);
-            } catch (error) {
-              mapPostgresError(error);
-            }
+            await applyLocalTimeouts(trx);
 
             try {
               return await fn(createKyselyRepositories(trx, mapPostgresError));
@@ -123,7 +144,7 @@ export function createPostgresDatabase(
     },
   };
 
-  async function ensureMigrationTable(): Promise<void> {
+  async function ensureMigrationTable(executor: Kysely<ProodDatabase>): Promise<void> {
     try {
       await sql`
         CREATE TABLE IF NOT EXISTS prood_schema_migrations (
@@ -131,7 +152,7 @@ export function createPostgresDatabase(
           name TEXT NOT NULL,
           applied_at TEXT NOT NULL
         )
-      `.execute(db);
+      `.execute(executor);
     } catch (error) {
       mapPostgresError(error);
     }
@@ -174,14 +195,14 @@ export function createPostgresDatabase(
     async migrate(runOptions?: MigrationRunOptions): Promise<MigrationRunResult> {
       const targetVersion = runOptions?.targetVersion;
       return executeWithTransientRetry(retryPolicy, async () => {
-        await ensureMigrationTable();
-        const newlyApplied: number[] = [];
-
         try {
-          await db.transaction().execute(async (trx) => {
-            await sql`SELECT pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`.execute(
+          return await db.transaction().execute(async (trx) => {
+            await applyLocalTimeouts(trx);
+            await sql`SELECT pg_advisory_xact_lock(hashtext('prood_migrations:' || current_schema())::bigint)`.execute(
               trx,
             );
+            await ensureMigrationTable(trx);
+
             const appliedList = await readAppliedVersions(trx);
             const appliedSet = new Set(appliedList);
 
@@ -191,6 +212,7 @@ export function createPostgresDatabase(
                 (targetVersion === undefined || m.version <= targetVersion),
             ).sort((a, b) => a.version - b.version);
 
+            const newlyApplied: number[] = [];
             for (const migration of pending) {
               for (const statement of migration.statements) {
                 await sql.raw(statement).execute(trx);
@@ -205,6 +227,16 @@ export function createPostgresDatabase(
                 .execute();
               newlyApplied.push(migration.version);
             }
+
+            const finalVersions = await readAppliedVersions(trx);
+            const currentVersion =
+              finalVersions.length > 0
+                ? finalVersions[finalVersions.length - 1]!
+                : 0;
+            return {
+              appliedVersions: newlyApplied,
+              currentVersion,
+            };
           });
         } catch (error) {
           if (isPersistenceError(error)) {
@@ -212,22 +244,24 @@ export function createPostgresDatabase(
           }
           mapPostgresError(error);
         }
-
-        const finalVersions = await readAppliedVersions(db);
-        const currentVersion =
-          finalVersions.length > 0
-            ? finalVersions[finalVersions.length - 1]!
-            : 0;
-        return {
-          appliedVersions: newlyApplied,
-          currentVersion,
-        };
       });
     },
 
     async getAppliedMigrationVersions(): Promise<number[]> {
-      await ensureMigrationTable();
-      return readAppliedVersions(db);
+      try {
+        const res = await sql<{ table_name: string | null }>`
+          SELECT to_regclass('prood_schema_migrations') AS table_name
+        `.execute(db);
+        if (!res.rows[0]?.table_name) {
+          return [];
+        }
+        return readAppliedVersions(db);
+      } catch (error) {
+        if (isPersistenceError(error)) {
+          throw error;
+        }
+        mapPostgresError(error);
+      }
     },
 
     async close(): Promise<void> {
