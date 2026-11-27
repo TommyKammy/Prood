@@ -22,6 +22,7 @@
     "@prood/contracts": "workspace:*",
     "@prood/domain": "workspace:*",
     "@prood/integration-better-auth": "workspace:*",
+    "@prood/integration-fastmcp": "workspace:*",
     "@prood/persistence-common": "workspace:*",
     "@prood/persistence-postgres": "workspace:*",
     "@prood/persistence-sqlite": "workspace:*",

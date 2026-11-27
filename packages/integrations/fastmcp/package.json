@@ -1,0 +1,22 @@
+{
+  "name": "@prood/integration-fastmcp",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@prood/application": "workspace:*",
+    "@prood/contracts": "workspace:*",
+    "@prood/domain": "workspace:*",
+    "fastmcp": "^4.30.0",
+    "zod": "^4.1.13"
+  }
+}

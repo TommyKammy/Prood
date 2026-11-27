@@ -43,6 +43,16 @@ export interface WorkspaceMembershipTable {
   updated_at: string;
 }
 
+export interface AuthUserTable {
+  id: string;
+  name: string;
+  email: string;
+  emailVerified: number | boolean;
+  image: string | null;
+  createdAt: string | Date;
+  updatedAt: string | Date;
+}
+
 export interface AuthSessionTable {
   id: string;
   expiresAt: string | Date;
@@ -54,6 +64,16 @@ export interface AuthSessionTable {
   userId: string;
 }
 
+export interface JwksTable {
+  id: string;
+  publicKey: string;
+  privateKey: string;
+  createdAt: string | Date;
+  expiresAt: string | Date | null;
+  alg: string | null;
+  crv: string | null;
+}
+
 export interface ProodDatabase {
   prood_schema_migrations: SchemaMigrationTable;
   workspaces: WorkspaceTable;
@@ -61,5 +81,7 @@ export interface ProodDatabase {
   users: UserTable;
   auth_identities: AuthIdentityTable;
   workspace_memberships: WorkspaceMembershipTable;
+  auth_user: AuthUserTable;
   auth_session: AuthSessionTable;
+  jwks: JwksTable;
 }

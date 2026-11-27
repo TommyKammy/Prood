@@ -1,16 +1,21 @@
-import { serve } from "@hono/node-server";
+import { getRequestListener, serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createSystemIdGenerator } from "@prood/application";
 import { createBetterAuthAdapter } from "@prood/integration-better-auth";
+import { createProodMcpServer } from "@prood/integration-fastmcp";
 import type { KyselyBackedDatabaseClient } from "@prood/persistence-common";
 import { createPostgresDatabase } from "@prood/persistence-postgres";
 import { createSqliteDatabase } from "@prood/persistence-sqlite";
 import { createApp } from "./app.js";
 
 export { createApp, type AppDeps } from "./app.js";
+
+export function createNodeAppListener(app: Hono) {
+  return getRequestListener(app.fetch);
+}
 
 export function selectDatabaseClient(
   env: NodeJS.ProcessEnv = process.env,
@@ -36,6 +41,11 @@ function mountWebShellAssets(rootApp: Hono): void {
 
   const assets: Array<{ route: string; file: string; contentType: string }> = [
     { route: "/", file: "index.html", contentType: "text/html; charset=utf-8" },
+    {
+      route: "/oauth/consent",
+      file: "index.html",
+      contentType: "text/html; charset=utf-8",
+    },
     {
       route: "/shell.js",
       file: "shell.js",
@@ -65,20 +75,35 @@ export async function startNodeServer(): Promise<void> {
   const baseURL = process.env.PROOD_BASE_URL ?? `http://127.0.0.1:${port}`;
   const secret =
     process.env.PROOD_AUTH_SECRET ?? "prood-dev-secret-change-in-production-32";
+  const mcpResource = `${baseURL.replace(/\/+$/, "")}/mcp`;
 
   const auth = createBetterAuthAdapter({
     db,
     secret,
     baseURL,
     trustedOrigins: [baseURL],
+    mcpResource,
+  });
+
+  const clock = { now: () => new Date() };
+  const idGenerator = createSystemIdGenerator();
+
+  const mcpHandler = createProodMcpServer({
+    resource: mcpResource,
+    tokenVerifier: auth,
+    uow: db.uow,
+    idGenerator,
+    clock,
   });
 
   const apiApp = createApp({
-    clock: { now: () => new Date() },
+    clock,
     dbHealth: db,
     auth,
     uow: db.uow,
-    idGenerator: createSystemIdGenerator(),
+    idGenerator,
+    mcpAuth: auth,
+    mcpHandler,
   });
 
   const rootApp = new Hono();

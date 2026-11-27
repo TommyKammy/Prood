@@ -13,10 +13,12 @@
     "build": "tsc -b"
   },
   "dependencies": {
+    "@better-auth/oauth-provider": "^1.7.28",
     "@prood/application": "workspace:*",
     "@prood/contracts": "workspace:*",
     "@prood/persistence-common": "workspace:*",
     "better-auth": "^1.7.28",
+    "jose": "^6.0.0",
     "kysely": "^0.29.9"
   }
 }

@@ -131,11 +131,11 @@ describe(`DB migrations, UnitOfWork, error mapping & concurrency (${targetDb})`,
     expect(await db.getAppliedMigrationVersions()).toEqual([]);
 
     const first = await db.migrate();
-    expect(first).toEqual({ appliedVersions: [1, 2, 3], currentVersion: 3 });
-    expect(await db.getAppliedMigrationVersions()).toEqual([1, 2, 3]);
+    expect(first).toEqual({ appliedVersions: [1, 2, 3, 4], currentVersion: 4 });
+    expect(await db.getAppliedMigrationVersions()).toEqual([1, 2, 3, 4]);
 
     const second = await db.migrate();
-    expect(second).toEqual({ appliedVersions: [], currentVersion: 3 });
+    expect(second).toEqual({ appliedVersions: [], currentVersion: 4 });
   });
 
   it("serializes concurrent migrate() calls on a fresh DB without duplicate application", async () => {
@@ -150,11 +150,11 @@ describe(`DB migrations, UnitOfWork, error mapping & concurrency (${targetDb})`,
       (a, b) => a - b,
     );
 
-    expect(allApplied).toEqual([1, 2, 3]);
-    expect(resA.currentVersion).toBe(3);
-    expect(resB.currentVersion).toBe(3);
-    expect(await clientA.getAppliedMigrationVersions()).toEqual([1, 2, 3]);
-    expect(await clientB.getAppliedMigrationVersions()).toEqual([1, 2, 3]);
+    expect(allApplied).toEqual([1, 2, 3, 4]);
+    expect(resA.currentVersion).toBe(4);
+    expect(resB.currentVersion).toBe(4);
+    expect(await clientA.getAppliedMigrationVersions()).toEqual([1, 2, 3, 4]);
+    expect(await clientB.getAppliedMigrationVersions()).toEqual([1, 2, 3, 4]);
   });
 
   it("upgrades from v1 with existing workspace rows and backfills workspace_settings", async () => {
@@ -177,7 +177,7 @@ describe(`DB migrations, UnitOfWork, error mapping & concurrency (${targetDb})`,
     });
 
     const v2Result = await db.migrate();
-    expect(v2Result).toEqual({ appliedVersions: [2, 3], currentVersion: 3 });
+    expect(v2Result).toEqual({ appliedVersions: [2, 3, 4], currentVersion: 4 });
 
     const verify = await db.uow.run(async (repos) => ({
       workspace: await repos.workspaces.findById(wksId),
