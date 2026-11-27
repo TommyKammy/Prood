@@ -17,9 +17,13 @@ import {
 import {
   CONTRACT_VERSION,
   type ApiErrorResponse,
+  type CopyTaskRequest,
   type CreateProjectRequest,
   type CreateTaskRequest,
+  type EnableDevProjectRequest,
+  type UpdateDevProjectSettingsRequest,
   type UpdateTaskRequest,
+  type UpdateWorkspaceSettingsRequest,
 } from "@prood/contracts";
 import {
   isValidEntityId,
@@ -410,6 +414,196 @@ export function createApp(deps: AppDeps): Hono {
         return actorResult.response;
       }
       const result = await workUseCases.updateTask(actorResult.actor, taskId, body);
+      return sendWorkResult(c, result);
+    });
+
+    app.get("/api/v1/workspaces/:workspaceId/settings", async (c) => {
+      c.header("Cache-Control", "no-store");
+      const session = await requireSessionOrRecord(c);
+      if (!session) {
+        return c.json(errorBody("UNAUTHORIZED", "error.unauthorized"), 401);
+      }
+      if (!identityUseCases || !workUseCases) {
+        return c.json(errorBody("INTERNAL_ERROR", "error.generic"), 500);
+      }
+      const workspaceId = c.req.param("workspaceId");
+      if (!isValidEntityId("wks", workspaceId)) {
+        return c.json(errorBody("NOT_FOUND", "error.notFound"), 404);
+      }
+      const actorResult = await resolveActorOrRespond(c, session);
+      if (!actorResult.ok) {
+        return actorResult.response;
+      }
+      const result = await workUseCases.getWorkspaceSettings(
+        actorResult.actor,
+        workspaceId,
+      );
+      return sendWorkResult(c, result);
+    });
+
+    app.patch("/api/v1/workspaces/:workspaceId/settings", async (c) => {
+      c.header("Cache-Control", "no-store");
+      const session = await requireSessionOrRecord(c);
+      if (!session) {
+        return c.json(errorBody("UNAUTHORIZED", "error.unauthorized"), 401);
+      }
+      if (!identityUseCases || !workUseCases) {
+        return c.json(errorBody("INTERNAL_ERROR", "error.generic"), 500);
+      }
+      const workspaceId = c.req.param("workspaceId");
+      if (!isValidEntityId("wks", workspaceId)) {
+        return c.json(errorBody("NOT_FOUND", "error.notFound"), 404);
+      }
+      const body = await parseJsonBody<
+        UpdateWorkspaceSettingsRequest & Record<string, unknown>
+      >(c);
+      if (!body) {
+        return c.json(errorBody("VALIDATION_ERROR", "error.validation"), 400);
+      }
+      const actorResult = await resolveActorOrRespond(c, session);
+      if (!actorResult.ok) {
+        return actorResult.response;
+      }
+      const result = await workUseCases.updateWorkspaceSettings(
+        actorResult.actor,
+        workspaceId,
+        body,
+      );
+      return sendWorkResult(c, result);
+    });
+
+    app.get("/api/v1/projects/:projectId/dev-settings", async (c) => {
+      c.header("Cache-Control", "no-store");
+      const session = await requireSessionOrRecord(c);
+      if (!session) {
+        return c.json(errorBody("UNAUTHORIZED", "error.unauthorized"), 401);
+      }
+      if (!identityUseCases || !workUseCases) {
+        return c.json(errorBody("INTERNAL_ERROR", "error.generic"), 500);
+      }
+      const projectId = c.req.param("projectId");
+      if (!isValidEntityId("prj", projectId)) {
+        return c.json(errorBody("NOT_FOUND", "error.notFound"), 404);
+      }
+      const actorResult = await resolveActorOrRespond(c, session);
+      if (!actorResult.ok) {
+        return actorResult.response;
+      }
+      const result = await workUseCases.getProjectDevSettings(
+        actorResult.actor,
+        projectId,
+      );
+      return sendWorkResult(c, result);
+    });
+
+    app.post("/api/v1/projects/:projectId/dev-settings/enable", async (c) => {
+      c.header("Cache-Control", "no-store");
+      const session = await requireSessionOrRecord(c);
+      if (!session) {
+        return c.json(errorBody("UNAUTHORIZED", "error.unauthorized"), 401);
+      }
+      if (!identityUseCases || !workUseCases) {
+        return c.json(errorBody("INTERNAL_ERROR", "error.generic"), 500);
+      }
+      const projectId = c.req.param("projectId");
+      if (!isValidEntityId("prj", projectId)) {
+        return c.json(errorBody("NOT_FOUND", "error.notFound"), 404);
+      }
+      const body = await parseJsonBody<
+        EnableDevProjectRequest & Record<string, unknown>
+      >(c);
+      if (!body) {
+        return c.json(errorBody("VALIDATION_ERROR", "error.validation"), 400);
+      }
+      const actorResult = await resolveActorOrRespond(c, session);
+      if (!actorResult.ok) {
+        return actorResult.response;
+      }
+      const result = await workUseCases.enableDevProject(
+        actorResult.actor,
+        projectId,
+        body,
+      );
+      return sendWorkResult(c, result);
+    });
+
+    app.patch("/api/v1/projects/:projectId/dev-settings", async (c) => {
+      c.header("Cache-Control", "no-store");
+      const session = await requireSessionOrRecord(c);
+      if (!session) {
+        return c.json(errorBody("UNAUTHORIZED", "error.unauthorized"), 401);
+      }
+      if (!identityUseCases || !workUseCases) {
+        return c.json(errorBody("INTERNAL_ERROR", "error.generic"), 500);
+      }
+      const projectId = c.req.param("projectId");
+      if (!isValidEntityId("prj", projectId)) {
+        return c.json(errorBody("NOT_FOUND", "error.notFound"), 404);
+      }
+      const body = await parseJsonBody<
+        UpdateDevProjectSettingsRequest & Record<string, unknown>
+      >(c);
+      if (!body) {
+        return c.json(errorBody("VALIDATION_ERROR", "error.validation"), 400);
+      }
+      const actorResult = await resolveActorOrRespond(c, session);
+      if (!actorResult.ok) {
+        return actorResult.response;
+      }
+      const result = await workUseCases.updateDevProjectSettings(
+        actorResult.actor,
+        projectId,
+        body,
+      );
+      return sendWorkResult(c, result);
+    });
+
+    app.post("/api/v1/tasks/:taskId/copy", async (c) => {
+      c.header("Cache-Control", "no-store");
+      const session = await requireSessionOrRecord(c);
+      if (!session) {
+        return c.json(errorBody("UNAUTHORIZED", "error.unauthorized"), 401);
+      }
+      if (!identityUseCases || !workUseCases) {
+        return c.json(errorBody("INTERNAL_ERROR", "error.generic"), 500);
+      }
+      const taskId = c.req.param("taskId");
+      if (!isValidEntityId("tsk", taskId)) {
+        return c.json(errorBody("NOT_FOUND", "error.notFound"), 404);
+      }
+      const body = await parseJsonBody<CopyTaskRequest & Record<string, unknown>>(c);
+      if (!body) {
+        return c.json(errorBody("VALIDATION_ERROR", "error.validation"), 400);
+      }
+      const actorResult = await resolveActorOrRespond(c, session);
+      if (!actorResult.ok) {
+        return actorResult.response;
+      }
+      const result = await workUseCases.copyTask(actorResult.actor, taskId, body);
+      if (!result.ok) {
+        return c.json(errorBody(result.code, result.messageKey), result.status);
+      }
+      return c.json(result.data, 201);
+    });
+
+    app.delete("/api/v1/tasks/:taskId", async (c) => {
+      c.header("Cache-Control", "no-store");
+      const session = await requireSessionOrRecord(c);
+      if (!session) {
+        return c.json(errorBody("UNAUTHORIZED", "error.unauthorized"), 401);
+      }
+      if (!identityUseCases || !workUseCases) {
+        return c.json(errorBody("INTERNAL_ERROR", "error.generic"), 500);
+      }
+      const taskId = c.req.param("taskId");
+      if (!isValidEntityId("tsk", taskId)) {
+        return c.json(errorBody("NOT_FOUND", "error.notFound"), 404);
+      }
+      const actorResult = await resolveActorOrRespond(c, session);
+      if (!actorResult.ok) {
+        return actorResult.response;
+      }
+      const result = await workUseCases.deleteTask(actorResult.actor, taskId);
       return sendWorkResult(c, result);
     });
   }
