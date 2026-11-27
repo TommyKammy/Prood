@@ -9,6 +9,7 @@ export const PUBLIC_ENTITY_PREFIXES = [
   "evt",
   "mbr",
   "out",
+  "ins",
 ] as const;
 
 export type PublicEntityPrefix = (typeof PUBLIC_ENTITY_PREFIXES)[number];
@@ -25,6 +26,7 @@ export type StatusId = EntityId<"sts">;
 export type EventId = EntityId<"evt">;
 export type MembershipId = EntityId<"mbr">;
 export type OutboxId = EntityId<"out">;
+export type NamespaceId = EntityId<"ins">;
 
 const TIMESTAMP_LENGTH = 10;
 const RANDOM_LENGTH = 16;

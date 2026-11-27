@@ -51,6 +51,16 @@ export const enMessages = {
     "Email verification is required before linking this account.",
   "error.notFound": "The requested item was not found.",
   "error.conflict": "A conflict occurred while updating this item.",
+  "error.devProjectsDisabled":
+    "Development projects are not enabled for this workspace.",
+  "error.devProjectAlreadyEnabled":
+    "This project is already enabled as a development project.",
+  "error.devProjectNotEnabled":
+    "This project is not enabled as a development project.",
+  "error.invalidDevPrefix":
+    "Prefix must be 2 to 10 ASCII letters or digits starting with a letter.",
+  "error.prefixAlreadyInUse":
+    "This prefix is already reserved in this workspace.",
   "aria.mainNavigation": "Main navigation",
   "aria.taskList": "Task list",
   "aria.searchTasks": "Search tasks",

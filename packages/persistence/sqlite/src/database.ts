@@ -149,7 +149,12 @@ export function createSqliteDatabase(
               txStorage.run(true, async () => {
                 try {
                   return await fn(
-                    createKyselyRepositories(txConn, mapSqliteError, assertActive),
+                    createKyselyRepositories(
+                      txConn,
+                      mapSqliteError,
+                      assertActive,
+                      "sqlite",
+                    ),
                   );
                 } catch (error) {
                   if (!isPersistenceError(error)) {

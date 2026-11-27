@@ -18,6 +18,7 @@ import { POSTGRES_MIGRATIONS } from "./migrations.js";
 export interface PostgresDatabaseOptions {
   connectionString: string;
   schema?: string;
+  maxPoolSize?: number;
   lockTimeoutMs?: number;
   statementTimeoutMs?: number;
   maxRetryAttempts?: number;
@@ -112,6 +113,7 @@ export function createPostgresDatabase(
 
   const pool = new Pool({
     connectionString: options.connectionString,
+    ...(options.maxPoolSize !== undefined ? { max: options.maxPoolSize } : {}),
     ...(options.schema !== undefined
       ? { options: `-c search_path=${options.schema}` }
       : {}),
@@ -156,7 +158,9 @@ export function createPostgresDatabase(
 
             return txStorage.run(true, async () => {
               try {
-                return await fn(createKyselyRepositories(trx, mapPostgresError));
+                return await fn(
+                  createKyselyRepositories(trx, mapPostgresError, undefined, "postgres"),
+                );
               } catch (error) {
                 if (!isPersistenceError(error)) {
                   hasBusinessError = true;

@@ -85,6 +85,9 @@ describe("@prood/server Web-Standard app", () => {
             upsert: async () => {
               throw new Error("not implemented");
             },
+            patch: async () => {
+              throw new Error("not implemented");
+            },
             findByWorkspaceId: async () => null,
           },
           users: {
@@ -134,6 +137,9 @@ describe("@prood/server Web-Standard app", () => {
               throw new Error("not implemented");
             },
             findById: async () => null,
+            findByIdForUpdate: async () => null,
+            lockForTaskWrite: async () => false,
+            updateKind: async () => null,
             listByWorkspace: async () => [],
             upsertMembership: async () => {
               throw new Error("not implemented");
@@ -156,6 +162,25 @@ describe("@prood/server Web-Standard app", () => {
             listSubtasks: async () => [],
             listSubtasksByParentIds: async () => [],
             update: async () => null,
+            deleteById: async () => false,
+          },
+          issueKeys: {
+            createNamespace: async () => {
+              throw new Error("not implemented");
+            },
+            findNamespaceByProjectId: async () => null,
+            findNamespaceByProjectIdForUpdate: async () => null,
+            findNamespacesByProjectIds: async () => [],
+            updateNamespace: async () => null,
+            listPrefixesByNamespace: async () => [],
+            listPrefixesByNamespaceIds: async () => [],
+            findPrefixOwner: async () => null,
+            reservePrefix: async () => null,
+            initCounter: async () => {},
+            allocateNextNumber: async () => 1,
+            createTaskKeys: async () => {},
+            findByTaskId: async () => null,
+            findByTaskIds: async () => new Map(),
           },
           outbox: {
             append: async () => {

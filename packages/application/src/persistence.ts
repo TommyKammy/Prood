@@ -1,4 +1,4 @@
-import type { WorkspaceMembershipSummary } from "@prood/contracts";
+import type { DbDriverKind, WorkspaceMembershipSummary } from "@prood/contracts";
 import type {
   ActorType,
   EventChannel,
@@ -6,6 +6,7 @@ import type {
   EventOutcome,
   LocaleCode,
   MembershipId,
+  NamespaceId,
   OutboxId,
   ProjectId,
   ProjectKind,
@@ -107,6 +108,34 @@ export interface TaskRecord {
   updatedAt: string;
 }
 
+export interface IssueKeyNamespaceRecord {
+  id: NamespaceId;
+  workspaceId: WorkspaceId;
+  projectId: ProjectId | null;
+  currentPrefix: string;
+  branchPrefix: string;
+  startStatusId: StatusId | null;
+  enabledBy: UserId | null;
+  enabledAt: string;
+  updatedAt: string;
+}
+
+export interface IssueKeyPrefixRecord {
+  workspaceId: WorkspaceId;
+  prefix: string;
+  namespaceId: NamespaceId;
+  createdAt: string;
+}
+
+export interface TaskIssueKeyView {
+  taskId: TaskPublicId;
+  namespaceId: NamespaceId;
+  issueNumber: number;
+  currentPrefix: string;
+  branchPrefix: string;
+  createdAt: string;
+}
+
 export interface OutboxEventRecord {
   id: OutboxId;
   eventId: EventId;
@@ -145,6 +174,13 @@ export interface UpsertWorkspaceSettingsInput {
   workspaceId: WorkspaceId;
   defaultLocale: LocaleCode;
   devProjectsEnabled: boolean;
+  updatedAt: string;
+}
+
+export interface PatchWorkspaceSettingsInput {
+  workspaceId: WorkspaceId;
+  defaultLocale?: LocaleCode;
+  devProjectsEnabled?: boolean;
   updatedAt: string;
 }
 
@@ -223,6 +259,30 @@ export interface UpdateTaskInput {
   updatedAt: string;
 }
 
+export interface CreateIssueKeyNamespaceInput {
+  id: NamespaceId;
+  workspaceId: WorkspaceId;
+  projectId: ProjectId;
+  currentPrefix: string;
+  branchPrefix: string;
+  startStatusId: StatusId | null;
+  enabledBy: UserId | null;
+  enabledAt: string;
+}
+
+export interface UpdateIssueKeyNamespaceInput {
+  currentPrefix?: string;
+  startStatusId?: StatusId | null;
+  updatedAt: string;
+}
+
+export interface CreateTaskIssueKeyInput {
+  taskId: TaskPublicId;
+  namespaceId: NamespaceId;
+  issueNumber: number;
+  createdAt: string;
+}
+
 export interface AppendOutboxEventInput {
   id: OutboxId;
   eventId: EventId;
@@ -255,6 +315,7 @@ export interface WorkspaceRepository {
 
 export interface WorkspaceSettingsRepository {
   upsert(input: UpsertWorkspaceSettingsInput): Promise<WorkspaceSettingsRecord>;
+  patch(input: PatchWorkspaceSettingsInput): Promise<WorkspaceSettingsRecord>;
   findByWorkspaceId(workspaceId: WorkspaceId): Promise<WorkspaceSettingsRecord | null>;
 }
 
@@ -281,6 +342,13 @@ export interface WorkspaceMembershipRepository {
 export interface ProjectRepository {
   create(input: CreateProjectInput): Promise<ProjectRecord>;
   findById(id: ProjectId): Promise<ProjectRecord | null>;
+  findByIdForUpdate(id: ProjectId): Promise<ProjectRecord | null>;
+  lockForTaskWrite(id: ProjectId): Promise<boolean>;
+  updateKind(
+    id: ProjectId,
+    kind: ProjectKind,
+    updatedAt: string,
+  ): Promise<ProjectRecord | null>;
   listByWorkspace(workspaceId: WorkspaceId): Promise<ProjectRecord[]>;
   upsertMembership(
     input: UpsertProjectMembershipInput,
@@ -306,6 +374,46 @@ export interface TaskRepository {
     parentTaskIds: readonly TaskPublicId[],
   ): Promise<TaskRecord[]>;
   update(id: TaskPublicId, input: UpdateTaskInput): Promise<TaskRecord | null>;
+  deleteById(id: TaskPublicId): Promise<boolean>;
+}
+
+export interface IssueKeyRepository {
+  createNamespace(
+    input: CreateIssueKeyNamespaceInput,
+  ): Promise<IssueKeyNamespaceRecord>;
+  findNamespaceByProjectId(
+    projectId: ProjectId,
+  ): Promise<IssueKeyNamespaceRecord | null>;
+  findNamespaceByProjectIdForUpdate(
+    projectId: ProjectId,
+  ): Promise<IssueKeyNamespaceRecord | null>;
+  findNamespacesByProjectIds(
+    projectIds: readonly ProjectId[],
+  ): Promise<IssueKeyNamespaceRecord[]>;
+  updateNamespace(
+    id: NamespaceId,
+    input: UpdateIssueKeyNamespaceInput,
+  ): Promise<IssueKeyNamespaceRecord | null>;
+  listPrefixesByNamespace(
+    namespaceId: NamespaceId,
+  ): Promise<IssueKeyPrefixRecord[]>;
+  listPrefixesByNamespaceIds(
+    namespaceIds: readonly NamespaceId[],
+  ): Promise<IssueKeyPrefixRecord[]>;
+  findPrefixOwner(
+    workspaceId: WorkspaceId,
+    prefix: string,
+  ): Promise<IssueKeyPrefixRecord | null>;
+  reservePrefix(
+    input: IssueKeyPrefixRecord,
+  ): Promise<IssueKeyPrefixRecord | null>;
+  initCounter(namespaceId: NamespaceId, nextNumber: number): Promise<void>;
+  allocateNextNumber(namespaceId: NamespaceId): Promise<number>;
+  createTaskKeys(entries: readonly CreateTaskIssueKeyInput[]): Promise<void>;
+  findByTaskId(taskId: TaskPublicId): Promise<TaskIssueKeyView | null>;
+  findByTaskIds(
+    taskIds: readonly TaskPublicId[],
+  ): Promise<Map<TaskPublicId, TaskIssueKeyView>>;
 }
 
 export interface OutboxRepository {
@@ -315,6 +423,7 @@ export interface OutboxRepository {
 }
 
 export interface TransactionRepositories {
+  readonly driver?: DbDriverKind;
   readonly workspaces: WorkspaceRepository;
   readonly workspaceSettings: WorkspaceSettingsRepository;
   readonly users: UserRepository;
@@ -322,6 +431,7 @@ export interface TransactionRepositories {
   readonly projects: ProjectRepository;
   readonly statuses: ProjectStatusRepository;
   readonly tasks: TaskRepository;
+  readonly issueKeys: IssueKeyRepository;
   readonly outbox: OutboxRepository;
 }
 
