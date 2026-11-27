@@ -778,6 +778,58 @@ export function createKyselyRepositories(
       return rows.map(toTaskRecord);
     },
 
+    async listSubtasksByParentIds(
+      parentTaskIds: readonly TaskPublicId[],
+    ): Promise<TaskRecord[]> {
+      const uniqueIds = Array.from(new Set(parentTaskIds));
+      if (uniqueIds.length === 0) {
+        return [];
+      }
+
+      // Keep each IN clause comfortably below SQLite's bind-parameter limit (999).
+      const SUBTASK_PARENT_BATCH_SIZE = 200;
+      const results: TaskRecord[] = [];
+      let chunkCount = 0;
+
+      for (let i = 0; i < uniqueIds.length; i += SUBTASK_PARENT_BATCH_SIZE) {
+        const chunk = uniqueIds.slice(i, i + SUBTASK_PARENT_BATCH_SIZE);
+        chunkCount += 1;
+        const rows = await runQuery(
+          () =>
+            executor
+              .selectFrom("tasks")
+              .selectAll()
+              .where("parent_task_id", "in", chunk)
+              .orderBy("position", "asc")
+              .orderBy("created_at", "asc")
+              .orderBy("id", "asc")
+              .execute(),
+          mapError,
+          assertActive,
+        );
+        for (const row of rows) {
+          results.push(toTaskRecord(row));
+        }
+      }
+
+      if (chunkCount > 1) {
+        results.sort((a, b) => {
+          if (a.position !== b.position) {
+            return a.position - b.position;
+          }
+          if (a.createdAt !== b.createdAt) {
+            return a.createdAt < b.createdAt ? -1 : 1;
+          }
+          if (a.id !== b.id) {
+            return a.id < b.id ? -1 : 1;
+          }
+          return 0;
+        });
+      }
+
+      return results;
+    },
+
     async update(
       id: TaskPublicId,
       input: UpdateTaskInput,

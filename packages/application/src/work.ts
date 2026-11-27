@@ -686,24 +686,29 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
 
         const directTasks = await repos.tasks.listByProject(project.id);
         const collected = new Map<TaskPublicId, TaskRecord>();
-        const queue: TaskRecord[] = [];
+        let frontier: TaskPublicId[] = [];
         for (const task of directTasks) {
           collected.set(task.id, task);
-          queue.push(task);
+          frontier.push(task.id);
         }
 
-        while (queue.length > 0) {
-          const current = queue.shift()!;
-          const children = await repos.tasks.listSubtasks(current.id);
+        for (
+          let depth = 0;
+          depth < MAX_PARENT_HOPS && frontier.length > 0;
+          depth += 1
+        ) {
+          const children = await repos.tasks.listSubtasksByParentIds(frontier);
+          const nextFrontier: TaskPublicId[] = [];
           for (const child of children) {
             if (
               !collected.has(child.id) &&
               (child.projectId === null || child.projectId === project.id)
             ) {
               collected.set(child.id, child);
-              queue.push(child);
+              nextFrontier.push(child.id);
             }
           }
+          frontier = nextFrontier;
         }
 
         return {

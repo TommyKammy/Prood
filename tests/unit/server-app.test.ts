@@ -154,6 +154,7 @@ describe("@prood/server Web-Standard app", () => {
             findById: async () => null,
             listByProject: async () => [],
             listSubtasks: async () => [],
+            listSubtasksByParentIds: async () => [],
             update: async () => null,
           },
           outbox: {

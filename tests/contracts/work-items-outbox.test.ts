@@ -935,9 +935,164 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
         expect(planText).toContain("SEARCH tasks USING INDEX tasks_project_idx");
         expect(planText).not.toContain("SCAN tasks");
         expect(planText).not.toContain("USE TEMP B-TREE");
+
+        const parentPlanRows = sqliteConn
+          .prepare(
+            "EXPLAIN QUERY PLAN SELECT * FROM tasks WHERE parent_task_id IN (?, ?) ORDER BY position ASC, created_at ASC, id ASC",
+          )
+          .all(targetTaskId, parentId) as Array<{ detail: string }>;
+        const parentPlanText = parentPlanRows.map((r) => r.detail).join(" | ");
+        expect(parentPlanText).toContain(
+          "SEARCH tasks USING INDEX tasks_parent_idx",
+        );
+        expect(parentPlanText).not.toContain("SCAN tasks");
       } finally {
         sqliteConn.close();
       }
     }
+  });
+
+  it("batches descendant lookups per level in listProjectTasks and across large parent ID batches", async () => {
+    const ctx = await createIsolatedDb();
+    const db = ctx.openClient();
+    await db.migrate();
+    const ids = createSystemIdGenerator();
+
+    const wksId = ids.next("wks");
+    const ownerId = ids.next("usr");
+    const now = "2026-11-27T14:00:00.000Z";
+
+    await db.uow.run(async (repos) => {
+      await repos.workspaces.create({
+        id: wksId,
+        slug: "batch-subtasks-ws",
+        name: "Batch Subtasks Workspace",
+        createdAt: now,
+      });
+      await repos.users.create({
+        id: ownerId,
+        email: "batch-owner@example.com",
+        displayName: "Batch Owner",
+        createdAt: now,
+      });
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: ownerId,
+        role: "admin",
+        createdAt: now,
+      });
+    });
+
+    const actor = {
+      userId: ownerId,
+      actorType: "user" as const,
+      channel: "web" as const,
+    };
+
+    const baseWork = createWorkUseCases({
+      uow: db.uow,
+      idGenerator: ids,
+      clock: { now: () => new Date(now) },
+    });
+
+    const createdProj = await baseWork.createProject(actor, wksId, {
+      name: "Batch Tree Project",
+      kind: "general",
+      visibility: "workspace",
+    });
+    expect(createdProj.ok).toBe(true);
+    if (!createdProj.ok) throw new Error("expected project creation");
+    const projectId = createdProj.data.project.id;
+
+    // Create 10 flat leaf tasks + 1 parent -> 2 children -> 1 grandchild (14 tasks total, depth 3).
+    const flatTaskIds: string[] = [];
+    for (let i = 0; i < 10; i += 1) {
+      const leaf = await baseWork.createTask(actor, projectId, {
+        title: `Leaf ${i}`,
+      });
+      expect(leaf.ok).toBe(true);
+      if (leaf.ok) flatTaskIds.push(leaf.data.task.id);
+    }
+
+    const treeParent = await baseWork.createTask(actor, projectId, {
+      title: "Tree Parent",
+    });
+    expect(treeParent.ok).toBe(true);
+    if (!treeParent.ok) throw new Error("expected parent");
+
+    const childA = await baseWork.createTask(actor, projectId, {
+      title: "Tree Child A",
+      parentTaskId: treeParent.data.task.id,
+    });
+    const childB = await baseWork.createTask(actor, projectId, {
+      title: "Tree Child B",
+      parentTaskId: treeParent.data.task.id,
+    });
+    expect(childA.ok && childB.ok).toBe(true);
+    if (!childA.ok || !childB.ok) throw new Error("expected children");
+
+    const grandchild = await baseWork.createTask(actor, projectId, {
+      title: "Tree Grandchild",
+      parentTaskId: childA.data.task.id,
+    });
+    expect(grandchild.ok).toBe(true);
+    if (!grandchild.ok) throw new Error("expected grandchild");
+
+    let listSubtasksCalls = 0;
+    let listSubtasksByParentIdsCalls = 0;
+    const countingUow: UnitOfWork = {
+      run: (fn) =>
+        db.uow.run((repos) =>
+          fn({
+            ...repos,
+            tasks: {
+              ...repos.tasks,
+              listSubtasks: async (parentTaskId) => {
+                listSubtasksCalls += 1;
+                return repos.tasks.listSubtasks(parentTaskId);
+              },
+              listSubtasksByParentIds: async (parentTaskIds) => {
+                listSubtasksByParentIdsCalls += 1;
+                return repos.tasks.listSubtasksByParentIds(parentTaskIds);
+              },
+            },
+          }),
+        ),
+    };
+
+    const countingWork = createWorkUseCases({
+      uow: countingUow,
+      idGenerator: ids,
+      clock: { now: () => new Date(now) },
+    });
+
+    const listed = await countingWork.listProjectTasks(actor, projectId);
+    expect(listed.ok).toBe(true);
+    if (!listed.ok) throw new Error("expected task list");
+
+    expect(listed.data.tasks).toHaveLength(14);
+    expect(
+      listed.data.tasks.every((task) => task.effectiveProjectId === projectId),
+    ).toBe(true);
+    expect(listSubtasksCalls).toBe(0);
+    // Level 0 (11 direct tasks) -> [childA, childB], Level 1 ([childA, childB]) -> [grandchild], Level 2 ([grandchild]) -> [].
+    expect(listSubtasksByParentIdsCalls).toBe(3);
+
+    // Exercise >200 parent IDs across two chunks (merge-sort + deduplication path).
+    const largeParentBatch = Array.from({ length: 250 }, () => ids.next("tsk"));
+    largeParentBatch.unshift(treeParent.data.task.id); // in chunk 1
+    largeParentBatch.push(childA.data.task.id); // in chunk 2
+    largeParentBatch.push(treeParent.data.task.id); // duplicate parent ID
+
+    const batchRows = await db.uow.run((repos) =>
+      repos.tasks.listSubtasksByParentIds(largeParentBatch),
+    );
+    const expectedOrder = [
+      childA.data.task.id,
+      childB.data.task.id,
+      grandchild.data.task.id,
+    ].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    expect(batchRows.map((t) => t.id)).toEqual(expectedOrder);
   });
 });

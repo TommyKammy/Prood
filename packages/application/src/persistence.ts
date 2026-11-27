@@ -302,6 +302,9 @@ export interface TaskRepository {
   findById(id: TaskPublicId): Promise<TaskRecord | null>;
   listByProject(projectId: ProjectId): Promise<TaskRecord[]>;
   listSubtasks(parentTaskId: TaskPublicId): Promise<TaskRecord[]>;
+  listSubtasksByParentIds(
+    parentTaskIds: readonly TaskPublicId[],
+  ): Promise<TaskRecord[]>;
   update(id: TaskPublicId, input: UpdateTaskInput): Promise<TaskRecord | null>;
 }
 
