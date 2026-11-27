@@ -1285,5 +1285,77 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
     release("obsolete");
     expect(await waiting).toBe(false);
     expect(await deps.uow.run((r) => r.automation.lookup(workspace, "obsolete"))).toBeNull();
+    // The recipient in a trigger filter can disappear even while the proposed status stays valid.
+    const candidate = await h.signUpUser("reviewer@example.com", "Reviewer");
+    const createdAt = clock.now().toISOString();
+    await db.uow.run(async (r) => {
+      await r.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: workspace,
+        userId: candidate.userId,
+        role: "member",
+        createdAt,
+      });
+      await r.projects.upsertMembership({
+        id: ids.next("mbr"),
+        projectId: project.id,
+        userId: candidate.userId,
+        role: "admin",
+        createdAt,
+      });
+    });
+    const publish = await h.workUseCases.manageAutomation(actor, project.id, "review", {
+      op: "publish",
+      revision: 0,
+      delegate: user.userId,
+      definition: { ...definition, from: user.userId, to: candidate.userId },
+    });
+    expect(publish.ok).toBe(true);
+    expect(
+      (await h.workUseCases.updateTask(actor, id, { assigneeId: candidate.userId })).ok,
+    ).toBe(true);
+    let matched!: Delivery;
+    expect(
+      await deliverNext(deps, workspace, (d) => {
+        matched = d;
+        return "review-run";
+      }),
+    ).toBe(true);
+    expect(matched.rule).toBe("review");
+    await db.kysely
+      .deleteFrom("project_memberships")
+      .where("project_id", "=", project.id)
+      .where("user_id", "=", candidate.userId)
+      .execute();
+    expect(
+      (
+        await h.workUseCases.prepareAutomation(
+          workspace,
+          matched.event,
+          matched.rule,
+          "review-run",
+          project.id,
+          1,
+        )
+      ).status,
+    ).toBe("denied");
+    await db.kysely
+      .deleteFrom("workspace_memberships")
+      .where("workspace_id", "=", workspace)
+      .where("user_id", "=", user.userId)
+      .execute();
+    await db.kysely
+      .updateTable("workspace_memberships")
+      .set({ role: "admin" })
+      .where("workspace_id", "=", workspace)
+      .where("user_id", "=", candidate.userId)
+      .execute();
+    const stopped = await h.workUseCases.manageAutomation(
+      { ...actor, userId: candidate.userId },
+      project.id,
+      "review",
+      { op: "stop", revision: 1 },
+    );
+    expect(stopped.ok && stopped.data.delegateName).toBe(user.userId);
   });
 });

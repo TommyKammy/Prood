@@ -264,7 +264,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       canReadProject(await resolveActorProjectRole(repos, value, project))
     );
   }
-  async function validCandidates(
+  async function visibleFilters(
     repos: TransactionRepositories,
     project: ProjectRecord,
     def: RuleDefinition,
@@ -273,14 +273,22 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
     for (const value of [def.from, def.to])
       if (value !== undefined && !(await allowedValue(repos, project, field, value)))
         return false;
+    return true;
+  }
+  async function validCandidates(
+    repos: TransactionRepositories,
+    project: ProjectRecord,
+    def: RuleDefinition,
+  ) {
     return (
-      (typeof def.action.value === "object" && def.action.value !== null) ||
-      (await allowedValue(
-        repos,
-        project,
-        def.action.field,
-        def.action.value as string | null,
-      ))
+      (await visibleFilters(repos, project, def)) &&
+      ((typeof def.action.value === "object" && def.action.value !== null) ||
+        (await allowedValue(
+          repos,
+          project,
+          def.action.field,
+          def.action.value as string | null,
+        )))
     );
   }
 
@@ -335,7 +343,11 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         )
           return fail(400, "VALIDATION_ERROR", "error.validation");
         const delegate = stop ? prior!.actor : actor.userId;
-        const delegateName = (await repos.users.findById(delegate))?.displayName ?? delegate;
+        const visibleDelegate =
+          !stop || canReadProject(await resolveActorProjectRole(repos, delegate, project));
+        const delegateName = visibleDelegate
+          ? ((await repos.users.findById(delegate))?.displayName ?? delegate)
+          : delegate;
         const labels: Record<string, string> = {};
         if (!stop)
           for (const id of [definition.from, definition.to, definition.action.value]) {
@@ -462,6 +474,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           canWriteProjectTasks(
             await resolveActorProjectRole(repos, p.delegate, resolved.project),
           ) &&
+          (await visibleFilters(repos, resolved.project, p.definition)) &&
           (await allowedValue(repos, resolved.project, field, value))
         );
         const status = !authorized
