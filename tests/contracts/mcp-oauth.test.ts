@@ -607,4 +607,197 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
     // Verify tool handler was never invoked by any of the 3 rejected tokens
     expect(server.getWhoamiExecutedCount()).toBe(0);
   });
+
+  it("resumes OAuth authorization after unauthenticated login redirect and serves consent assets", async () => {
+    const ctx = await createIsolatedOAuthDb();
+    const db = ctx.openClient();
+    await db.migrate();
+
+    const ids = createSystemIdGenerator();
+    const wksId = ids.next("wks");
+    const now = "2026-11-27T12:15:00.000Z";
+    await db.uow.run((repos) =>
+      repos.workspaces.create({
+        id: wksId,
+        slug: "resume-ws",
+        name: "Resume Workspace",
+        createdAt: now,
+      }),
+    );
+
+    const server = await startTestHttpServer(db);
+
+    // Pre-register user, then clear cookies so authorization starts unauthenticated
+    const setupJar = new CookieJar();
+    const signUpRes = await fetch(`${server.baseURL}/api/auth/sign-up/email`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: server.baseURL,
+      },
+      body: JSON.stringify({
+        email: "resume-user@example.com",
+        password: "resume-oauth-password-123",
+        name: "Resume Tester",
+      }),
+    });
+    expect(signUpRes.status).toBe(200);
+    setupJar.updateFrom(signUpRes);
+
+    const meRes = await fetch(`${server.baseURL}/api/v1/me`, {
+      headers: { cookie: setupJar.toHeader() },
+    });
+    const me = (await meRes.json()) as MeResponse;
+    await db.uow.run((repos) =>
+      repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: me.user.id,
+        role: "member",
+        createdAt: now,
+      }),
+    );
+
+    // 1. Register public PKCE client via DCR
+    const asRes = await fetch(
+      `${server.baseURL}/.well-known/oauth-authorization-server`,
+    );
+    const asMeta = (await asRes.json()) as {
+      authorization_endpoint: string;
+      token_endpoint: string;
+      registration_endpoint: string;
+    };
+    const redirectUri = "http://127.0.0.1:49153/callback";
+    const regRes = await fetch(asMeta.registration_endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_name: "Resume Test Client",
+        redirect_uris: [redirectUri],
+        grant_types: ["authorization_code"],
+        response_types: ["code"],
+        token_endpoint_auth_method: "none",
+        scope: `openid profile ${MCP_REQUIRED_WHOAMI_SCOPE}`,
+      }),
+    });
+    expect(regRes.status).toBe(201);
+    const { client_id: clientId } = (await regRes.json()) as { client_id: string };
+
+    // 2. Start /oauth2/authorize unauthenticated -> must redirect to loginPage with signed query
+    const { verifier, challenge } = createPkcePair();
+    const state = randomBytes(10).toString("hex");
+    const authUrl = new URL(asMeta.authorization_endpoint);
+    authUrl.searchParams.set("response_type", "code");
+    authUrl.searchParams.set("client_id", clientId);
+    authUrl.searchParams.set("redirect_uri", redirectUri);
+    authUrl.searchParams.set("scope", `openid profile ${MCP_REQUIRED_WHOAMI_SCOPE}`);
+    authUrl.searchParams.set("resource", server.mcpResource);
+    authUrl.searchParams.set("state", state);
+    authUrl.searchParams.set("code_challenge", challenge);
+    authUrl.searchParams.set("code_challenge_method", "S256");
+
+    const unauthAuthRes = await fetch(authUrl.toString(), {
+      method: "GET",
+      headers: { accept: "text/html" },
+      redirect: "manual",
+    });
+    let loginLocation = unauthAuthRes.headers.get("location");
+    if (unauthAuthRes.status === 200) {
+      const redirectJson = (await unauthAuthRes.json()) as {
+        redirect?: boolean;
+        url?: string;
+      };
+      loginLocation = redirectJson.url ?? null;
+    } else {
+      expect(unauthAuthRes.status).toBe(302);
+    }
+    expect(loginLocation).toBeTruthy();
+    const loginUrl = new URL(loginLocation!, server.baseURL);
+    expect(loginUrl.pathname).toBe("/");
+    const signedLoginQuery = loginUrl.search.replace(/^\?/, "");
+    expect(signedLoginQuery).toContain("sig=");
+
+    // 3. Sign in via /api/auth/sign-in/email forwarding oauth_query -> must resume to consent
+    const loginJar = new CookieJar();
+    const signInRes = await fetch(`${server.baseURL}/api/auth/sign-in/email`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: server.baseURL,
+      },
+      body: JSON.stringify({
+        email: "resume-user@example.com",
+        password: "resume-oauth-password-123",
+        oauth_query: signedLoginQuery,
+      }),
+    });
+    expect(signInRes.status).toBe(200);
+    loginJar.updateFrom(signInRes);
+    const signInJson = (await signInRes.json()) as {
+      redirect?: boolean;
+      url?: string;
+    };
+    expect(signInJson.redirect).toBe(true);
+    expect(signInJson.url).toBeTruthy();
+
+    const consentUrl = new URL(signInJson.url!, server.baseURL);
+    expect(consentUrl.pathname).toBe("/oauth/consent");
+
+    // 4. Approve consent and exchange code for JWT token
+    const consentRes = await fetch(`${server.baseURL}/api/auth/oauth2/consent`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: server.baseURL,
+        cookie: loginJar.toHeader(),
+      },
+      body: JSON.stringify({
+        accept: true,
+        oauth_query: consentUrl.search.replace(/^\?/, ""),
+      }),
+    });
+    expect(consentRes.status).toBe(200);
+    const consentJson = (await consentRes.json()) as { url: string };
+    const callbackUrl = new URL(consentJson.url);
+    expect(callbackUrl.searchParams.get("state")).toBe(state);
+    const code = callbackUrl.searchParams.get("code")!;
+    expect(code).toBeTruthy();
+
+    const tokenRes = await fetch(asMeta.token_endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        code_verifier: verifier,
+        resource: server.mcpResource,
+      }).toString(),
+    });
+    expect(tokenRes.status).toBe(200);
+    const { access_token: accessToken } = (await tokenRes.json()) as {
+      access_token: string;
+    };
+
+    // 5. Connect real MCP client and confirm whoami returns the same user ID
+    const client = new Client({ name: "resume-mcp-client", version: "1.0.0" });
+    const transport = new StreamableHTTPClientTransport(
+      new URL(server.mcpResource),
+      {
+        requestInit: { headers: { authorization: `Bearer ${accessToken}` } },
+      },
+    );
+    await client.connect(transport);
+    try {
+      const callRes = await client.callTool({ name: "whoami", arguments: {} });
+      const text = (
+        callRes.content as Array<{ type: string; text?: string }>
+      ).find((item) => item.type === "text")?.text;
+      const whoami = JSON.parse(text!) as McpWhoamiResponse;
+      expect(whoami.userId).toBe(me.user.id);
+    } finally {
+      await client.close();
+    }
+  });
 });

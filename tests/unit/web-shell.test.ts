@@ -1,7 +1,13 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CONTRACT_VERSION, type MeResponse } from "@prood/contracts";
 import { generateEntityId } from "@prood/domain";
-import { ProodShellElement } from "@prood/web";
+import {
+  extractSignedOAuthQuery,
+  ProodLoginFormElement,
+  ProodShellElement,
+} from "@prood/web";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -81,5 +87,76 @@ describe("@prood/web ProodShellElement signOut", () => {
     expect(signedOut).toBe(true);
     expect(shell.getAuthState()).toBe("unauthenticated");
     expect(shell.getSignOutError()).toBe("");
+  });
+});
+
+describe("@prood/web login & asset paths", () => {
+  it("extracts signed OAuth query only when sig and client_id are present", () => {
+    expect(extractSignedOAuthQuery("")).toBeUndefined();
+    expect(extractSignedOAuthQuery("?tab=list")).toBeUndefined();
+    expect(
+      extractSignedOAuthQuery("?client_id=c1&scope=openid&sig=abc123&exp=999"),
+    ).toBe("client_id=c1&scope=openid&sig=abc123&exp=999");
+  });
+
+  it("forwards oauth_query on sign-in and follows Better Auth OAuth redirect", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            redirect: true,
+            url: "/oauth/consent?client_id=c1&sig=next",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ token: "ok" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const redirects: string[] = [];
+    const form = new ProodLoginFormElement();
+    form.setCredentials("alice@example.com", "secret-pass");
+    form.setOAuthContext({
+      search: "?client_id=c1&sig=abc123",
+      onRedirect: (url) => redirects.push(url),
+    });
+    await form.submit();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const firstBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(firstBody).toEqual({
+      email: "alice@example.com",
+      password: "secret-pass",
+      oauth_query: "client_id=c1&sig=abc123",
+    });
+    expect(redirects).toEqual(["/oauth/consent?client_id=c1&sig=next"]);
+
+    // Ordinary sign-in without OAuth query omits oauth_query
+    const normalForm = new ProodLoginFormElement();
+    normalForm.setCredentials("alice@example.com", "secret-pass");
+    normalForm.setOAuthContext({ search: "", onRedirect: (u) => redirects.push(u) });
+    await normalForm.submit();
+
+    const secondBody = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
+    expect(secondBody).toEqual({
+      email: "alice@example.com",
+      password: "secret-pass",
+    });
+    expect(redirects).toHaveLength(1);
+  });
+
+  it("uses root-relative shell asset URLs so /oauth/consent loads shell assets", () => {
+    const html = readFileSync(
+      resolve(process.cwd(), "apps/web/public/index.html"),
+      "utf8",
+    );
+    expect(html).toContain('href="/shell.css"');
+    expect(html).toContain('src="/shell.js"');
   });
 });
