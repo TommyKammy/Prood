@@ -59,7 +59,9 @@ export interface AutomationRepository {
   lookup(workspace: WorkspaceId, run: string): Promise<Delivery | null>;
 }
 
-export async function routeTaskEvent(repos: TransactionRepositories, e: OutboxEventRecord) {
+export async function routeTaskEvent(
+  repos: TransactionRepositories, e: OutboxEventRecord, manualSubscription?: Subscription,
+) {
   if (
     !e.projectId ||
     !e.workspaceId ||
@@ -88,8 +90,13 @@ export async function routeTaskEvent(repos: TransactionRepositories, e: OutboxEv
     cause = p.parentRun;
     origin = parent.proposal.origin;
   }
-  for (const r of await repos.automation.rules(e.projectId)) {
-    if (!r.enabled) continue;
+  // A manual start has already selected a revision. A second read under READ COMMITTED
+  // could silently drop it or route it to a revision published in between.
+  const subscriptions = manualSubscription
+    ? [manualSubscription]
+    : await repos.automation.rules(e.projectId);
+  for (const r of subscriptions) {
+    if (!r.enabled || r.project !== e.projectId) continue;
     const def = r.definition;
     if (def.when === "manual") {
       if (e.eventType !== "task.manual" || p.rule !== r.rule) continue;

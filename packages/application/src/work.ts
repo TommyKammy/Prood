@@ -1,4 +1,10 @@
-import { routeTaskEvent, parseRule, type RuleDefinition, type TaskField } from "./automation.js";
+import {
+  routeTaskEvent,
+  parseRule,
+  type RuleDefinition,
+  type Subscription,
+  type TaskField,
+} from "./automation.js";
 import {
   CONTRACT_VERSION,
   type ApiErrorCode,
@@ -163,6 +169,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       reasonCode: string | null;
       payload: Record<string, unknown>;
     },
+    manualSubscription?: Subscription,
   ): Promise<OutboxEventRecord> {
     const nowIso = deps.clock.now().toISOString();
     const event = await repos.outbox.append({
@@ -190,7 +197,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       },
       occurredAt: nowIso,
     });
-    await routeTaskEvent(repos,event);
+    await routeTaskEvent(repos, event, manualSubscription);
     return event;
   }
 
@@ -438,7 +445,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
             statusId: task.statusId,
             assigneeId: task.assigneeId,
           },
-        });
+        }, sub);
         return { ok: true, data: { event: e.eventId } };
       });
     },

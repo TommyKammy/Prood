@@ -1285,6 +1285,68 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
     release("obsolete");
     expect(await waiting).toBe(false);
     expect(await deps.uow.run((r) => r.automation.lookup(workspace, "obsolete"))).toBeNull();
+    const manualDefinition = { when: "manual", action: definition.action };
+    expect(
+      (
+        await h.workUseCases.manageAutomation(actor, project.id, "manual", {
+          op: "publish",
+          revision: 0,
+          delegate: user.userId,
+          definition: manualDefinition,
+        })
+      ).ok,
+    ).toBe(true);
+    // Stop at the selection boundary. On PG use a second connection for a real concurrent commit.
+    let selected = false;
+    const racingWork = createWorkUseCases({
+      ...deps,
+      uow: {
+        run: (fn) =>
+          db.uow.run((repos) =>
+            fn({
+              ...repos,
+              automation: {
+                ...repos.automation,
+                rules: async (projectId) => {
+                  const rules = await repos.automation.rules(projectId);
+                  if (!selected) {
+                    selected = true;
+                    const rule = rules.find((r) => r.rule === "manual")!;
+                    const stopped = { ...rule, enabled: false, revision: 2, delegation: 2 };
+                    const saved =
+                      targetDb === "postgres"
+                        ? await reopened.uow.run((r) => r.automation.save(stopped, 1))
+                        : await repos.automation.save(stopped, 1);
+                    expect(saved).toBe(true);
+                  }
+                  return rules;
+                },
+              },
+            }),
+          ),
+      },
+    });
+    const started = await racingWork.manualAutomation(actor, project.id, "manual", id);
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw Error("manual start");
+    expect(
+      await deliverNext(deps, workspace, (d) => {
+        expect([d.event, d.rule, d.revision]).toEqual([started.data.event, "manual", 1]);
+        return "manual-run";
+      }),
+    ).toBe(true);
+    expect(
+      (
+        await h.workUseCases.prepareAutomation(
+          workspace,
+          started.data.event,
+          "manual",
+          "manual-run",
+          project.id,
+          1,
+        )
+      ).status,
+    ).toBe("denied");
     // The recipient in a trigger filter can disappear even while the proposed status stays valid.
     const candidate = await h.signUpUser("reviewer@example.com", "Reviewer");
     const createdAt = clock.now().toISOString();

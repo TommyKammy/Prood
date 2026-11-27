@@ -599,7 +599,7 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
     await db.migrate();
 
     const server = await startTestHttpServer(db, {
-      accessTokenExpiresIn: 1,
+      accessTokenExpiresIn: 5,
     });
 
     const jar = new CookieJar();
@@ -669,14 +669,18 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
       await lowScopeClient.close();
     }
 
-    // 3. Expired token: issue valid token with 1s TTL, wait > 1s, then attempt connect/call
+    // Keep the scope assertion independent of sub-second JWT rounding; wait for this token to expire.
     const shortLivedToken = await issueOAuthAccessToken({
       baseURL: server.baseURL,
       cookieJar: jar,
       scope: `openid profile ${MCP_REQUIRED_WHOAMI_SCOPE}`,
       resource: server.mcpResource,
     });
-    await sleep(1200);
+    const { exp } = JSON.parse(
+      Buffer.from(shortLivedToken.accessToken.split(".")[1]!, "base64url").toString(),
+    );
+    expect(typeof exp).toBe("number");
+    await sleep(Math.max(0, exp * 1000 - Date.now() + 50));
 
     const expiredClient = new Client({
       name: "expired-client",
