@@ -7,6 +7,7 @@ import {
 
 export * from "./auth.js";
 export * from "./id.js";
+export * from "./mcp.js";
 export * from "./persistence.js";
 
 export interface Clock {

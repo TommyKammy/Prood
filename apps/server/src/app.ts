@@ -7,6 +7,8 @@ import {
   type Clock,
   type DatabaseHealthPort,
   type IdGenerator,
+  type McpHttpHandler,
+  type McpTokenVerifier,
   type UnitOfWork,
 } from "@prood/application";
 import {
@@ -22,6 +24,8 @@ export interface AppDeps {
   auth?: AuthPort;
   uow?: UnitOfWork;
   idGenerator?: IdGenerator;
+  mcpAuth?: McpTokenVerifier;
+  mcpHandler?: McpHttpHandler;
 }
 
 function errorBody(
@@ -35,7 +39,7 @@ function errorBody(
 }
 
 /**
- * Web-Standard Hono application with zero Node-specific, Better-Auth,
+ * Web-Standard Hono application with zero Node-specific, Better-Auth, FastMCP,
  * or DB-driver imports so the HTTP layer can also run on Cloudflare Workers.
  */
 export function createApp(deps: AppDeps): Hono {
@@ -51,6 +55,28 @@ export function createApp(deps: AppDeps): Hono {
     const health = await getHealth();
     return c.json(health);
   });
+
+  if (deps.mcpAuth) {
+    const mcpAuth = deps.mcpAuth;
+    app.get("/.well-known/oauth-protected-resource", (c) =>
+      c.json(mcpAuth.getProtectedResourceMetadata()),
+    );
+    app.get("/.well-known/oauth-protected-resource/mcp", (c) =>
+      c.json(mcpAuth.getProtectedResourceMetadata()),
+    );
+    app.get("/.well-known/oauth-authorization-server", async (c) =>
+      c.json(await mcpAuth.getAuthorizationServerMetadata()),
+    );
+    app.get("/.well-known/oauth-authorization-server/api/auth", async (c) =>
+      c.json(await mcpAuth.getAuthorizationServerMetadata()),
+    );
+  }
+
+  if (deps.mcpHandler) {
+    const mcpHandler = deps.mcpHandler;
+    app.all("/mcp", (c) => mcpHandler.handleRequest(c.req.raw));
+    app.all("/mcp/*", (c) => mcpHandler.handleRequest(c.req.raw));
+  }
 
   if (deps.auth) {
     const auth = deps.auth;

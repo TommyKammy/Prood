@@ -20,6 +20,7 @@
 - **Authentication Library**: `better-auth` (`^1.7.28`) isolated inside `@prood/integration-better-auth`, sharing Prood's existing Kysely instance (`database: { db, type: "sqlite" | "postgres" }`) so auth and domain data live in the same selected DB.
 - **Initial Login Flow**: Email + Password (`emailAndPassword: { enabled: true }`). OIDC SSO (test IdP) is deferred to a later phase.
 - **Identity & Table Separation**: Better Auth manages `auth_user`, `auth_session`, `auth_account`, and `auth_verification`; Prood owns `users` (`usr_*`), `auth_identities` (`(auth_provider, auth_subject) -> user_id`), and `workspace_memberships` (`mbr_*`). Auth routes are mounted via Web-Standard `Request/Response` in `apps/server/src/app.ts` without importing `better-auth` into `app.ts`.
+- **MCP OAuth Integration (PR 04)**: `@better-auth/oauth-provider` (`^1.7.28`) + `jwt()` acts as the OAuth 2.1 / OIDC issuer, while `fastmcp` (`^4.30.0`, `FastMCP` + `WebStreamableHTTPServerTransport` from `fastmcp/edge`) serves `/mcp` over Web-Standard HTTP with `jose` JWKS verification (`issuer`, `audience`, `exp`) and per-tool `prood:read` scope checks. See `docs/mcp-oauth-interop.md`.
 
 ## 5. Persistence & Public ID Decisions (PR 02)
 - **Public ID Format**: `<prefix>_<26 lowercase Crockford Base32 ULID chars>` (48-bit Unix ms + 80-bit random, monotonic within the same millisecond). Implemented with zero runtime dependencies in `@prood/domain`, using Web Standard `crypto.getRandomValues` in `@prood/application`.

@@ -13,6 +13,8 @@ export class ProodShellElement extends BaseElement {
   private authState: ShellAuthState = "loading";
   private signingOut = false;
   private signOutError = "";
+  private consentError = "";
+  private consentSubmitting = false;
 
   connectedCallback(): void {
     this.addEventListener("prood-authenticated", () => {
@@ -85,6 +87,42 @@ export class ProodShellElement extends BaseElement {
     }
   }
 
+  private async submitConsent(accept: boolean): Promise<void> {
+    if (
+      typeof fetch === "undefined" ||
+      typeof window === "undefined" ||
+      this.consentSubmitting
+    ) {
+      return;
+    }
+    this.consentSubmitting = true;
+    this.consentError = "";
+    this.render();
+    try {
+      const oauthQuery = window.location.search.replace(/^\?/, "");
+      const res = await fetch("/api/auth/oauth2/consent", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accept, oauth_query: oauthQuery }),
+      });
+      if (!res.ok) {
+        this.consentError = this.i18n.t("oauth.consentError");
+        return;
+      }
+      const data = (await res.json()) as { redirect_uri?: string; url?: string };
+      const target = data.redirect_uri ?? data.url;
+      if (target) {
+        window.location.assign(target);
+      }
+    } catch {
+      this.consentError = this.i18n.t("oauth.consentError");
+    } finally {
+      this.consentSubmitting = false;
+      this.render();
+    }
+  }
+
   private render(): void {
     if (typeof document === "undefined") {
       return;
@@ -148,6 +186,70 @@ export class ProodShellElement extends BaseElement {
     }
 
     if (this.authState === "authenticated" && this.sessionProfile) {
+      if (
+        typeof window !== "undefined" &&
+        window.location.pathname === "/oauth/consent"
+      ) {
+        const consentWrap = document.createElement("section");
+        consentWrap.className = "prood-login-wrap";
+
+        const consentCard = document.createElement("div");
+        consentCard.className = "prood-login-form";
+        consentCard.setAttribute("aria-label", t("aria.consentForm"));
+
+        const title = document.createElement("h1");
+        title.className = "prood-login-title";
+        title.textContent = t("oauth.consentTitle");
+
+        const desc = document.createElement("p");
+        desc.className = "prood-login-subtitle";
+        desc.textContent = t("oauth.consentDescription");
+
+        const params = new URLSearchParams(window.location.search);
+        const scopes = params.get("scope") ?? "openid";
+        const scopeText = document.createElement("p");
+        scopeText.className = "prood-count";
+        scopeText.textContent = t("oauth.consentScopes", { scopes });
+
+        consentCard.append(title, desc, scopeText);
+
+        if (this.consentError) {
+          const errEl = document.createElement("p");
+          errEl.className = "prood-auth-feedback";
+          errEl.setAttribute("role", "alert");
+          errEl.textContent = this.consentError;
+          consentCard.appendChild(errEl);
+        }
+
+        const btnRow = document.createElement("div");
+        btnRow.className = "prood-actions";
+
+        const approveBtn = document.createElement("button");
+        approveBtn.type = "button";
+        approveBtn.className = "prood-btn-primary";
+        approveBtn.disabled = this.consentSubmitting;
+        approveBtn.textContent = t("oauth.consentApprove");
+        approveBtn.addEventListener("click", () => {
+          void this.submitConsent(true);
+        });
+
+        const denyBtn = document.createElement("button");
+        denyBtn.type = "button";
+        denyBtn.className = "prood-btn-secondary";
+        denyBtn.disabled = this.consentSubmitting;
+        denyBtn.textContent = t("oauth.consentDeny");
+        denyBtn.addEventListener("click", () => {
+          void this.submitConsent(false);
+        });
+
+        btnRow.append(approveBtn, denyBtn);
+        consentCard.appendChild(btnRow);
+        consentWrap.appendChild(consentCard);
+        main.appendChild(consentWrap);
+        this.append(header, main);
+        return;
+      }
+
       if (this.signOutError) {
         const errorBanner = document.createElement("p");
         errorBanner.className = "prood-auth-feedback";

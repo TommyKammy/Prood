@@ -66,3 +66,16 @@ export interface ApiErrorResponse {
     messageKey: string;
   };
 }
+
+export const MCP_REQUIRED_WHOAMI_SCOPE = "prood:read" as const;
+
+export interface McpWhoamiResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  userId: UserId;
+  email: string;
+  displayName: string;
+  clientId: string;
+  scopes: string[];
+  resource: string;
+  workspaces: WorkspaceMembershipSummary[];
+}

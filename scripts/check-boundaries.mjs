@@ -76,14 +76,17 @@ for (const file of collectFiles(resolve(rootDir, "packages/domain/src"), (f) => 
   }
 }
 
-// 3. contracts & application must not import node:*, DB drivers, Kysely, Better Auth, or persistence packages
+// 3. contracts & application must not import node:*, DB drivers, Kysely, Better Auth, FastMCP, or persistence packages
 const coreForbidden = [
   /^node:/,
   "pg",
   "better-sqlite3",
   "kysely",
   "better-auth",
+  "@better-auth/oauth-provider",
+  "fastmcp",
   "@prood/integration-better-auth",
+  "@prood/integration-fastmcp",
   /^@prood\/persistence-/,
 ];
 assertNoForbiddenImports(resolve(rootDir, "packages/contracts/src"), coreForbidden, "contracts");
@@ -92,7 +95,16 @@ assertNoForbiddenImports(resolve(rootDir, "packages/application/src"), coreForbi
 // 4. persistence/common must remain driver- and node-free (Cloudflare D1 portability)
 assertNoForbiddenImports(
   resolve(rootDir, "packages/persistence/common/src"),
-  [/^node:/, "pg", "better-sqlite3", "better-auth", "@prood/integration-better-auth"],
+  [
+    /^node:/,
+    "pg",
+    "better-sqlite3",
+    "better-auth",
+    "@better-auth/oauth-provider",
+    "fastmcp",
+    "@prood/integration-better-auth",
+    "@prood/integration-fastmcp",
+  ],
   "persistence-common",
 );
 
@@ -105,7 +117,10 @@ assertNoForbiddenImports(
     "better-sqlite3",
     "kysely",
     "better-auth",
+    "@better-auth/oauth-provider",
+    "fastmcp",
     "@prood/integration-better-auth",
+    "@prood/integration-fastmcp",
     "@prood/persistence-sqlite",
     "@prood/persistence-postgres",
     "@hono/node-server",
@@ -113,7 +128,7 @@ assertNoForbiddenImports(
   "server-app",
 );
 
-// 6. apps/web/src/** must not import node:*, DB drivers, Kysely, Better Auth, persistence, or server
+// 6. apps/web/src/** must not import node:*, DB drivers, Kysely, Better Auth, FastMCP, persistence, or server
 assertNoForbiddenImports(
   resolve(rootDir, "apps/web/src"),
   [
@@ -122,7 +137,10 @@ assertNoForbiddenImports(
     "better-sqlite3",
     "kysely",
     "better-auth",
+    "@better-auth/oauth-provider",
+    "fastmcp",
     "@prood/integration-better-auth",
+    "@prood/integration-fastmcp",
     /^@prood\/persistence-/,
     "@prood/server",
   ],
@@ -137,6 +155,7 @@ if (webDistFiles.length === 0) {
 const forbiddenBundleMarkers = [
   "better-sqlite3",
   "better-auth",
+  "fastmcp",
   "pg-protocol",
   "kysely",
   "node:fs",

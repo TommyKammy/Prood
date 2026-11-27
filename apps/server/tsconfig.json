@@ -11,7 +11,8 @@
     { "path": "../../packages/persistence/common" },
     { "path": "../../packages/persistence/sqlite" },
     { "path": "../../packages/persistence/postgres" },
-    { "path": "../../packages/integrations/better-auth" }
+    { "path": "../../packages/integrations/better-auth" },
+    { "path": "../../packages/integrations/fastmcp" }
   ],
   "include": ["src"]
 }
