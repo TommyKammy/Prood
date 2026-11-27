@@ -223,9 +223,13 @@ describe("@prood/integration-fastmcp bounded session retention", () => {
 
   it("blocks cross-user and cross-client session access and preserves session state on rejected scope call", async () => {
     const nowMs = { value: 1_795_000_000_000 };
+    const authFailures: Array<{ path: string; reasonCode: string }> = [];
     const handler = createProodMcpServer({
       ...createTestDeps(nowMs),
       sessionIdleTtlMs: 5_000,
+      onAuthFailure: (info) => {
+        authFailures.push({ path: info.path, reasonCode: info.reasonCode });
+      },
     });
 
     const ownerSession = await initializeMcpSession(handler, "Bearer valid");
@@ -290,6 +294,14 @@ describe("@prood/integration-fastmcp bounded session retention", () => {
     // 600ms later (total 5_100ms since init): session must expire because 403 call did not refresh TTL
     nowMs.value += 600;
     expect((await listToolsInSession(handler, ownerSession)).status).toBe(404);
+
+    // Every rejected POST, GET, DELETE principal mismatch + scope error was audited via onAuthFailure
+    expect(
+      authFailures.filter((f) => f.reasonCode === "SESSION_PRINCIPAL_MISMATCH"),
+    ).toHaveLength(4);
+    expect(
+      authFailures.filter((f) => f.reasonCode === "INSUFFICIENT_SCOPE"),
+    ).toHaveLength(1);
   });
 
   it("enforces per-principal session cap, Origin header allowlist, DELETE cleanup, and header sanitization", async () => {

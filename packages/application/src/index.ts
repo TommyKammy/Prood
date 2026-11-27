@@ -9,6 +9,7 @@ export * from "./auth.js";
 export * from "./id.js";
 export * from "./mcp.js";
 export * from "./persistence.js";
+export * from "./work.js";
 
 export interface Clock {
   now(): Date;

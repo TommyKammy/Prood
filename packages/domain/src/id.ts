@@ -18,9 +18,13 @@ const VALID_PREFIX_SET = new Set<string>(PUBLIC_ENTITY_PREFIXES);
 export type EntityId<P extends PublicEntityPrefix> = `${P}_${string}`;
 
 export type TaskPublicId = EntityId<"tsk">;
+export type ProjectId = EntityId<"prj">;
 export type WorkspaceId = EntityId<"wks">;
 export type UserId = EntityId<"usr">;
+export type StatusId = EntityId<"sts">;
+export type EventId = EntityId<"evt">;
 export type MembershipId = EntityId<"mbr">;
+export type OutboxId = EntityId<"out">;
 
 const TIMESTAMP_LENGTH = 10;
 const RANDOM_LENGTH = 16;
