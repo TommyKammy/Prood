@@ -8,6 +8,7 @@ import {
   type DevProjectSettingsDto,
   type EnableDevProjectRequest,
   type EnableDevProjectResponse,
+  type MoveTaskRequest,
   type OutboxEventDto,
   type ProjectDevSettingsResponse,
   type ProjectDto,
@@ -17,6 +18,9 @@ import {
   type TaskDto,
   type TaskListResponse,
   type TaskResponse,
+  type TaskSearchItemDto,
+  type TaskSearchMatchKind,
+  type TaskSearchResponse,
   type UpdateDevProjectSettingsRequest,
   type UpdateTaskRequest,
   type UpdateWorkspaceSettingsRequest,
@@ -36,6 +40,7 @@ import {
   isValidProjectVisibility,
   normalizeDevPrefix,
   OUTBOX_SCHEMA_VERSION,
+  parseIssueKey,
   resolveEffectiveProjectRole,
   type AuditActorContext,
   type EventChannel,
@@ -176,7 +181,9 @@ function toTaskDto(
   task: TaskRecord,
   effectiveProjectId: ProjectId,
   issueKeyView: TaskIssueKeyView | null = null,
+  showIssueKey = true,
 ): TaskDto {
+  const visibleKey = showIssueKey ? issueKeyView : null;
   return {
     id: task.id,
     workspaceId: task.workspaceId,
@@ -184,11 +191,11 @@ function toTaskDto(
     effectiveProjectId,
     parentTaskId: task.parentTaskId,
     statusId: task.statusId,
-    issueKey: issueKeyView
-      ? formatIssueKey(issueKeyView.currentPrefix, issueKeyView.issueNumber)
+    issueKey: visibleKey
+      ? formatIssueKey(visibleKey.currentPrefix, visibleKey.issueNumber)
       : null,
-    branchName: issueKeyView
-      ? formatBranchName(issueKeyView.branchPrefix, issueKeyView.issueNumber)
+    branchName: visibleKey
+      ? formatBranchName(visibleKey.branchPrefix, visibleKey.issueNumber)
       : null,
     title: task.title,
     description: task.description,
@@ -322,18 +329,13 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
     return null;
   }
 
-  async function collectProjectTasksInTx(
+  async function collectDescendantsInTx(
     repos: TransactionRepositories,
-    projectId: ProjectId,
+    initialFrontier: readonly TaskPublicId[],
+    includeChild: (child: TaskRecord) => boolean,
   ): Promise<TaskRecord[]> {
-    const directTasks = await repos.tasks.listByProject(projectId);
     const collected = new Map<TaskPublicId, TaskRecord>();
-    let frontier: TaskPublicId[] = [];
-    for (const task of directTasks) {
-      collected.set(task.id, task);
-      frontier.push(task.id);
-    }
-
+    let frontier = Array.from(initialFrontier);
     for (
       let depth = 0;
       depth < MAX_PARENT_HOPS && frontier.length > 0;
@@ -342,18 +344,262 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       const children = await repos.tasks.listSubtasksByParentIds(frontier);
       const nextFrontier: TaskPublicId[] = [];
       for (const child of children) {
-        if (
-          !collected.has(child.id) &&
-          (child.projectId === null || child.projectId === projectId)
-        ) {
+        if (!collected.has(child.id) && includeChild(child)) {
           collected.set(child.id, child);
           nextFrontier.push(child.id);
         }
       }
       frontier = nextFrontier;
     }
-
     return Array.from(collected.values());
+  }
+
+  async function collectProjectTasksInTx(
+    repos: TransactionRepositories,
+    projectId: ProjectId,
+  ): Promise<TaskRecord[]> {
+    const directTasks = await repos.tasks.listByProject(projectId);
+    const descendants = await collectDescendantsInTx(
+      repos,
+      directTasks.map((t) => t.id),
+      (child) => child.projectId === null || child.projectId === projectId,
+    );
+    const seen = new Set(directTasks.map((t) => t.id));
+    return [
+      ...directTasks,
+      ...descendants.filter((child) => !seen.has(child.id)),
+    ];
+  }
+
+  interface ResolvedTaskContext {
+    task: TaskRecord;
+    effectiveProject: ProjectRecord;
+    role: ProjectRole | null;
+  }
+
+  async function resolveProjectRefInTx(
+    repos: TransactionRepositories,
+    workspaceId: WorkspaceId,
+    projectRef: string,
+  ): Promise<ProjectRecord | null> {
+    const trimmed = projectRef.trim();
+    if (!trimmed) {
+      return null;
+    }
+    if (isValidEntityId("prj", trimmed)) {
+      const project = await repos.projects.findById(trimmed);
+      if (!project || project.workspaceId !== workspaceId) {
+        return null;
+      }
+      return project;
+    }
+    const normalizedPrefix = normalizeDevPrefix(trimmed);
+    if (!normalizedPrefix) {
+      return null;
+    }
+    const resolvedId = await repos.issueKeys.findProjectIdByWorkspacePrefix(
+      workspaceId,
+      normalizedPrefix,
+    );
+    if (!resolvedId) {
+      return null;
+    }
+    const project = await repos.projects.findById(resolvedId);
+    if (!project || project.workspaceId !== workspaceId) {
+      return null;
+    }
+    return project;
+  }
+
+  async function loadTaskContextInTx(
+    repos: TransactionRepositories,
+    actor: AuditActorContext,
+    taskId: TaskPublicId,
+    workspaceFilter?: WorkspaceId,
+  ): Promise<ResolvedTaskContext | null> {
+    const task = await repos.tasks.findById(taskId);
+    if (!task) {
+      return null;
+    }
+    if (workspaceFilter && task.workspaceId !== workspaceFilter) {
+      return null;
+    }
+    const resolved = await resolveTaskEffectiveProject(repos, task);
+    if (!resolved) {
+      return null;
+    }
+    const role = await resolveActorProjectRole(
+      repos,
+      actor.userId,
+      resolved.project,
+    );
+    return { task, effectiveProject: resolved.project, role };
+  }
+
+  async function resolveTaskRefInTx<T>(
+    repos: TransactionRepositories,
+    actor: AuditActorContext,
+    taskRef: string,
+    options?: { workspaceId?: WorkspaceId },
+  ): Promise<
+    | { found: true; ctx: ResolvedTaskContext }
+    | {
+        found: false;
+        failure: WorkUseCaseResult<T>;
+        deniedTarget?: ResolvedTaskContext;
+      }
+  > {
+    const trimmed = typeof taskRef === "string" ? taskRef.trim() : "";
+    if (!trimmed) {
+      return { found: false, failure: fail(404, "NOT_FOUND", "error.notFound") };
+    }
+
+    if (isValidEntityId("tsk", trimmed)) {
+      const ctx = await loadTaskContextInTx(
+        repos,
+        actor,
+        trimmed,
+        options?.workspaceId,
+      );
+      if (!ctx) {
+        return {
+          found: false,
+          failure: fail(404, "NOT_FOUND", "error.notFound"),
+        };
+      }
+      return { found: true, ctx };
+    }
+
+    const parsedKey = parseIssueKey(trimmed);
+    if (!parsedKey) {
+      return { found: false, failure: fail(404, "NOT_FOUND", "error.notFound") };
+    }
+
+    if (options?.workspaceId) {
+      const taskId = await repos.issueKeys.findTaskIdByWorkspaceKey(
+        options.workspaceId,
+        parsedKey.prefix,
+        parsedKey.number,
+      );
+      if (!taskId) {
+        return {
+          found: false,
+          failure: fail(404, "NOT_FOUND", "error.notFound"),
+        };
+      }
+      const ctx = await loadTaskContextInTx(
+        repos,
+        actor,
+        taskId,
+        options.workspaceId,
+      );
+      if (!ctx) {
+        return {
+          found: false,
+          failure: fail(404, "NOT_FOUND", "error.notFound"),
+        };
+      }
+      return { found: true, ctx };
+    }
+
+    const summaries = actor.userId
+      ? await repos.memberships.listSummariesForUser(actor.userId)
+      : [];
+    if (summaries.length === 0) {
+      return { found: false, failure: fail(404, "NOT_FOUND", "error.notFound") };
+    }
+
+    const candidates = await repos.issueKeys.findTaskIdsByWorkspacesAndKey(
+      summaries.map((s) => s.workspaceId),
+      parsedKey.prefix,
+      parsedKey.number,
+    );
+    const readable: ResolvedTaskContext[] = [];
+    const denied: ResolvedTaskContext[] = [];
+    for (const candidate of candidates) {
+      const ctx = await loadTaskContextInTx(
+        repos,
+        actor,
+        candidate.taskId,
+        candidate.workspaceId,
+      );
+      if (!ctx) {
+        continue;
+      }
+      if (canReadProject(ctx.role)) {
+        readable.push(ctx);
+      } else {
+        denied.push(ctx);
+      }
+    }
+
+    if (readable.length === 1) {
+      return { found: true, ctx: readable[0]! };
+    }
+    if (readable.length > 1) {
+      return {
+        found: false,
+        failure: fail(409, "CONFLICT", "error.ambiguousIssueKey"),
+      };
+    }
+    return {
+      found: false,
+      failure: fail(404, "NOT_FOUND", "error.notFound"),
+      deniedTarget: denied[0],
+    };
+  }
+
+  async function assignMissingKeysForSubtreeInTx(
+    repos: TransactionRepositories,
+    rootTask: TaskRecord,
+    targetProject: ProjectRecord,
+    nowIso: string,
+  ): Promise<void> {
+    await repos.projects.lockForTaskWrite(targetProject.id);
+    const namespace = await repos.issueKeys.findNamespaceByProjectId(
+      targetProject.id,
+    );
+    if (!namespace) {
+      return;
+    }
+
+    const inheritedSubtasks = await collectDescendantsInTx(
+      repos,
+      [rootTask.id],
+      (child) => child.projectId === null,
+    );
+    const subtreeTasks = [rootTask, ...inheritedSubtasks];
+    const existingKeys = await repos.issueKeys.findByTaskIds(
+      subtreeTasks.map((t) => t.id),
+    );
+    const unkeyed = subtreeTasks
+      .filter((t) => !existingKeys.has(t.id))
+      .sort((a, b) => {
+        if (a.createdAt !== b.createdAt) {
+          return a.createdAt < b.createdAt ? -1 : 1;
+        }
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      });
+    if (unkeyed.length === 0) {
+      return;
+    }
+
+    const entries: Array<{
+      taskId: TaskPublicId;
+      namespaceId: IssueKeyNamespaceRecord["id"];
+      issueNumber: number;
+      createdAt: string;
+    }> = [];
+    for (const item of unkeyed) {
+      const issueNumber = await repos.issueKeys.allocateNextNumber(namespace.id);
+      entries.push({
+        taskId: item.id,
+        namespaceId: namespace.id,
+        issueNumber,
+        createdAt: nowIso,
+      });
+    }
+    await repos.issueKeys.createTaskKeys(entries);
   }
 
   async function insertTaskAndIssueKeyInTx(
@@ -668,6 +914,57 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       });
     },
 
+    async getProject(
+      actor: AuditActorContext,
+      workspaceId: WorkspaceId,
+      projectRef: string,
+    ): Promise<WorkUseCaseResult<ProjectResponse>> {
+      return deps.uow.run(async (repos) => {
+        const wsMembership = actor.userId
+          ? await repos.memberships.findByWorkspaceAndUser(workspaceId, actor.userId)
+          : null;
+        const project = await resolveProjectRefInTx(repos, workspaceId, projectRef);
+        if (!project) {
+          return fail(404, "NOT_FOUND", "error.notFound");
+        }
+        const role = wsMembership
+          ? await resolveActorProjectRole(repos, actor.userId, project)
+          : null;
+        if (!canReadProject(role)) {
+          await appendOutbox(repos, {
+            workspaceId: project.workspaceId,
+            projectId: project.id,
+            eventType: "project.read.denied",
+            action: "project.read",
+            outcome: "denied",
+            actor,
+            targetType: "project",
+            targetId: project.id,
+            reasonCode: "FORBIDDEN",
+            payload: { projectId: project.id },
+          });
+          return fail(404, "NOT_FOUND", "error.notFound");
+        }
+
+        const statuses = await repos.statuses.listByProject(project.id);
+        const ns = await repos.issueKeys.findNamespaceByProjectId(project.id);
+        const prefixes = ns
+          ? await repos.issueKeys.listPrefixesByNamespace(ns.id)
+          : [];
+        return {
+          ok: true,
+          data: {
+            contractVersion: CONTRACT_VERSION,
+            project: toProjectDto(
+              project,
+              statuses,
+              ns ? toDevProjectSettingsDto(ns, prefixes) : null,
+            ),
+          },
+        };
+      });
+    },
+
     async createTask(
       actor: AuditActorContext,
       projectId: ProjectId,
@@ -824,24 +1121,38 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
 
     async getTask(
       actor: AuditActorContext,
-      taskId: TaskPublicId,
+      taskRef: string,
+      options?: { workspaceId?: WorkspaceId },
     ): Promise<WorkUseCaseResult<TaskResponse>> {
       return deps.uow.run(async (repos) => {
-        const task = await repos.tasks.findById(taskId);
-        if (!task) {
-          return fail(404, "NOT_FOUND", "error.notFound");
-        }
-        const resolved = await resolveTaskEffectiveProject(repos, task);
-        if (!resolved) {
-          return fail(404, "NOT_FOUND", "error.notFound");
-        }
-        const effectiveProject = resolved.project;
-
-        const role = await resolveActorProjectRole(
+        const resolvedRef = await resolveTaskRefInTx<TaskResponse>(
           repos,
-          actor.userId,
-          effectiveProject,
+          actor,
+          taskRef,
+          options,
         );
+        if (!resolvedRef.found) {
+          if (resolvedRef.deniedTarget) {
+            await appendOutbox(repos, {
+              workspaceId: resolvedRef.deniedTarget.effectiveProject.workspaceId,
+              projectId: resolvedRef.deniedTarget.effectiveProject.id,
+              eventType: "task.read.denied",
+              action: "task.read",
+              outcome: "denied",
+              actor,
+              targetType: "task",
+              targetId: resolvedRef.deniedTarget.task.id,
+              reasonCode: "FORBIDDEN",
+              payload: {
+                taskId: resolvedRef.deniedTarget.task.id,
+                projectId: resolvedRef.deniedTarget.effectiveProject.id,
+              },
+            });
+          }
+          return resolvedRef.failure;
+        }
+
+        const { task, effectiveProject, role } = resolvedRef.ctx;
         if (!canReadProject(role)) {
           await appendOutbox(repos, {
             workspaceId: effectiveProject.workspaceId,
@@ -858,13 +1169,21 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           return fail(404, "NOT_FOUND", "error.notFound");
         }
 
-        const issueKey = await repos.issueKeys.findByTaskId(task.id);
+        const [issueKey, activeNamespace] = await Promise.all([
+          repos.issueKeys.findByTaskId(task.id),
+          repos.issueKeys.findNamespaceByProjectId(effectiveProject.id),
+        ]);
 
         return {
           ok: true,
           data: {
             contractVersion: CONTRACT_VERSION,
-            task: toTaskDto(task, effectiveProject.id, issueKey),
+            task: toTaskDto(
+              task,
+              effectiveProject.id,
+              issueKey,
+              activeNamespace !== null,
+            ),
           },
         };
       });
@@ -898,16 +1217,25 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         }
 
         const collectedTasks = await collectProjectTasksInTx(repos, project.id);
-        const issueKeysByTaskId = await repos.issueKeys.findByTaskIds(
-          collectedTasks.map((t) => t.id),
+        const activeNamespace = await repos.issueKeys.findNamespaceByProjectId(
+          project.id,
         );
+        const showKeys = activeNamespace !== null;
+        const issueKeysByTaskId = showKeys
+          ? await repos.issueKeys.findByTaskIds(collectedTasks.map((t) => t.id))
+          : new Map<TaskPublicId, TaskIssueKeyView>();
 
         return {
           ok: true,
           data: {
             contractVersion: CONTRACT_VERSION,
             tasks: collectedTasks.map((t) =>
-              toTaskDto(t, project.id, issueKeysByTaskId.get(t.id) ?? null),
+              toTaskDto(
+                t,
+                project.id,
+                issueKeysByTaskId.get(t.id) ?? null,
+                showKeys,
+              ),
             ),
           },
         };
@@ -916,8 +1244,9 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
 
     async updateTask(
       actor: AuditActorContext,
-      taskId: TaskPublicId,
+      taskRef: string,
       patch: UpdateTaskRequest & Record<string, unknown>,
+      options?: { workspaceId?: WorkspaceId },
     ): Promise<WorkUseCaseResult<TaskResponse>> {
       if (!isPlainObject(patch)) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
@@ -932,6 +1261,13 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
       if (patch.description !== undefined && typeof patch.description !== "string") {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
+      if (
+        patch.projectId !== undefined &&
+        (typeof patch.projectId !== "string" ||
+          !isValidEntityId("prj", patch.projectId))
+      ) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
       if (
@@ -966,25 +1302,42 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       }
 
       return deps.uow.run(async (repos) => {
-        const existing = await repos.tasks.findById(taskId);
-        if (!existing) {
-          return fail(404, "NOT_FOUND", "error.notFound");
-        }
-        const resolved = await resolveTaskEffectiveProject(repos, existing);
-        if (!resolved) {
-          return fail(404, "NOT_FOUND", "error.notFound");
-        }
-        const effectiveProject = resolved.project;
-
-        const role = await resolveActorProjectRole(
+        const resolvedRef = await resolveTaskRefInTx<TaskResponse>(
           repos,
-          actor.userId,
-          effectiveProject,
+          actor,
+          taskRef,
+          options,
         );
-        if (!canWriteProjectTasks(role)) {
+        if (!resolvedRef.found) {
+          if (resolvedRef.deniedTarget) {
+            await appendOutbox(repos, {
+              workspaceId: resolvedRef.deniedTarget.effectiveProject.workspaceId,
+              projectId: resolvedRef.deniedTarget.effectiveProject.id,
+              eventType: "task.update.denied",
+              action: "task.update",
+              outcome: "denied",
+              actor,
+              targetType: "task",
+              targetId: resolvedRef.deniedTarget.task.id,
+              reasonCode: "FORBIDDEN",
+              payload: {
+                taskId: resolvedRef.deniedTarget.task.id,
+                projectId: resolvedRef.deniedTarget.effectiveProject.id,
+              },
+            });
+          }
+          return resolvedRef.failure;
+        }
+
+        const {
+          task: existing,
+          effectiveProject: sourceProject,
+          role: sourceRole,
+        } = resolvedRef.ctx;
+        if (!canReadProject(sourceRole)) {
           await appendOutbox(repos, {
-            workspaceId: effectiveProject.workspaceId,
-            projectId: effectiveProject.id,
+            workspaceId: sourceProject.workspaceId,
+            projectId: sourceProject.id,
             eventType: "task.update.denied",
             action: "task.update",
             outcome: "denied",
@@ -992,21 +1345,91 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
             targetType: "task",
             targetId: existing.id,
             reasonCode: "FORBIDDEN",
-            payload: { taskId: existing.id, projectId: effectiveProject.id },
+            payload: { taskId: existing.id, projectId: sourceProject.id },
+          });
+          return fail(404, "NOT_FOUND", "error.notFound");
+        }
+        if (!canWriteProjectTasks(sourceRole)) {
+          await appendOutbox(repos, {
+            workspaceId: sourceProject.workspaceId,
+            projectId: sourceProject.id,
+            eventType: "task.update.denied",
+            action: "task.update",
+            outcome: "denied",
+            actor,
+            targetType: "task",
+            targetId: existing.id,
+            reasonCode: "FORBIDDEN",
+            payload: { taskId: existing.id, projectId: sourceProject.id },
           });
           return fail(403, "FORBIDDEN", "error.forbidden");
         }
 
-        if (patch.statusId !== undefined && patch.statusId !== null) {
-          const status = await repos.statuses.findById(patch.statusId);
-          if (!status || status.projectId !== effectiveProject.id) {
+        let targetProject = sourceProject;
+        const isMovingProject =
+          patch.projectId !== undefined && patch.projectId !== sourceProject.id;
+        if (isMovingProject) {
+          const requestedTarget = await repos.projects.findById(patch.projectId!);
+          if (!requestedTarget) {
+            return fail(404, "NOT_FOUND", "error.notFound");
+          }
+          if (requestedTarget.workspaceId !== sourceProject.workspaceId) {
             return fail(400, "VALIDATION_ERROR", "error.validation");
           }
+          const targetRole = await resolveActorProjectRole(
+            repos,
+            actor.userId,
+            requestedTarget,
+          );
+          if (!canReadProject(targetRole)) {
+            await appendOutbox(repos, {
+              workspaceId: requestedTarget.workspaceId,
+              projectId: requestedTarget.id,
+              eventType: "task.move.denied",
+              action: "task.move",
+              outcome: "denied",
+              actor,
+              targetType: "project",
+              targetId: requestedTarget.id,
+              reasonCode: "FORBIDDEN",
+              payload: { taskId: existing.id, projectId: requestedTarget.id },
+            });
+            return fail(404, "NOT_FOUND", "error.notFound");
+          }
+          if (!canWriteProjectTasks(targetRole)) {
+            await appendOutbox(repos, {
+              workspaceId: requestedTarget.workspaceId,
+              projectId: requestedTarget.id,
+              eventType: "task.move.denied",
+              action: "task.move",
+              outcome: "denied",
+              actor,
+              targetType: "project",
+              targetId: requestedTarget.id,
+              reasonCode: "FORBIDDEN",
+              payload: { taskId: existing.id, projectId: requestedTarget.id },
+            });
+            return fail(403, "FORBIDDEN", "error.forbidden");
+          }
+          targetProject = requestedTarget;
+        }
+
+        let resolvedStatusId: StatusId | null | undefined = patch.statusId;
+        if (patch.statusId !== undefined && patch.statusId !== null) {
+          const status = await repos.statuses.findById(patch.statusId);
+          if (!status || status.projectId !== targetProject.id) {
+            return fail(400, "VALIDATION_ERROR", "error.validation");
+          }
+        } else if (isMovingProject && patch.statusId === undefined) {
+          const targetStatuses = await repos.statuses.listByProject(
+            targetProject.id,
+          );
+          resolvedStatusId = targetStatuses[0]?.id ?? null;
         }
 
         if (patch.assigneeId !== undefined && patch.assigneeId !== null) {
           const assigneeMembership = await repos.memberships.findByWorkspaceAndUser(
-            effectiveProject.workspaceId,
+            targetProject.workspaceId,
             patch.assigneeId,
           );
           if (!assigneeMembership) {
@@ -1020,7 +1443,12 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           ...(patch.description !== undefined
             ? { description: patch.description }
             : {}),
-          ...(patch.statusId !== undefined ? { statusId: patch.statusId } : {}),
+          ...(isMovingProject
+            ? { projectId: targetProject.id, parentTaskId: null }
+            : {}),
+          ...(resolvedStatusId !== undefined
+            ? { statusId: resolvedStatusId }
+            : {}),
           ...(patch.assigneeId !== undefined
             ? { assigneeId: patch.assigneeId }
             : {}),
@@ -1034,11 +1462,20 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           return fail(404, "NOT_FOUND", "error.notFound");
         }
 
+        if (isMovingProject) {
+          await assignMissingKeysForSubtreeInTx(
+            repos,
+            updated,
+            targetProject,
+            nowIso,
+          );
+        }
+
         await appendOutbox(repos, {
-          workspaceId: effectiveProject.workspaceId,
-          projectId: effectiveProject.id,
-          eventType: "task.updated",
-          action: "task.update",
+          workspaceId: targetProject.workspaceId,
+          projectId: targetProject.id,
+          eventType: isMovingProject ? "task.moved" : "task.updated",
+          action: isMovingProject ? "task.move" : "task.update",
           outcome: "succeeded",
           actor,
           targetType: "task",
@@ -1046,13 +1483,17 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           reasonCode: null,
           payload: {
             taskId: updated.id,
-            projectId: effectiveProject.id,
+            projectId: targetProject.id,
+            ...(isMovingProject ? { fromProjectId: sourceProject.id } : {}),
             changes: {
               ...(patch.title !== undefined ? { title: updated.title } : {}),
               ...(patch.description !== undefined
                 ? { description: updated.description }
                 : {}),
-              ...(patch.statusId !== undefined ? { statusId: updated.statusId } : {}),
+              ...(isMovingProject ? { projectId: updated.projectId } : {}),
+              ...(resolvedStatusId !== undefined
+                ? { statusId: updated.statusId }
+                : {}),
               ...(patch.assigneeId !== undefined
                 ? { assigneeId: updated.assigneeId }
                 : {}),
@@ -1064,13 +1505,253 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           },
         });
 
-        const issueKey = await repos.issueKeys.findByTaskId(updated.id);
+        const [issueKey, activeNamespace] = await Promise.all([
+          repos.issueKeys.findByTaskId(updated.id),
+          repos.issueKeys.findNamespaceByProjectId(targetProject.id),
+        ]);
 
         return {
           ok: true,
           data: {
             contractVersion: CONTRACT_VERSION,
-            task: toTaskDto(updated, effectiveProject.id, issueKey),
+            task: toTaskDto(
+              updated,
+              targetProject.id,
+              issueKey,
+              activeNamespace !== null,
+            ),
+          },
+        };
+      });
+    },
+
+    async moveTask(
+      actor: AuditActorContext,
+      taskRef: string,
+      input: MoveTaskRequest & Record<string, unknown>,
+      options?: { workspaceId?: WorkspaceId },
+    ): Promise<WorkUseCaseResult<TaskResponse>> {
+      if (!isPlainObject(input)) {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
+      if (
+        typeof input.projectId !== "string" ||
+        !isValidEntityId("prj", input.projectId)
+      ) {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
+      if (
+        input.statusId !== undefined &&
+        input.statusId !== null &&
+        (typeof input.statusId !== "string" ||
+          !isValidEntityId("sts", input.statusId))
+      ) {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
+      return this.updateTask(
+        actor,
+        taskRef,
+        {
+          projectId: input.projectId,
+          ...(input.statusId !== undefined ? { statusId: input.statusId } : {}),
+        },
+        options,
+      );
+    },
+
+    async searchTasks(
+      actor: AuditActorContext,
+      workspaceId: WorkspaceId,
+      input: {
+        query?: string;
+        projectRef?: string;
+        limit?: number;
+      },
+    ): Promise<WorkUseCaseResult<TaskSearchResponse>> {
+      const rawQuery = typeof input.query === "string" ? input.query : "";
+      const trimmedQuery = rawQuery.trim();
+      const rawLimit =
+        typeof input.limit === "number" && Number.isFinite(input.limit)
+          ? Math.trunc(input.limit)
+          : 20;
+      const limit = Math.min(Math.max(rawLimit, 1), 100);
+
+      return deps.uow.run(async (repos) => {
+        const wsMembership = actor.userId
+          ? await repos.memberships.findByWorkspaceAndUser(workspaceId, actor.userId)
+          : null;
+        if (!wsMembership) {
+          await appendOutbox(repos, {
+            workspaceId: null,
+            projectId: null,
+            eventType: "task.search.denied",
+            action: "task.search",
+            outcome: "denied",
+            actor,
+            targetType: "workspace",
+            targetId: workspaceId,
+            reasonCode: "FORBIDDEN",
+            payload: { workspaceId },
+          });
+          return fail(403, "FORBIDDEN", "error.forbidden");
+        }
+
+        const allProjects = await repos.projects.listByWorkspace(workspaceId);
+        const readableProjects: ProjectRecord[] = [];
+        for (const project of allProjects) {
+          const role = await resolveActorProjectRole(repos, actor.userId, project);
+          if (canReadProject(role)) {
+            readableProjects.push(project);
+          }
+        }
+        const readableIds = new Set(readableProjects.map((p) => p.id));
+
+        let allowedProjects = readableProjects;
+        if (input.projectRef !== undefined && input.projectRef.trim() !== "") {
+          const scopedProject = await resolveProjectRefInTx(
+            repos,
+            workspaceId,
+            input.projectRef,
+          );
+          if (!scopedProject || !readableIds.has(scopedProject.id)) {
+            await appendOutbox(repos, {
+              workspaceId,
+              projectId: scopedProject?.id ?? null,
+              eventType: "task.search.denied",
+              action: "task.search",
+              outcome: "denied",
+              actor,
+              targetType: "project",
+              targetId: scopedProject?.id ?? input.projectRef.trim(),
+              reasonCode: "FORBIDDEN",
+              payload: { workspaceId, projectRef: input.projectRef.trim() },
+            });
+            return fail(404, "NOT_FOUND", "error.notFound");
+          }
+          allowedProjects = [scopedProject];
+        }
+
+        const allowedProjectMap = new Map<ProjectId, ProjectRecord>(
+          allowedProjects.map((p) => [p.id, p]),
+        );
+        const allowedProjectIds = Array.from(allowedProjectMap.keys());
+        const activeNamespaces = await repos.issueKeys.findNamespacesByProjectIds(
+          allowedProjectIds,
+        );
+        const devProjectIds = new Set<ProjectId>(
+          activeNamespaces
+            .map((ns) => ns.projectId)
+            .filter((id): id is ProjectId => id !== null),
+        );
+
+        let exactEntry: {
+          task: TaskRecord;
+          effectiveProjectId: ProjectId;
+          matchKind: TaskSearchMatchKind;
+        } | null = null;
+
+        if (isValidEntityId("tsk", trimmedQuery)) {
+          const candidate = await repos.tasks.findById(trimmedQuery);
+          if (candidate && candidate.workspaceId === workspaceId) {
+            const resolved = await resolveTaskEffectiveProject(repos, candidate);
+            if (resolved && allowedProjectMap.has(resolved.project.id)) {
+              exactEntry = {
+                task: candidate,
+                effectiveProjectId: resolved.project.id,
+                matchKind: "exact_id",
+              };
+            }
+          }
+        } else {
+          const parsedKey = parseIssueKey(trimmedQuery);
+          if (parsedKey) {
+            const candidateId = await repos.issueKeys.findTaskIdByWorkspaceKey(
+              workspaceId,
+              parsedKey.prefix,
+              parsedKey.number,
+            );
+            if (candidateId) {
+              const candidate = await repos.tasks.findById(candidateId);
+              if (candidate && candidate.workspaceId === workspaceId) {
+                const resolved = await resolveTaskEffectiveProject(repos, candidate);
+                if (resolved && allowedProjectMap.has(resolved.project.id)) {
+                  exactEntry = {
+                    task: candidate,
+                    effectiveProjectId: resolved.project.id,
+                    matchKind: "exact_key",
+                  };
+                }
+              }
+            }
+          }
+        }
+
+        const candidateLimit = Math.min(limit * 3, 300);
+        const textCandidates = await repos.tasks.searchInWorkspace({
+          workspaceId,
+          allowedProjectIds,
+          query: trimmedQuery,
+          limit: candidateLimit,
+        });
+
+        const selected: Array<{
+          task: TaskRecord;
+          effectiveProjectId: ProjectId;
+          matchKind: TaskSearchMatchKind;
+        }> = [];
+        const seenTaskIds = new Set<TaskPublicId>();
+        if (exactEntry) {
+          selected.push(exactEntry);
+          seenTaskIds.add(exactEntry.task.id);
+        }
+
+        for (const candidate of textCandidates) {
+          if (selected.length >= limit) {
+            break;
+          }
+          if (seenTaskIds.has(candidate.id)) {
+            continue;
+          }
+          let effectiveProject: ProjectRecord | undefined;
+          if (candidate.projectId) {
+            effectiveProject = allowedProjectMap.get(candidate.projectId);
+          } else {
+            const resolved = await resolveTaskEffectiveProject(repos, candidate);
+            if (resolved) {
+              effectiveProject = allowedProjectMap.get(resolved.project.id);
+            }
+          }
+          if (!effectiveProject) {
+            continue;
+          }
+          seenTaskIds.add(candidate.id);
+          selected.push({
+            task: candidate,
+            effectiveProjectId: effectiveProject.id,
+            matchKind: "text",
+          });
+        }
+
+        const issueKeysByTaskId = await repos.issueKeys.findByTaskIds(
+          selected.map((s) => s.task.id),
+        );
+
+        const items: TaskSearchItemDto[] = selected.map((entry) => ({
+          matchKind: entry.matchKind,
+          task: toTaskDto(
+            entry.task,
+            entry.effectiveProjectId,
+            issueKeysByTaskId.get(entry.task.id) ?? null,
+            devProjectIds.has(entry.effectiveProjectId),
+          ),
+        }));
+
+        return {
+          ok: true,
+          data: {
+            contractVersion: CONTRACT_VERSION,
+            query: rawQuery,
+            items,
           },
         };
       });
@@ -1078,8 +1759,9 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
 
     async copyTask(
       actor: AuditActorContext,
-      sourceTaskId: TaskPublicId,
+      sourceTaskRef: string,
       input: CopyTaskRequest & Record<string, unknown>,
+      options?: { workspaceId?: WorkspaceId },
     ): Promise<WorkUseCaseResult<TaskResponse>> {
       if (!isPlainObject(input)) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
@@ -1113,23 +1795,41 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       }
 
       return deps.uow.run(async (repos) => {
-        const sourceTask = await repos.tasks.findById(sourceTaskId);
-        if (!sourceTask) {
-          return fail(404, "NOT_FOUND", "error.notFound");
-        }
-        const sourceResolved = await resolveTaskEffectiveProject(repos, sourceTask);
-        if (!sourceResolved) {
-          return fail(404, "NOT_FOUND", "error.notFound");
-        }
-        const sourceRole = await resolveActorProjectRole(
+        const resolvedRef = await resolveTaskRefInTx<TaskResponse>(
           repos,
-          actor.userId,
-          sourceResolved.project,
+          actor,
+          sourceTaskRef,
+          options,
         );
+        if (!resolvedRef.found) {
+          if (resolvedRef.deniedTarget) {
+            await appendOutbox(repos, {
+              workspaceId: resolvedRef.deniedTarget.effectiveProject.workspaceId,
+              projectId: resolvedRef.deniedTarget.effectiveProject.id,
+              eventType: "task.copy.denied",
+              action: "task.copy",
+              outcome: "denied",
+              actor,
+              targetType: "task",
+              targetId: resolvedRef.deniedTarget.task.id,
+              reasonCode: "FORBIDDEN",
+              payload: {
+                taskId: resolvedRef.deniedTarget.task.id,
+                projectId: resolvedRef.deniedTarget.effectiveProject.id,
+              },
+            });
+          }
+          return resolvedRef.failure;
+        }
+        const {
+          task: sourceTask,
+          effectiveProject: sourceProject,
+          role: sourceRole,
+        } = resolvedRef.ctx;
         if (!canReadProject(sourceRole)) {
           await appendOutbox(repos, {
-            workspaceId: sourceResolved.project.workspaceId,
-            projectId: sourceResolved.project.id,
+            workspaceId: sourceProject.workspaceId,
+            projectId: sourceProject.id,
             eventType: "task.copy.denied",
             action: "task.copy",
             outcome: "denied",
@@ -1137,18 +1837,18 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
             targetType: "task",
             targetId: sourceTask.id,
             reasonCode: "FORBIDDEN",
-            payload: { taskId: sourceTask.id, projectId: sourceResolved.project.id },
+            payload: { taskId: sourceTask.id, projectId: sourceProject.id },
           });
           return fail(404, "NOT_FOUND", "error.notFound");
         }
 
-        let targetProject = sourceResolved.project;
-        if (input.projectId !== undefined && input.projectId !== sourceResolved.project.id) {
+        let targetProject = sourceProject;
+        if (input.projectId !== undefined && input.projectId !== sourceProject.id) {
           const requestedTarget = await repos.projects.findById(input.projectId);
           if (!requestedTarget) {
             return fail(404, "NOT_FOUND", "error.notFound");
           }
-          if (requestedTarget.workspaceId !== sourceResolved.project.workspaceId) {
+          if (requestedTarget.workspaceId !== sourceProject.workspaceId) {
             return fail(400, "VALIDATION_ERROR", "error.validation");
           }
           targetProject = requestedTarget;
@@ -1214,7 +1914,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         }
 
         let resolvedStatusId: StatusId | null = null;
-        if (targetProject.id === sourceResolved.project.id) {
+        if (targetProject.id === sourceProject.id) {
           resolvedStatusId = sourceTask.statusId;
         } else {
           const targetStatuses = await repos.statuses.listByProject(targetProject.id);
@@ -1248,23 +1948,38 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
 
     async deleteTask(
       actor: AuditActorContext,
-      taskId: TaskPublicId,
+      taskRef: string,
+      options?: { workspaceId?: WorkspaceId },
     ): Promise<WorkUseCaseResult<DeleteTaskResponse>> {
       return deps.uow.run(async (repos) => {
-        const existing = await repos.tasks.findById(taskId);
-        if (!existing) {
-          return fail(404, "NOT_FOUND", "error.notFound");
-        }
-        const resolved = await resolveTaskEffectiveProject(repos, existing);
-        if (!resolved) {
-          return fail(404, "NOT_FOUND", "error.notFound");
-        }
-        const effectiveProject = resolved.project;
-        const role = await resolveActorProjectRole(
+        const resolvedRef = await resolveTaskRefInTx<DeleteTaskResponse>(
           repos,
-          actor.userId,
-          effectiveProject,
+          actor,
+          taskRef,
+          options,
         );
+        if (!resolvedRef.found) {
+          if (resolvedRef.deniedTarget) {
+            await appendOutbox(repos, {
+              workspaceId: resolvedRef.deniedTarget.effectiveProject.workspaceId,
+              projectId: resolvedRef.deniedTarget.effectiveProject.id,
+              eventType: "task.delete.denied",
+              action: "task.delete",
+              outcome: "denied",
+              actor,
+              targetType: "task",
+              targetId: resolvedRef.deniedTarget.task.id,
+              reasonCode: "FORBIDDEN",
+              payload: {
+                taskId: resolvedRef.deniedTarget.task.id,
+                projectId: resolvedRef.deniedTarget.effectiveProject.id,
+              },
+            });
+          }
+          return resolvedRef.failure;
+        }
+
+        const { task: existing, effectiveProject, role } = resolvedRef.ctx;
         if (!canReadProject(role)) {
           await appendOutbox(repos, {
             workspaceId: effectiveProject.workspaceId,

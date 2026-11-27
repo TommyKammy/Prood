@@ -1,0 +1,789 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  createSystemIdGenerator,
+  createWorkUseCases,
+} from "@prood/application";
+import type {
+  ApiErrorResponse,
+  DbDriverKind,
+  EnableDevProjectResponse,
+  MeResponse,
+  ProjectResponse,
+  TaskListResponse,
+  TaskResponse,
+  TaskSearchResponse,
+} from "@prood/contracts";
+import { createBetterAuthAdapter } from "@prood/integration-better-auth";
+import type { KyselyBackedDatabaseClient } from "@prood/persistence-common";
+import {
+  createPostgresDatabase,
+  createPostgresSchema,
+  dropPostgresSchema,
+} from "@prood/persistence-postgres";
+import {
+  createSqliteDatabase,
+  openSqliteConnection,
+} from "@prood/persistence-sqlite";
+import { createApp } from "@prood/server/app";
+
+const targetDb = process.env.PROOD_TEST_DB as DbDriverKind | undefined;
+if (targetDb !== "sqlite" && targetDb !== "postgres") {
+  throw new Error(
+    `PROOD_TEST_DB must be "sqlite" or "postgres" (received: ${String(targetDb)})`,
+  );
+}
+
+const BASE_URL = "http://127.0.0.1:3000";
+const AUTH_SECRET = "prood-resolve-search-test-secret-at-least-32-chars!";
+
+interface IsolatedDb {
+  openClient(): KyselyBackedDatabaseClient;
+  sqliteFilePath?: string;
+  cleanup(): Promise<void>;
+}
+
+const cleanups: Array<() => Promise<void>> = [];
+
+afterEach(async () => {
+  while (cleanups.length > 0) {
+    const fn = cleanups.pop()!;
+    await fn();
+  }
+});
+
+async function createIsolatedDb(): Promise<IsolatedDb> {
+  const opened: KyselyBackedDatabaseClient[] = [];
+
+  if (targetDb === "sqlite") {
+    const dir = mkdtempSync(join(tmpdir(), "prood-resolve-sqlite-"));
+    const filePath = join(dir, "resolve.sqlite");
+    const ctx: IsolatedDb = {
+      sqliteFilePath: filePath,
+      openClient() {
+        const client = createSqliteDatabase({ filePath });
+        opened.push(client);
+        return client;
+      },
+      async cleanup() {
+        for (const client of opened.splice(0)) {
+          await client.close();
+        }
+        rmSync(dir, { recursive: true, force: true });
+      },
+    };
+    cleanups.push(() => ctx.cleanup());
+    return ctx;
+  }
+
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error("DATABASE_URL must be set when PROOD_TEST_DB=postgres");
+  }
+
+  const schema = `prood_resolve_${Date.now().toString(36)}_${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
+  await createPostgresSchema(connectionString, schema);
+
+  const ctx: IsolatedDb = {
+    openClient() {
+      const client = createPostgresDatabase({ connectionString, schema });
+      opened.push(client);
+      return client;
+    },
+    async cleanup() {
+      for (const client of opened.splice(0)) {
+        await client.close();
+      }
+      await dropPostgresSchema(connectionString, schema);
+    },
+  };
+  cleanups.push(() => ctx.cleanup());
+  return ctx;
+}
+
+class CookieJar {
+  private cookies = new Map<string, string>();
+
+  updateFrom(res: Response): void {
+    for (const header of res.headers.getSetCookie()) {
+      const firstPart = header.split(";")[0];
+      if (!firstPart) continue;
+      const eqIdx = firstPart.indexOf("=");
+      if (eqIdx <= 0) continue;
+      const name = firstPart.slice(0, eqIdx).trim();
+      const value = firstPart.slice(eqIdx + 1).trim();
+      if (value === "") {
+        this.cookies.delete(name);
+      } else {
+        this.cookies.set(name, value);
+      }
+    }
+  }
+
+  toHeader(): string {
+    return Array.from(this.cookies.entries())
+      .map(([name, value]) => `${name}=${value}`)
+      .join("; ");
+  }
+}
+
+function createServerHarness(
+  db: KyselyBackedDatabaseClient,
+  startTimeIso = "2026-11-28T09:30:00.000Z",
+) {
+  let tick = Date.parse(startTimeIso);
+  const clock = {
+    now: () => {
+      tick += 1000;
+      return new Date(tick);
+    },
+  };
+  const idGenerator = createSystemIdGenerator();
+  const auth = createBetterAuthAdapter({
+    db,
+    secret: AUTH_SECRET,
+    baseURL: BASE_URL,
+    trustedOrigins: [BASE_URL],
+    mcpResource: `${BASE_URL}/mcp`,
+  });
+  const workUseCases = createWorkUseCases({
+    uow: db.uow,
+    idGenerator,
+    clock,
+  });
+  const app = createApp({
+    clock,
+    dbHealth: db,
+    auth,
+    uow: db.uow,
+    idGenerator,
+    mcpAuth: auth,
+  });
+
+  async function request(
+    path: string,
+    init: {
+      method?: string;
+      json?: unknown;
+      cookieHeader?: string;
+    } = {},
+  ): Promise<Response> {
+    const headers = new Headers();
+    headers.set("origin", BASE_URL);
+    if (init.cookieHeader) {
+      headers.set("cookie", init.cookieHeader);
+    }
+    let body: string | undefined;
+    if (init.json !== undefined) {
+      headers.set("content-type", "application/json");
+      body = JSON.stringify(init.json);
+    }
+    return app.request(
+      new Request(`${BASE_URL}${path}`, {
+        method: init.method ?? "GET",
+        headers,
+        body,
+      }),
+    );
+  }
+
+  async function signUpUser(email: string, name: string) {
+    const jar = new CookieJar();
+    const res = await request("/api/auth/sign-up/email", {
+      method: "POST",
+      json: { email, password: "prood-test-password-123", name },
+    });
+    expect(res.status).toBe(200);
+    jar.updateFrom(res);
+    const meRes = await request("/api/v1/me", { cookieHeader: jar.toHeader() });
+    expect(meRes.status).toBe(200);
+    const me = (await meRes.json()) as MeResponse;
+    return { jar, userId: me.user.id, email: me.user.email };
+  }
+
+  return { app, request, signUpUser, workUseCases };
+}
+
+describe(`Issue resolution, move visibility & search (${targetDb})`, () => {
+  it("resolves tasks & projects identically by ID, current key, and old key while hiding existence of unreadable keys and respecting access revocation", async () => {
+    const ctx = await createIsolatedDb();
+    const db = ctx.openClient();
+    await db.migrate();
+    const ids = createSystemIdGenerator();
+    const harness = createServerHarness(db);
+
+    const wksId = ids.next("wks");
+    const now = "2026-11-28T09:00:00.000Z";
+    await db.uow.run(async (repos) => {
+      await repos.workspaces.create({
+        id: wksId,
+        slug: "resolve-ws",
+        name: "Resolve Workspace",
+        createdAt: now,
+      });
+      await repos.workspaceSettings.upsert({
+        workspaceId: wksId,
+        defaultLocale: "en",
+        devProjectsEnabled: true,
+        updatedAt: now,
+      });
+    });
+
+    const admin = await harness.signUpUser("admin-res@example.com", "Admin");
+    const privMember = await harness.signUpUser("priv-member@example.com", "Priv Member");
+    const openMember = await harness.signUpUser("open-member@example.com", "Open Member");
+    const viewer = await harness.signUpUser("viewer-res@example.com", "Viewer");
+
+    await db.uow.run(async (repos) => {
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: admin.userId,
+        role: "admin",
+        createdAt: now,
+      });
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: privMember.userId,
+        role: "member",
+        createdAt: now,
+      });
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: openMember.userId,
+        role: "member",
+        createdAt: now,
+      });
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: viewer.userId,
+        role: "viewer",
+        createdAt: now,
+      });
+    });
+
+    // Open dev project PRD -> renamed to CORE
+    const openProj = ((await (
+      await harness.request(`/api/v1/workspaces/${wksId}/projects`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { name: "Open Dev", kind: "general", visibility: "workspace" },
+      })
+    ).json()) as ProjectResponse).project;
+    await harness.request(`/api/v1/projects/${openProj.id}/dev-settings/enable`, {
+      method: "POST",
+      cookieHeader: admin.jar.toHeader(),
+      json: { prefix: "PRD" },
+    });
+
+    const openRoot = ((await (
+      await harness.request(`/api/v1/projects/${openProj.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { title: "Open Root Task", description: "First root" },
+      })
+    ).json()) as TaskResponse).task;
+    const openSub = ((await (
+      await harness.request(`/api/v1/projects/${openProj.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: {
+          title: "Open Inherited Subtask",
+          parentTaskId: openRoot.id,
+          inheritParentProject: true,
+        },
+      })
+    ).json()) as TaskResponse).task;
+
+    await harness.request(`/api/v1/projects/${openProj.id}/dev-settings`, {
+      method: "PATCH",
+      cookieHeader: admin.jar.toHeader(),
+      json: { prefix: "CORE" },
+    });
+
+    // Private dev project OLDPRIV -> renamed to PRIV, granted only to admin & privMember
+    const privProj = ((await (
+      await harness.request(`/api/v1/workspaces/${wksId}/projects`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { name: "Private Dev", kind: "general", visibility: "private" },
+      })
+    ).json()) as ProjectResponse).project;
+    await db.uow.run((repos) =>
+      repos.projects.upsertMembership({
+        id: ids.next("mbr"),
+        projectId: privProj.id,
+        userId: privMember.userId,
+        role: "member",
+        createdAt: now,
+      }),
+    );
+    await harness.request(`/api/v1/projects/${privProj.id}/dev-settings/enable`, {
+      method: "POST",
+      cookieHeader: admin.jar.toHeader(),
+      json: { prefix: "OLDPRIV" },
+    });
+    const privRoot = ((await (
+      await harness.request(`/api/v1/projects/${privProj.id}/tasks`, {
+        method: "POST",
+        cookieHeader: privMember.jar.toHeader(),
+        json: { title: "Secret Root Title" },
+      })
+    ).json()) as TaskResponse).task;
+    const privSub = ((await (
+      await harness.request(`/api/v1/projects/${privProj.id}/tasks`, {
+        method: "POST",
+        cookieHeader: privMember.jar.toHeader(),
+        json: {
+          title: "Secret Inherited Subtask",
+          parentTaskId: privRoot.id,
+          inheritParentProject: true,
+        },
+      })
+    ).json()) as TaskResponse).task;
+    await harness.request(`/api/v1/projects/${privProj.id}/dev-settings`, {
+      method: "PATCH",
+      cookieHeader: admin.jar.toHeader(),
+      json: { prefix: "PRIV" },
+    });
+
+    // 1. Unified resolution: ID, current key, old key, lowercase key all return identical task & project
+    for (const ref of [openRoot.id, "CORE-1", "PRD-1", "prd-1", "core-1"]) {
+      const res = await harness.request(`/api/v1/tasks/${ref}`, {
+        cookieHeader: openMember.jar.toHeader(),
+      });
+      expect(res.status).toBe(200);
+      const task = ((await res.json()) as TaskResponse).task;
+      expect(task.id).toBe(openRoot.id);
+      expect(task.issueKey).toBe("CORE-1");
+      expect(task.branchName).toBe("prd-1");
+    }
+
+    // Inherited subtask resolves by ID, current key (CORE-2), and old key (PRD-2)
+    for (const subRef of [openSub.id, "CORE-2", "PRD-2"]) {
+      const res = await harness.request(`/api/v1/tasks/${subRef}`, {
+        cookieHeader: openMember.jar.toHeader(),
+      });
+      expect(res.status).toBe(200);
+      const task = ((await res.json()) as TaskResponse).task;
+      expect(task.id).toBe(openSub.id);
+      expect(task.projectId).toBeNull();
+      expect(task.effectiveProjectId).toBe(openProj.id);
+      expect(task.issueKey).toBe("CORE-2");
+    }
+
+    // Project ref resolution by ID, current prefix, and old prefix
+    for (const projRef of [openProj.id, "CORE", "PRD", "prd"]) {
+      const res = await harness.request(
+        `/api/v1/workspaces/${wksId}/projects/${projRef}`,
+        { cookieHeader: openMember.jar.toHeader() },
+      );
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as ProjectResponse).project.id).toBe(openProj.id);
+    }
+
+    // Viewer gets identical read (200) and write denial (403) across ID, current key, and old key
+    for (const ref of [openRoot.id, "CORE-1", "PRD-1"]) {
+      expect(
+        (
+          await harness.request(`/api/v1/tasks/${ref}`, {
+            cookieHeader: viewer.jar.toHeader(),
+          })
+        ).status,
+      ).toBe(200);
+      const viewerPatch = await harness.request(`/api/v1/tasks/${ref}`, {
+        method: "PATCH",
+        cookieHeader: viewer.jar.toHeader(),
+        json: { title: "Denied Update" },
+      });
+      expect(viewerPatch.status).toBe(403);
+      expect(((await viewerPatch.json()) as ApiErrorResponse).error.code).toBe(
+        "FORBIDDEN",
+      );
+    }
+
+    // 2. Non-member gets identical 404 responses for non-existent vs unreadable ID/current key/old key
+    const readBodies: string[] = [];
+    const patchBodies: string[] = [];
+    for (const ref of ["NOPE-999", privSub.id, "PRIV-2", "OLDPRIV-2"]) {
+      const getRes = await harness.request(`/api/v1/tasks/${ref}`, {
+        cookieHeader: openMember.jar.toHeader(),
+      });
+      expect(getRes.status).toBe(404);
+      readBodies.push(await getRes.text());
+
+      const patchRes = await harness.request(`/api/v1/tasks/${ref}`, {
+        method: "PATCH",
+        cookieHeader: openMember.jar.toHeader(),
+        json: { title: "Should Not Leak" },
+      });
+      expect(patchRes.status).toBe(404);
+      patchBodies.push(await patchRes.text());
+    }
+    expect(new Set(readBodies).size).toBe(1);
+    expect(new Set(patchBodies).size).toBe(1);
+
+    // 3. Access revocation: removing privMember from privProj immediately blocks ID, current key, old key, and search
+    expect(
+      (
+        await harness.request(`/api/v1/tasks/OLDPRIV-2`, {
+          cookieHeader: privMember.jar.toHeader(),
+        })
+      ).status,
+    ).toBe(200);
+
+    await db.uow.run((repos) =>
+      repos.projects.deleteMembership(privProj.id, privMember.userId),
+    );
+
+    for (const ref of [privSub.id, "PRIV-2", "OLDPRIV-2"]) {
+      const res = await harness.request(`/api/v1/tasks/${ref}`, {
+        cookieHeader: privMember.jar.toHeader(),
+      });
+      expect(res.status).toBe(404);
+    }
+
+    // Removing openMember from workspace revokes open-project key resolution and search
+    expect(
+      (
+        await harness.request(`/api/v1/tasks/CORE-1`, {
+          cookieHeader: openMember.jar.toHeader(),
+        })
+      ).status,
+    ).toBe(200);
+
+    await db.uow.run((repos) =>
+      repos.memberships.deleteByWorkspaceAndUser(wksId, openMember.userId),
+    );
+
+    expect(
+      (
+        await harness.request(`/api/v1/tasks/CORE-1`, {
+          cookieHeader: openMember.jar.toHeader(),
+        })
+      ).status,
+    ).toBe(404);
+    expect(
+      (
+        await harness.request(`/api/v1/workspaces/${wksId}/tasks/search?q=CORE-1`, {
+          cookieHeader: openMember.jar.toHeader(),
+        })
+      ).status,
+    ).toBe(403);
+  });
+
+  it("hides display keys after move to a general project while still resolving/searching old keys, issues keys on move to dev project, and disambiguates cross-workspace keys", async () => {
+    const ctx = await createIsolatedDb();
+    const db = ctx.openClient();
+    await db.migrate();
+    const ids = createSystemIdGenerator();
+    const harness = createServerHarness(db);
+
+    const wksA = ids.next("wks");
+    const wksB = ids.next("wks");
+    const now = "2026-11-28T09:10:00.000Z";
+    await db.uow.run(async (repos) => {
+      await repos.workspaces.create({
+        id: wksA,
+        slug: "move-ws-a",
+        name: "Move WS A",
+        createdAt: now,
+      });
+      await repos.workspaces.create({
+        id: wksB,
+        slug: "move-ws-b",
+        name: "Move WS B",
+        createdAt: now,
+      });
+      await repos.workspaceSettings.upsert({
+        workspaceId: wksA,
+        defaultLocale: "en",
+        devProjectsEnabled: true,
+        updatedAt: now,
+      });
+      await repos.workspaceSettings.upsert({
+        workspaceId: wksB,
+        defaultLocale: "en",
+        devProjectsEnabled: true,
+        updatedAt: now,
+      });
+    });
+
+    const admin = await harness.signUpUser("move-admin@example.com", "Move Admin");
+    const memberA = await harness.signUpUser("move-member@example.com", "Move Member");
+    await db.uow.run(async (repos) => {
+      for (const wksId of [wksA, wksB]) {
+        await repos.memberships.create({
+          id: ids.next("mbr"),
+          workspaceId: wksId,
+          userId: admin.userId,
+          role: "admin",
+          createdAt: now,
+        });
+      }
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksA,
+        userId: memberA.userId,
+        role: "member",
+        createdAt: now,
+      });
+    });
+
+    const createDevProject = async (wksId: string, name: string, prefix: string) => {
+      const proj = ((await (
+        await harness.request(`/api/v1/workspaces/${wksId}/projects`, {
+          method: "POST",
+          cookieHeader: admin.jar.toHeader(),
+          json: { name, kind: "general", visibility: "workspace" },
+        })
+      ).json()) as ProjectResponse).project;
+      const enableRes = await harness.request(
+        `/api/v1/projects/${proj.id}/dev-settings/enable`,
+        {
+          method: "POST",
+          cookieHeader: admin.jar.toHeader(),
+          json: { prefix },
+        },
+      );
+      expect(enableRes.status).toBe(200);
+      expect(((await enableRes.json()) as EnableDevProjectResponse).dev.prefix).toBe(prefix);
+      return proj;
+    };
+
+    const devA = await createDevProject(wksA, "Dev Alpha", "ALF");
+    await harness.request(`/api/v1/projects/${devA.id}/dev-settings`, {
+      method: "PATCH",
+      cookieHeader: admin.jar.toHeader(),
+      json: { prefix: "BETA" },
+    });
+    const devB = await createDevProject(wksA, "Dev Gamma", "GAM");
+    const generalProj = ((await (
+      await harness.request(`/api/v1/workspaces/${wksA}/projects`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { name: "General Inbox", kind: "general", visibility: "workspace" },
+      })
+    ).json()) as ProjectResponse).project;
+    const privGeneral = ((await (
+      await harness.request(`/api/v1/workspaces/${wksA}/projects`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { name: "Private General", kind: "general", visibility: "private" },
+      })
+    ).json()) as ProjectResponse).project;
+
+    // Task + inherited subtask in devA (BETA-1 / BETA-2, old prefix ALF)
+    const root1 = ((await (
+      await harness.request(`/api/v1/projects/${devA.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { title: "Portable feature" },
+      })
+    ).json()) as TaskResponse).task;
+    const sub1 = ((await (
+      await harness.request(`/api/v1/projects/${devA.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { title: "Portable child", parentTaskId: root1.id },
+      })
+    ).json()) as TaskResponse).task;
+    // Task mentioning ALF-1 / BETA-1 in title + Japanese text task
+    const followUp = ((await (
+      await harness.request(`/api/v1/projects/${generalProj.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { title: "Follow up on ALF-1 and BETA-1", description: "Text mention" },
+      })
+    ).json()) as TaskResponse).task;
+    const jpTask = ((await (
+      await harness.request(`/api/v1/projects/${generalProj.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { title: "認証フローの設計確認", description: "日本語検索の確認" },
+      })
+    ).json()) as TaskResponse).task;
+    const jpChild = ((await (
+      await harness.request(`/api/v1/projects/${generalProj.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { title: "日本語サブタスク", parentTaskId: jpTask.id },
+      })
+    ).json()) as TaskResponse).task;
+    const privTask = ((await (
+      await harness.request(`/api/v1/projects/${privGeneral.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { title: "Confidential BETA-1 token" },
+      })
+    ).json()) as TaskResponse).task;
+
+    // 1. Move BETA-1 (along with inherited sub1 BETA-2) from devA -> generalProj
+    const movedToGenRes = await harness.request(`/api/v1/tasks/BETA-1/move`, {
+      method: "POST",
+      cookieHeader: admin.jar.toHeader(),
+      json: { projectId: generalProj.id },
+    });
+    expect(movedToGenRes.status).toBe(200);
+    const movedToGen = ((await movedToGenRes.json()) as TaskResponse).task;
+    expect(movedToGen.effectiveProjectId).toBe(generalProj.id);
+    // Display key MUST be hidden after moving to a general project
+    expect(movedToGen.issueKey).toBeNull();
+    expect(movedToGen.branchName).toBeNull();
+
+    // Still resolves cleanly by old/issued keys AND ID for an authorized member, still hiding display key
+    for (const ref of [root1.id, "BETA-1", "ALF-1"]) {
+      const readRes = await harness.request(`/api/v1/tasks/${ref}`, {
+        cookieHeader: memberA.jar.toHeader(),
+      });
+      expect(readRes.status).toBe(200);
+      const t = ((await readRes.json()) as TaskResponse).task;
+      expect(t.id).toBe(root1.id);
+      expect(t.issueKey).toBeNull();
+      expect(t.branchName).toBeNull();
+    }
+    const readSubMoved = ((await (
+      await harness.request(`/api/v1/tasks/ALF-2`, {
+        cookieHeader: memberA.jar.toHeader(),
+      })
+    ).json()) as TaskResponse).task;
+    expect(readSubMoved.id).toBe(sub1.id);
+    expect(readSubMoved.issueKey).toBeNull();
+
+    // General project task list shows null issueKey for moved tasks
+    const genList = ((await (
+      await harness.request(`/api/v1/projects/${generalProj.id}/tasks`, {
+        cookieHeader: memberA.jar.toHeader(),
+      })
+    ).json()) as TaskListResponse).tasks;
+    expect(genList.find((t) => t.id === root1.id)?.issueKey).toBeNull();
+
+    // 2. Search exact match ordering & visibility filtering
+    const keySearch = ((await (
+      await harness.request(`/api/v1/workspaces/${wksA}/tasks/search?q=alf-1`, {
+        cookieHeader: memberA.jar.toHeader(),
+      })
+    ).json()) as TaskSearchResponse);
+    expect(keySearch.items[0]?.matchKind).toBe("exact_key");
+    expect(keySearch.items[0]?.task.id).toBe(root1.id);
+    expect(keySearch.items[0]?.task.issueKey).toBeNull();
+    expect(keySearch.items[1]?.matchKind).toBe("text");
+    expect(keySearch.items[1]?.task.id).toBe(followUp.id);
+    // Private general task mentioning ALF-1/BETA-1 must NOT appear for memberA
+    expect(keySearch.items.some((i) => i.task.id === privTask.id)).toBe(false);
+
+    const idSearch = ((await (
+      await harness.request(`/api/v1/workspaces/${wksA}/tasks/search?q=${root1.id}`, {
+        cookieHeader: memberA.jar.toHeader(),
+      })
+    ).json()) as TaskSearchResponse);
+    expect(idSearch.items[0]?.matchKind).toBe("exact_id");
+    expect(idSearch.items[0]?.task.id).toBe(root1.id);
+
+    const jpSearch = ((await (
+      await harness.request(
+        `/api/v1/workspaces/${wksA}/tasks/search?q=${encodeURIComponent("認証フロー")}`,
+        { cookieHeader: memberA.jar.toHeader() },
+      )
+    ).json()) as TaskSearchResponse);
+    expect(jpSearch.items.map((i) => i.task.id)).toEqual([jpTask.id]);
+
+    // 3. Move unkeyed general task (with inherited subtask) into devB -> issues GAM-1 and GAM-2
+    const movedGenToDevB = ((await (
+      await harness.request(`/api/v1/tasks/${jpTask.id}/move`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { projectId: devB.id },
+      })
+    ).json()) as TaskResponse).task;
+    expect(movedGenToDevB.issueKey).toBe("GAM-1");
+    const jpChildAfterMove = ((await (
+      await harness.request(`/api/v1/tasks/${jpChild.id}`, {
+        cookieHeader: memberA.jar.toHeader(),
+      })
+    ).json()) as TaskResponse).task;
+    expect(jpChildAfterMove.issueKey).toBe("GAM-2");
+
+    // 4. Move already-keyed task (BETA-1 / ALF-1) into devB -> preserves ALF/BETA origin namespace!
+    const movedGenToDevBKeyed = ((await (
+      await harness.request(`/api/v1/tasks/ALF-1/move`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { projectId: devB.id },
+      })
+    ).json()) as TaskResponse).task;
+    expect(movedGenToDevBKeyed.issueKey).toBe("BETA-1");
+    expect(movedGenToDevBKeyed.branchName).toBe("alf-1");
+
+    // 5. Move ALF-1 into privGeneral -> memberA loses access even via old key ALF-1 and search
+    await harness.request(`/api/v1/tasks/ALF-1/move`, {
+      method: "POST",
+      cookieHeader: admin.jar.toHeader(),
+      json: { projectId: privGeneral.id },
+    });
+    expect(
+      (
+        await harness.request(`/api/v1/tasks/ALF-1`, {
+          cookieHeader: memberA.jar.toHeader(),
+        })
+      ).status,
+    ).toBe(404);
+    const searchPrivateMoved = ((await (
+      await harness.request(`/api/v1/workspaces/${wksA}/tasks/search?q=ALF-1`, {
+        cookieHeader: memberA.jar.toHeader(),
+      })
+    ).json()) as TaskSearchResponse);
+    expect(searchPrivateMoved.items.some((i) => i.task.id === root1.id)).toBe(false);
+
+    // 6. Cross-workspace key isolation & unscoped disambiguation
+    const devWsB = await createDevProject(wksB, "WS B Beta", "BETA");
+    const wsBTask = ((await (
+      await harness.request(`/api/v1/projects/${devWsB.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { title: "Workspace B BETA-1" },
+      })
+    ).json()) as TaskResponse).task;
+    expect(wsBTask.issueKey).toBe("BETA-1");
+
+    // Admin can see BOTH wksA and wksB BETA-1 -> unscoped returns 409 CONFLICT, scoped returns the target workspace's task
+    const ambiguousRes = await harness.request(`/api/v1/tasks/BETA-1`, {
+      cookieHeader: admin.jar.toHeader(),
+    });
+    expect(ambiguousRes.status).toBe(409);
+    expect(((await ambiguousRes.json()) as ApiErrorResponse).error.messageKey).toBe(
+      "error.ambiguousIssueKey",
+    );
+
+    const scopedBRes = await harness.request(
+      `/api/v1/workspaces/${wksB}/tasks/BETA-1`,
+      { cookieHeader: admin.jar.toHeader() },
+    );
+    expect(scopedBRes.status).toBe(200);
+    expect(((await scopedBRes.json()) as TaskResponse).task.id).toBe(wsBTask.id);
+
+    // Query plan check on SQLite for exact-key index lookup
+    if (targetDb === "sqlite" && ctx.sqliteFilePath) {
+      const sqliteConn = openSqliteConnection(ctx.sqliteFilePath);
+      try {
+        const rows = sqliteConn
+          .prepare(
+            "EXPLAIN QUERY PLAN SELECT task_issue_keys.task_id FROM issue_key_prefixes INNER JOIN task_issue_keys ON task_issue_keys.namespace_id = issue_key_prefixes.namespace_id WHERE issue_key_prefixes.workspace_id = ? AND issue_key_prefixes.prefix = ? AND task_issue_keys.issue_number = ?",
+          )
+          .all(wksB, "BETA", 1) as Array<{ detail: string }>;
+        const plan = rows.map((r) => r.detail).join(" | ");
+        expect(plan).not.toContain("SCAN issue_key_prefixes");
+        expect(plan).not.toContain("SCAN task_issue_keys");
+      } finally {
+        sqliteConn.close();
+      }
+    }
+  });
+});

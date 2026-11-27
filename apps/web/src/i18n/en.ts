@@ -61,6 +61,8 @@ export const enMessages = {
     "Prefix must be 2 to 10 ASCII letters or digits starting with a letter.",
   "error.prefixAlreadyInUse":
     "This prefix is already reserved in this workspace.",
+  "error.ambiguousIssueKey":
+    "This issue key matches tasks in multiple workspaces. Specify a workspace.",
   "aria.mainNavigation": "Main navigation",
   "aria.taskList": "Task list",
   "aria.searchTasks": "Search tasks",

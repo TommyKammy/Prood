@@ -131,6 +131,7 @@ describe("@prood/server Web-Standard app", () => {
                 role: "admin",
               },
             ],
+            deleteByWorkspaceAndUser: async () => false,
           },
           projects: {
             create: async () => {
@@ -145,6 +146,7 @@ describe("@prood/server Web-Standard app", () => {
               throw new Error("not implemented");
             },
             findMembership: async () => null,
+            deleteMembership: async () => false,
           },
           statuses: {
             create: async () => {
@@ -161,6 +163,7 @@ describe("@prood/server Web-Standard app", () => {
             listByProject: async () => [],
             listSubtasks: async () => [],
             listSubtasksByParentIds: async () => [],
+            searchInWorkspace: async () => [],
             update: async () => null,
             deleteById: async () => false,
           },
@@ -175,6 +178,9 @@ describe("@prood/server Web-Standard app", () => {
             listPrefixesByNamespace: async () => [],
             listPrefixesByNamespaceIds: async () => [],
             findPrefixOwner: async () => null,
+            findProjectIdByWorkspacePrefix: async () => null,
+            findTaskIdByWorkspaceKey: async () => null,
+            findTaskIdsByWorkspacesAndKey: async () => [],
             reservePrefix: async () => null,
             initCounter: async () => {},
             allocateNextNumber: async () => 1,
