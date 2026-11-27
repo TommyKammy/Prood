@@ -177,6 +177,13 @@ export interface UpsertWorkspaceSettingsInput {
   updatedAt: string;
 }
 
+export interface PatchWorkspaceSettingsInput {
+  workspaceId: WorkspaceId;
+  defaultLocale?: LocaleCode;
+  devProjectsEnabled?: boolean;
+  updatedAt: string;
+}
+
 export interface CreateUserInput {
   id: UserId;
   email: string;
@@ -308,6 +315,7 @@ export interface WorkspaceRepository {
 
 export interface WorkspaceSettingsRepository {
   upsert(input: UpsertWorkspaceSettingsInput): Promise<WorkspaceSettingsRecord>;
+  patch(input: PatchWorkspaceSettingsInput): Promise<WorkspaceSettingsRecord>;
   findByWorkspaceId(workspaceId: WorkspaceId): Promise<WorkspaceSettingsRecord | null>;
 }
 

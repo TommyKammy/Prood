@@ -16,6 +16,7 @@ import type {
   LinkAuthIdentityInput,
   OutboxEventRecord,
   OutboxRepository,
+  PatchWorkspaceSettingsInput,
   ProjectMembershipRecord,
   ProjectRecord,
   ProjectRepository,
@@ -40,6 +41,7 @@ import type {
 } from "@prood/application";
 import type { DbDriverKind, WorkspaceMembershipSummary } from "@prood/contracts";
 import {
+  DEFAULT_LOCALE,
   normalizeEmail,
   type ActorType,
   type EventChannel,
@@ -376,6 +378,44 @@ export function createKyselyRepositories(
                 dev_projects_enabled: enabledInt,
                 updated_at: input.updatedAt,
               }),
+            )
+            .returningAll()
+            .executeTakeFirstOrThrow(),
+        mapError,
+        assertActive,
+      );
+      return toWorkspaceSettingsRecord(row);
+    },
+
+    async patch(
+      input: PatchWorkspaceSettingsInput,
+    ): Promise<WorkspaceSettingsRecord> {
+      const updatePatch: {
+        updated_at: string;
+        default_locale?: string;
+        dev_projects_enabled?: number;
+      } = {
+        updated_at: input.updatedAt,
+      };
+      if (input.defaultLocale !== undefined) {
+        updatePatch.default_locale = input.defaultLocale;
+      }
+      if (input.devProjectsEnabled !== undefined) {
+        updatePatch.dev_projects_enabled = input.devProjectsEnabled ? 1 : 0;
+      }
+
+      const row = await runQuery(
+        () =>
+          executor
+            .insertInto("workspace_settings")
+            .values({
+              workspace_id: input.workspaceId,
+              default_locale: input.defaultLocale ?? DEFAULT_LOCALE,
+              dev_projects_enabled: input.devProjectsEnabled ? 1 : 0,
+              updated_at: input.updatedAt,
+            })
+            .onConflict((oc) =>
+              oc.column("workspace_id").doUpdateSet(updatePatch),
             )
             .returningAll()
             .executeTakeFirstOrThrow(),

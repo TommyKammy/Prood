@@ -1428,19 +1428,15 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           return fail(403, "FORBIDDEN", "error.forbidden");
         }
 
-        const existing = await repos.workspaceSettings.findByWorkspaceId(workspaceId);
         const nowIso = deps.clock.now().toISOString();
-        const nextLocale: LocaleCode = hasLocale
-          ? (input.defaultLocale as string).trim()
-          : existing?.defaultLocale ?? DEFAULT_LOCALE;
-        const nextEnabled = hasEnabled
-          ? (input.devProjectsEnabled as boolean)
-          : existing?.devProjectsEnabled ?? false;
-
-        const saved = await repos.workspaceSettings.upsert({
+        const saved = await repos.workspaceSettings.patch({
           workspaceId,
-          defaultLocale: nextLocale,
-          devProjectsEnabled: nextEnabled,
+          ...(hasLocale
+            ? { defaultLocale: (input.defaultLocale as string).trim() as LocaleCode }
+            : {}),
+          ...(hasEnabled
+            ? { devProjectsEnabled: input.devProjectsEnabled as boolean }
+            : {}),
           updatedAt: nowIso,
         });
 

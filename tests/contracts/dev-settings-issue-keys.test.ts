@@ -1071,4 +1071,134 @@ describe(`Dev settings & issue key issuance (${targetDb})`, () => {
       expect(isPersistenceError(mapped, "CHECK_VIOLATION")).toBe(true);
     }
   });
+
+  it("preserves concurrent updates to disjoint workspace settings fields without lost updates", async () => {
+    const ctx = await createIsolatedDb();
+    const setupDb = ctx.openClient();
+    await setupDb.migrate();
+    const ids = createSystemIdGenerator();
+
+    const wksExisting = ids.next("wks");
+    const wksEmpty = ids.next("wks");
+    const adminId = ids.next("usr");
+    const now = "2026-11-28T09:00:00.000Z";
+
+    await setupDb.uow.run(async (repos) => {
+      await repos.workspaces.create({
+        id: wksExisting,
+        slug: "patch-existing-ws",
+        name: "Patch Existing WS",
+        createdAt: now,
+      });
+      await repos.workspaces.create({
+        id: wksEmpty,
+        slug: "patch-empty-ws",
+        name: "Patch Empty WS",
+        createdAt: now,
+      });
+      await repos.users.create({
+        id: adminId,
+        email: "patch-admin@example.com",
+        displayName: "Patch Admin",
+        createdAt: now,
+      });
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksExisting,
+        userId: adminId,
+        role: "admin",
+        createdAt: now,
+      });
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksEmpty,
+        userId: adminId,
+        role: "admin",
+        createdAt: now,
+      });
+      // Seed existing row with devProjectsEnabled=true, defaultLocale="en"
+      await repos.workspaceSettings.upsert({
+        workspaceId: wksExisting,
+        defaultLocale: "en",
+        devProjectsEnabled: true,
+        updatedAt: now,
+      });
+    });
+
+    const actor = {
+      userId: adminId,
+      actorType: "user" as const,
+      channel: "web" as const,
+    };
+
+    const makeWorker = () => {
+      const client =
+        targetDb === "sqlite"
+          ? ctx.openClient({
+              busyTimeoutMs: 25,
+              maxRetryAttempts: 60,
+              retryBaseDelayMs: 5,
+            })
+          : ctx.openClient({ maxPoolSize: 2, maxRetryAttempts: 8 });
+      return createWorkUseCases({
+        uow: client.uow,
+        idGenerator: createSystemIdGenerator(),
+        clock: { now: () => new Date(now) },
+      });
+    };
+
+    // Case 1: Concurrent disable (devProjectsEnabled: false) vs locale-only update ("ja") on existing row
+    const workerA = makeWorker();
+    const workerB = makeWorker();
+    const barrier1 = createBarrier(2);
+    const [resDisable, resLocale] = await Promise.all([
+      (async () => {
+        await barrier1();
+        return workerA.updateWorkspaceSettings(actor, wksExisting, {
+          devProjectsEnabled: false,
+        });
+      })(),
+      (async () => {
+        await barrier1();
+        return workerB.updateWorkspaceSettings(actor, wksExisting, {
+          defaultLocale: "ja",
+        });
+      })(),
+    ]);
+    expect(resDisable.ok).toBe(true);
+    expect(resLocale.ok).toBe(true);
+
+    const existingAfter = await setupDb.uow.run((repos) =>
+      repos.workspaceSettings.findByWorkspaceId(wksExisting),
+    );
+    expect(existingAfter?.devProjectsEnabled).toBe(false);
+    expect(existingAfter?.defaultLocale).toBe("ja");
+
+    // Case 2: Concurrent first-insert race (no prior workspace_settings row)
+    const workerC = makeWorker();
+    const workerD = makeWorker();
+    const barrier2 = createBarrier(2);
+    const [resEnable, resEmptyLocale] = await Promise.all([
+      (async () => {
+        await barrier2();
+        return workerC.updateWorkspaceSettings(actor, wksEmpty, {
+          devProjectsEnabled: true,
+        });
+      })(),
+      (async () => {
+        await barrier2();
+        return workerD.updateWorkspaceSettings(actor, wksEmpty, {
+          defaultLocale: "ja",
+        });
+      })(),
+    ]);
+    expect(resEnable.ok).toBe(true);
+    expect(resEmptyLocale.ok).toBe(true);
+
+    const emptyAfter = await setupDb.uow.run((repos) =>
+      repos.workspaceSettings.findByWorkspaceId(wksEmpty),
+    );
+    expect(emptyAfter?.devProjectsEnabled).toBe(true);
+    expect(emptyAfter?.defaultLocale).toBe("ja");
+  });
 });

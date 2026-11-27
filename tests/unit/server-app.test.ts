@@ -85,6 +85,9 @@ describe("@prood/server Web-Standard app", () => {
             upsert: async () => {
               throw new Error("not implemented");
             },
+            patch: async () => {
+              throw new Error("not implemented");
+            },
             findByWorkspaceId: async () => null,
           },
           users: {
