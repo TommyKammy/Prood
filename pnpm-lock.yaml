@@ -62,6 +62,9 @@ importers:
       '@prood/domain':
         specifier: workspace:*
         version: link:../../packages/domain
+      '@prood/integration-better-auth':
+        specifier: workspace:*
+        version: link:../../packages/integrations/better-auth
       '@prood/persistence-common':
         specifier: workspace:*
         version: link:../../packages/persistence/common
