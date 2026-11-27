@@ -76,8 +76,8 @@ for (const file of collectFiles(resolve(rootDir, "packages/domain/src"), (f) => 
   }
 }
 
-// 3. contracts & application must not import node:*, DB drivers, or persistence packages
-const coreForbidden = [/^node:/, "pg", "better-sqlite3", /^@prood\/persistence-/];
+// 3. contracts & application must not import node:*, DB drivers, Kysely, or persistence packages
+const coreForbidden = [/^node:/, "pg", "better-sqlite3", "kysely", /^@prood\/persistence-/];
 assertNoForbiddenImports(resolve(rootDir, "packages/contracts/src"), coreForbidden, "contracts");
 assertNoForbiddenImports(resolve(rootDir, "packages/application/src"), coreForbidden, "application");
 
@@ -91,14 +91,14 @@ assertNoForbiddenImports(
 // 5. apps/server/src/app.ts must remain Cloudflare Workers portable
 assertNoForbiddenImports(
   resolve(rootDir, "apps/server/src/app.ts"),
-  [/^node:/, "pg", "better-sqlite3", "@prood/persistence-sqlite", "@prood/persistence-postgres", "@hono/node-server"],
+  [/^node:/, "pg", "better-sqlite3", "kysely", "@prood/persistence-sqlite", "@prood/persistence-postgres", "@hono/node-server"],
   "server-app",
 );
 
-// 6. apps/web/src/** must not import node:*, DB drivers, persistence, or server
+// 6. apps/web/src/** must not import node:*, DB drivers, Kysely, persistence, or server
 assertNoForbiddenImports(
   resolve(rootDir, "apps/web/src"),
-  [/^node:/, "pg", "better-sqlite3", /^@prood\/persistence-/, "@prood/server"],
+  [/^node:/, "pg", "better-sqlite3", "kysely", /^@prood\/persistence-/, "@prood/server"],
   "web-src",
 );
 
@@ -110,6 +110,7 @@ if (webDistFiles.length === 0) {
 const forbiddenBundleMarkers = [
   "better-sqlite3",
   "pg-protocol",
+  "kysely",
   "node:fs",
   "node:net",
   "DATABASE_URL",

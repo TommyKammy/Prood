@@ -18,3 +18,12 @@
 
 ## 4. Authentication Scope (PR 03 Preview)
 - Initial Web login uses Better Auth **Email + Password**. OIDC SSO (test IdP) is deferred to a later phase.
+
+## 5. Persistence & Public ID Decisions (PR 02)
+- **Public ID Format**: `<prefix>_<26 lowercase Crockford Base32 ULID chars>` (48-bit Unix ms + 80-bit random, monotonic within the same millisecond). Implemented with zero runtime dependencies in `@prood/domain`, using Web Standard `crypto.getRandomValues` in `@prood/application`.
+- **Persistence Stack**:
+  - `kysely` (`^0.29.9`) for query building and transaction-scoped repositories inside `@prood/persistence-common`, keeping Kysely types out of `@prood/domain`, `@prood/contracts`, and `@prood/application`.
+  - `better-sqlite3` (`^13.2.0`) for SQLite with per-connection `journal_mode = WAL`, `foreign_keys = ON`, `busy_timeout`, `BEGIN IMMEDIATE` transactions, and bounded retry on `SQLITE_BUSY` / `SQLITE_LOCKED`.
+  - `pg` (`^8.23.1`) for PostgreSQL with `SET LOCAL lock_timeout` / `SET LOCAL statement_timeout` per transaction and bounded retry on `40001` / `40P01` / `55P03` / `57014`.
+- **Error Boundary**: Driver errors map to `PersistenceError` (`UNIQUE_VIOLATION`, `FOREIGN_KEY_VIOLATION`, `NOT_NULL_VIOLATION`, `CHECK_VIOLATION`, `TRANSIENT_CONFLICT`, `CONNECTION_ERROR`, `UNKNOWN_DB_ERROR`); application/business errors thrown inside `UnitOfWork.run` roll back the transaction and pass through untouched.
+

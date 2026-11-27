@@ -1,6 +1,10 @@
 import { Client } from "pg";
 import type { DbSmokeAdapter, SmokeProbeResult } from "@prood/persistence-common";
 
+export * from "./database.js";
+export * from "./errors.js";
+export * from "./migrations.js";
+
 export function createPostgresSmokeAdapter(connectionString: string): DbSmokeAdapter {
   return {
     driver: "postgres",

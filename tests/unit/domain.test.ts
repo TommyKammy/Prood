@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  createMonotonicIdGenerator,
+  decodeEntityIdTimestamp,
   DEFAULT_LOCALE,
+  generateEntityId,
+  isValidEntityId,
   isValidIssueKeyFormat,
   isValidTaskPublicIdFormat,
 } from "@prood/domain";
@@ -10,10 +14,56 @@ describe("@prood/domain", () => {
     expect(DEFAULT_LOCALE).toBe("en");
   });
 
-  it("accepts canonical lowercase Crockford Base32 task public IDs", () => {
-    const validId = "tsk_01jf8x9z2k3m4n5p6q7r8s9t0v";
-    expect(isValidTaskPublicIdFormat(validId)).toBe(true);
-    expect(isValidIssueKeyFormat(validId)).toBe(false);
+  it("generates canonical prefixed ULIDs and decodes timestamps", () => {
+    const fixedTime = Date.UTC(2026, 10, 27, 10, 0, 0, 123);
+    const bytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    const id = generateEntityId("tsk", fixedTime, bytes);
+
+    expect(isValidTaskPublicIdFormat(id)).toBe(true);
+    expect(isValidEntityId("tsk", id)).toBe(true);
+    expect(isValidEntityId("wks", id)).toBe(false);
+    expect(isValidIssueKeyFormat(id)).toBe(false);
+    expect(decodeEntityIdTimestamp(id)).toBe(fixedTime);
+  });
+
+  it("produces strictly monotonic IDs within the same millisecond and advances on new timestamp", () => {
+    let currentMs = 1_795_000_000_000;
+    let seed = 10;
+    const generator = createMonotonicIdGenerator({
+      now: () => currentMs,
+      randomBytes: (len) => {
+        const buf = new Uint8Array(len);
+        buf.fill(seed);
+        seed += 1;
+        return buf;
+      },
+    });
+
+    const ids: string[] = [];
+    for (let i = 0; i < 100; i += 1) {
+      ids.push(generator.next("tsk"));
+    }
+
+    expect(new Set(ids).size).toBe(100);
+    for (let i = 1; i < ids.length; i += 1) {
+      expect(ids[i - 1]! < ids[i]!).toBe(true);
+    }
+
+    currentMs += 1;
+    const nextMsId = generator.next("tsk");
+    expect(decodeEntityIdTimestamp(nextMsId)).toBe(currentMs);
+    expect(ids[ids.length - 1]! < nextMsId).toBe(true);
+  });
+
+  it("validates entity IDs per prefix", () => {
+    const fixedTime = 1_795_000_000_000;
+    const bytes = new Uint8Array(10).fill(7);
+    const wksId = generateEntityId("wks", fixedTime, bytes);
+    const evtId = generateEntityId("evt", fixedTime, bytes);
+
+    expect(isValidEntityId("wks", wksId)).toBe(true);
+    expect(isValidEntityId("tsk", wksId)).toBe(false);
+    expect(isValidEntityId("evt", evtId)).toBe(true);
   });
 
   it("rejects invalid task public IDs (wrong prefix, length, or ambiguous chars)", () => {

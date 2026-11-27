@@ -13,8 +13,11 @@
     "build": "tsc -b"
   },
   "dependencies": {
+    "@prood/application": "workspace:*",
     "@prood/contracts": "workspace:*",
+    "@prood/domain": "workspace:*",
     "@prood/persistence-common": "workspace:*",
+    "kysely": "^0.29.9",
     "pg": "^8.23.1"
   },
   "devDependencies": {

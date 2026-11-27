@@ -1,17 +1,9 @@
-import Database from "better-sqlite3";
 import type { DbSmokeAdapter, SmokeProbeResult } from "@prood/persistence-common";
+import { openSqliteConnection } from "./database.js";
 
-/**
- * Opens a SQLite connection with per-connection PRAGMAs required by Prood:
- * WAL mode, foreign key enforcement, and a 5s busy timeout.
- */
-export function openSqliteConnection(filePath: string): Database.Database {
-  const db = new Database(filePath);
-  db.pragma("journal_mode = WAL");
-  db.pragma("foreign_keys = ON");
-  db.pragma("busy_timeout = 5000");
-  return db;
-}
+export * from "./database.js";
+export * from "./errors.js";
+export * from "./migrations.js";
 
 export function createSqliteSmokeAdapter(filePath: string): DbSmokeAdapter {
   return {

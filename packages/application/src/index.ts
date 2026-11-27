@@ -5,6 +5,9 @@ import {
   type HealthResponse,
 } from "@prood/contracts";
 
+export * from "./id.js";
+export * from "./persistence.js";
+
 export interface Clock {
   now(): Date;
 }
