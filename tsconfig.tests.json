@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true,
+    "composite": false,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"]
+  },
+  "references": [
+    { "path": "packages/domain" },
+    { "path": "packages/contracts" },
+    { "path": "packages/application" },
+    { "path": "packages/persistence/common" },
+    { "path": "packages/persistence/sqlite" },
+    { "path": "packages/persistence/postgres" },
+    { "path": "packages/integrations/better-auth" },
+    { "path": "packages/integrations/fastmcp" },
+    { "path": "apps/server" },
+    { "path": "apps/web" }
+  ],
+  "include": ["tests/**/*.ts"]
+}

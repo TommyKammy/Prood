@@ -15,6 +15,7 @@ export interface McpVerifiedToken {
   expiresAt: number;
   issuer: string;
   email?: string;
+  emailVerified?: boolean;
   name?: string;
 }
 
@@ -45,6 +46,7 @@ export interface McpTokenVerifier {
  */
 export interface McpHttpHandler {
   handleRequest(request: Request): Promise<Response>;
+  close?(): Promise<void>;
 }
 
 export interface McpIdentityUseCaseDeps {
@@ -97,6 +99,7 @@ export function createMcpIdentityUseCase(deps: McpIdentityUseCaseDeps) {
         authProvider: "better-auth",
         authSubject: token.subject,
         email: token.email,
+        emailVerified: token.emailVerified,
         name: token.name ?? token.email,
         expiresAt: new Date(token.expiresAt * 1000).toISOString(),
       });

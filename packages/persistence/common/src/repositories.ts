@@ -17,12 +17,13 @@ import type {
   WorkspaceSettingsRepository,
 } from "@prood/application";
 import type { WorkspaceMembershipSummary } from "@prood/contracts";
-import type {
-  LocaleCode,
-  MembershipId,
-  UserId,
-  WorkspaceId,
-  WorkspaceRole,
+import {
+  normalizeEmail,
+  type LocaleCode,
+  type MembershipId,
+  type UserId,
+  type WorkspaceId,
+  type WorkspaceRole,
 } from "@prood/domain";
 import type {
   AuthIdentityTable,
@@ -88,10 +89,16 @@ function toWorkspaceMembershipRecord(
   };
 }
 
+function normalizeSlug(slug: string): string {
+  return slug.trim().toLowerCase();
+}
+
 async function runQuery<T>(
   fn: () => Promise<T>,
   mapError: (error: unknown) => never,
+  assertActive?: () => void,
 ): Promise<T> {
+  assertActive?.();
   try {
     return await fn();
   } catch (error) {
@@ -105,16 +112,18 @@ async function runQuery<T>(
 export function createKyselyRepositories(
   executor: DbExecutor,
   mapError: (error: unknown) => never,
+  assertActive?: () => void,
 ): TransactionRepositories {
   const workspaces: WorkspaceRepository = {
     async create(input: CreateWorkspaceInput): Promise<WorkspaceRecord> {
+      const slug = normalizeSlug(input.slug);
       const row = await runQuery(
         () =>
           executor
             .insertInto("workspaces")
             .values({
               id: input.id,
-              slug: input.slug,
+              slug,
               name: input.name,
               created_at: input.createdAt,
               updated_at: input.createdAt,
@@ -122,6 +131,7 @@ export function createKyselyRepositories(
             .returningAll()
             .executeTakeFirstOrThrow(),
         mapError,
+        assertActive,
       );
       return toWorkspaceRecord(row);
     },
@@ -135,19 +145,22 @@ export function createKyselyRepositories(
             .where("id", "=", id)
             .executeTakeFirst(),
         mapError,
+        assertActive,
       );
       return row ? toWorkspaceRecord(row) : null;
     },
 
     async findBySlug(slug: string): Promise<WorkspaceRecord | null> {
+      const normalized = normalizeSlug(slug);
       const row = await runQuery(
         () =>
           executor
             .selectFrom("workspaces")
             .selectAll()
-            .where("slug", "=", slug)
+            .where("slug", "=", normalized)
             .executeTakeFirst(),
         mapError,
+        assertActive,
       );
       return row ? toWorkspaceRecord(row) : null;
     },
@@ -166,6 +179,7 @@ export function createKyselyRepositories(
             .returningAll()
             .executeTakeFirst(),
         mapError,
+        assertActive,
       );
       return row ? toWorkspaceRecord(row) : null;
     },
@@ -196,6 +210,7 @@ export function createKyselyRepositories(
             .returningAll()
             .executeTakeFirstOrThrow(),
         mapError,
+        assertActive,
       );
       return toWorkspaceSettingsRecord(row);
     },
@@ -211,6 +226,7 @@ export function createKyselyRepositories(
             .where("workspace_id", "=", workspaceId)
             .executeTakeFirst(),
         mapError,
+        assertActive,
       );
       return row ? toWorkspaceSettingsRecord(row) : null;
     },
@@ -226,19 +242,22 @@ export function createKyselyRepositories(
             .where("id", "=", id)
             .executeTakeFirst(),
         mapError,
+        assertActive,
       );
       return row ? toUserRecord(row) : null;
     },
 
     async findByEmail(email: string): Promise<UserRecord | null> {
+      const normalized = normalizeEmail(email);
       const row = await runQuery(
         () =>
           executor
             .selectFrom("users")
             .selectAll()
-            .where("email", "=", email)
+            .where("email", "=", normalized)
             .executeTakeFirst(),
         mapError,
+        assertActive,
       );
       return row ? toUserRecord(row) : null;
     },
@@ -263,18 +282,20 @@ export function createKyselyRepositories(
             .where("auth_identities.auth_subject", "=", authSubject)
             .executeTakeFirst(),
         mapError,
+        assertActive,
       );
       return row ? toUserRecord(row) : null;
     },
 
     async create(input: CreateUserInput): Promise<UserRecord> {
+      const email = normalizeEmail(input.email);
       const row = await runQuery(
         () =>
           executor
             .insertInto("users")
             .values({
               id: input.id,
-              email: input.email,
+              email,
               display_name: input.displayName,
               created_at: input.createdAt,
               updated_at: input.createdAt,
@@ -282,6 +303,7 @@ export function createKyselyRepositories(
             .returningAll()
             .executeTakeFirstOrThrow(),
         mapError,
+        assertActive,
       );
       return toUserRecord(row);
     },
@@ -302,6 +324,7 @@ export function createKyselyRepositories(
             .returningAll()
             .executeTakeFirstOrThrow(),
         mapError,
+        assertActive,
       );
       return toAuthIdentityRecord(row);
     },
@@ -326,6 +349,7 @@ export function createKyselyRepositories(
             .returningAll()
             .executeTakeFirstOrThrow(),
         mapError,
+        assertActive,
       );
       return toWorkspaceMembershipRecord(row);
     },
@@ -343,6 +367,7 @@ export function createKyselyRepositories(
             .where("user_id", "=", userId)
             .executeTakeFirst(),
         mapError,
+        assertActive,
       );
       return row ? toWorkspaceMembershipRecord(row) : null;
     },
@@ -371,6 +396,7 @@ export function createKyselyRepositories(
             .orderBy("workspaces.id", "asc")
             .execute(),
         mapError,
+        assertActive,
       );
 
       return rows.map((row) => ({

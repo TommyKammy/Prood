@@ -82,4 +82,37 @@ describe("@prood/domain", () => {
     expect(isValidIssueKeyFormat("prd-42")).toBe(false);
     expect(isValidTaskPublicIdFormat("PRD-42")).toBe(false);
   });
+
+  it("rejects 50-bit ULID timestamp overflow and corrupt suffixes, and preserves generator state when RNG fails", () => {
+    const overflowId = "tsk_80000000000000000000000000";
+    expect(isValidEntityId("tsk", overflowId)).toBe(false);
+    expect(() => decodeEntityIdTimestamp(overflowId)).toThrow(RangeError);
+    expect(() => decodeEntityIdTimestamp("tsk_zzzzzzzzzzzzzzzzzzzzzzzzzz")).toThrow(
+      RangeError,
+    );
+    expect(() => decodeEntityIdTimestamp("bad_01jf8x9z2k3m4n5p6q7r8s9t0v")).toThrow(
+      RangeError,
+    );
+    expect(() => decodeEntityIdTimestamp("tsk_01jf8x9z2k3m4n5p6q7r8s9t0!")).toThrow(
+      RangeError,
+    );
+
+    let shouldThrow = true;
+    let currentMs = 1_795_000_000_000;
+    const gen = createMonotonicIdGenerator({
+      now: () => currentMs,
+      randomBytes: (len) => {
+        if (shouldThrow) {
+          throw new Error("entropy unavailable");
+        }
+        return new Uint8Array(len).fill(42);
+      },
+    });
+    expect(() => gen.next("tsk")).toThrow("entropy unavailable");
+    shouldThrow = false;
+    // Must generate high-entropy ID normally instead of incrementing stale lastRandom=0
+    const recovered = gen.next("tsk");
+    expect(recovered.endsWith("0000000000000001")).toBe(false);
+    expect(decodeEntityIdTimestamp(recovered)).toBe(currentMs);
+  });
 });

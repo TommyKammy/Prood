@@ -74,6 +74,13 @@ export interface JwksTable {
   crv: string | null;
 }
 
+export interface OAuthClientTable {
+  id: string;
+  clientId: string;
+  disabled: number | boolean | null;
+  name: string | null;
+}
+
 export interface ProodDatabase {
   prood_schema_migrations: SchemaMigrationTable;
   workspaces: WorkspaceTable;
@@ -84,4 +91,5 @@ export interface ProodDatabase {
   auth_user: AuthUserTable;
   auth_session: AuthSessionTable;
   jwks: JwksTable;
+  oauthClient: OAuthClientTable;
 }

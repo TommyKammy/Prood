@@ -7,10 +7,11 @@
     "node": ">=22.0.0"
   },
   "scripts": {
+    "clean": "rm -rf packages/*/dist packages/*/*/dist apps/*/dist packages/*/tsconfig.tsbuildinfo packages/*/*/tsconfig.tsbuildinfo apps/*/tsconfig.tsbuildinfo",
     "build:ts": "tsc -b",
     "build:web": "pnpm --filter @prood/web build",
     "build": "pnpm build:ts && pnpm build:web",
-    "typecheck": "tsc -b",
+    "typecheck": "tsc -b && tsc -p tsconfig.tests.json --noEmit",
     "check:boundaries": "node scripts/check-boundaries.mjs",
     "measure:shell": "node scripts/measure-shell.mjs",
     "test:unit": "vitest run --project unit",

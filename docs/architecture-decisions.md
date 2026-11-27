@@ -18,7 +18,7 @@
 
 ## 4. Authentication & Identity Decisions (PR 03)
 - **Authentication Library**: `better-auth` (`^1.7.28`) isolated inside `@prood/integration-better-auth`, sharing Prood's existing Kysely instance (`database: { db, type: "sqlite" | "postgres" }`) so auth and domain data live in the same selected DB.
-- **Initial Login Flow**: Email + Password (`emailAndPassword: { enabled: true }`). OIDC SSO (test IdP) is deferred to a later phase.
+- **Initial Login Flow**: Email + Password (`emailAndPassword: { enabled: true }`). OIDC SSO (test IdP) is deferred to a later dedicated PR; `AuthSessionInfo.authProvider` accepts `string` and unverified emails cannot auto-link to pre-existing `users` rows.
 - **Identity & Table Separation**: Better Auth manages `auth_user`, `auth_session`, `auth_account`, and `auth_verification`; Prood owns `users` (`usr_*`), `auth_identities` (`(auth_provider, auth_subject) -> user_id`), and `workspace_memberships` (`mbr_*`). Auth routes are mounted via Web-Standard `Request/Response` in `apps/server/src/app.ts` without importing `better-auth` into `app.ts`.
 - **MCP OAuth Integration (PR 04)**: `@better-auth/oauth-provider` (`^1.7.28`) + `jwt()` acts as the OAuth 2.1 / OIDC issuer, while `fastmcp` (`^4.30.0`, `FastMCP` + `WebStreamableHTTPServerTransport` from `fastmcp/edge`) serves `/mcp` over Web-Standard HTTP with `jose` JWKS verification (`issuer`, `audience`, `exp`) and per-tool `prood:read` scope checks. See `docs/mcp-oauth-interop.md`.
 
@@ -27,6 +27,6 @@
 - **Persistence Stack**:
   - `kysely` (`^0.29.9`) for query building and transaction-scoped repositories inside `@prood/persistence-common`, keeping Kysely types out of `@prood/domain`, `@prood/contracts`, and `@prood/application`.
   - `better-sqlite3` (`^13.2.0`) for SQLite with per-connection `journal_mode = WAL`, `foreign_keys = ON`, `busy_timeout`, `BEGIN IMMEDIATE` transactions, and bounded retry on `SQLITE_BUSY` / `SQLITE_LOCKED`.
-  - `pg` (`^8.23.1`) for PostgreSQL with `SET LOCAL lock_timeout` / `SET LOCAL statement_timeout` per transaction and bounded retry on `40001` / `40P01` / `55P03` / `57014`.
+  - `pg` (`^8.23.1`) for PostgreSQL with `SET LOCAL lock_timeout` / `SET LOCAL statement_timeout` per transaction and bounded retry on `40001` / `40P01` / `55P03` (`57014` `statement_timeout` is non-retryable).
 - **Error Boundary**: Driver errors map to `PersistenceError` (`UNIQUE_VIOLATION`, `FOREIGN_KEY_VIOLATION`, `NOT_NULL_VIOLATION`, `CHECK_VIOLATION`, `TRANSIENT_CONFLICT`, `CONNECTION_ERROR`, `UNKNOWN_DB_ERROR`); application/business errors thrown inside `UnitOfWork.run` roll back the transaction and pass through untouched.
 

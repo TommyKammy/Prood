@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import {
   createHealthCheckUseCase,
   createIdentityUseCases,
+  isEmailVerificationRequiredError,
   type AuthPort,
   type AuthSessionInfo,
   type Clock,
@@ -45,6 +46,10 @@ function errorBody(
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
   const getHealth = createHealthCheckUseCase(deps);
+
+  app.onError((_err, c) => {
+    return c.json(errorBody("INTERNAL_ERROR", "error.generic"), 500);
+  });
 
   app.get("/healthz", async (c) => {
     const health = await getHealth();
@@ -98,6 +103,7 @@ export function createApp(deps: AppDeps): Hono {
         : null;
 
     app.get("/api/v1/me", async (c) => {
+      c.header("Cache-Control", "no-store");
       const session = await requireAuthenticatedSession(c.req.raw.headers);
       if (!session) {
         return c.json(errorBody("UNAUTHORIZED", "error.unauthorized"), 401);
@@ -105,11 +111,22 @@ export function createApp(deps: AppDeps): Hono {
       if (!identityUseCases) {
         return c.json(errorBody("INTERNAL_ERROR", "error.generic"), 500);
       }
-      const profile = await identityUseCases.getCurrentUserProfile(session);
-      return c.json(profile, 200);
+      try {
+        const profile = await identityUseCases.getCurrentUserProfile(session);
+        return c.json(profile, 200);
+      } catch (error) {
+        if (isEmailVerificationRequiredError(error)) {
+          return c.json(
+            errorBody("FORBIDDEN", "error.emailVerificationRequired"),
+            403,
+          );
+        }
+        throw error;
+      }
     });
 
     app.get("/api/v1/workspaces/:workspaceId/membership", async (c) => {
+      c.header("Cache-Control", "no-store");
       const session = await requireAuthenticatedSession(c.req.raw.headers);
       if (!session) {
         return c.json(errorBody("UNAUTHORIZED", "error.unauthorized"), 401);
@@ -123,14 +140,24 @@ export function createApp(deps: AppDeps): Hono {
         return c.json(errorBody("FORBIDDEN", "error.forbidden"), 403);
       }
 
-      const result = await identityUseCases.getWorkspaceMembershipForUser(
-        session,
-        workspaceId,
-      );
-      if (!result) {
-        return c.json(errorBody("FORBIDDEN", "error.forbidden"), 403);
+      try {
+        const result = await identityUseCases.getWorkspaceMembershipForUser(
+          session,
+          workspaceId,
+        );
+        if (!result) {
+          return c.json(errorBody("FORBIDDEN", "error.forbidden"), 403);
+        }
+        return c.json(result, 200);
+      } catch (error) {
+        if (isEmailVerificationRequiredError(error)) {
+          return c.json(
+            errorBody("FORBIDDEN", "error.emailVerificationRequired"),
+            403,
+          );
+        }
+        throw error;
       }
-      return c.json(result, 200);
     });
   }
 

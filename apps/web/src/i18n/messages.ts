@@ -21,6 +21,19 @@ export interface I18nInstance {
   formatTaskCount(count: number): string;
 }
 
+function normalizeLocaleTag(locale: string): string {
+  const trimmed = locale.trim().replace(/_/g, "-");
+  if (!trimmed) {
+    return DEFAULT_LOCALE;
+  }
+  try {
+    const canonical = Intl.getCanonicalLocales(trimmed)[0];
+    return canonical || DEFAULT_LOCALE;
+  } catch {
+    return DEFAULT_LOCALE;
+  }
+}
+
 function interpolate(
   template: string,
   params?: Record<string, string | number>,
@@ -35,18 +48,36 @@ function interpolate(
 }
 
 /**
- * Creates a locale-aware translator and formatter with automatic fallback to English.
+ * Creates a locale-aware translator and formatter with BCP-47 fallback to English.
  */
 export function createI18n(options: I18nOptions = {}): I18nInstance {
-  let currentLocale: LocaleCode = options.locale ?? DEFAULT_LOCALE;
+  let currentLocale: LocaleCode = normalizeLocaleTag(options.locale ?? DEFAULT_LOCALE);
   const catalogs: Record<string, PartialMessageCatalog> = {
     en: enMessages,
     ...(options.catalogs ?? {}),
   };
 
+  function findCatalog(
+    locale: string,
+  ): { locale: string; catalog: PartialMessageCatalog } | null {
+    const exact = catalogs[locale];
+    if (exact) {
+      return { locale, catalog: exact };
+    }
+    const dashIdx = locale.indexOf("-");
+    if (dashIdx > 0) {
+      const baseLang = locale.slice(0, dashIdx);
+      const baseCatalog = catalogs[baseLang];
+      if (baseCatalog) {
+        return { locale: baseLang, catalog: baseCatalog };
+      }
+    }
+    return null;
+  }
+
   function resolveTemplate(key: MessageKey): string {
-    const activeCatalog = catalogs[currentLocale];
-    const localized = activeCatalog?.[key];
+    const matched = findCatalog(currentLocale);
+    const localized = matched?.catalog[key];
     if (localized !== undefined) {
       return localized;
     }
@@ -59,7 +90,7 @@ export function createI18n(options: I18nOptions = {}): I18nInstance {
     },
 
     setLocale(locale: LocaleCode): void {
-      currentLocale = locale;
+      currentLocale = normalizeLocaleTag(locale);
     },
 
     t(key: MessageKey, params?: Record<string, string | number>): string {
@@ -82,12 +113,12 @@ export function createI18n(options: I18nOptions = {}): I18nInstance {
     },
 
     formatTaskCount(count: number): string {
-      const activeCatalog = catalogs[currentLocale];
-      if (activeCatalog) {
+      const matched = findCatalog(currentLocale);
+      if (matched) {
         const activeRule = new Intl.PluralRules(currentLocale).select(count);
         const activeKey: MessageKey =
           activeRule === "one" ? "task.count.one" : "task.count.other";
-        const localizedTemplate = activeCatalog[activeKey];
+        const localizedTemplate = matched.catalog[activeKey];
         if (localizedTemplate !== undefined) {
           return interpolate(localizedTemplate, {
             count: new Intl.NumberFormat(currentLocale).format(count),

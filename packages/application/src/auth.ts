@@ -10,11 +10,36 @@ import type { UnitOfWork, UserRecord } from "./persistence.js";
 
 export interface AuthSessionInfo {
   sessionId: string;
-  authProvider: "better-auth";
+  authProvider: string;
   authSubject: string;
   email: string;
+  emailVerified?: boolean;
   name: string;
   expiresAt: string;
+}
+
+/**
+ * Thrown when an unverified external/sign-up identity attempts to link to a
+ * pre-existing Prood user sharing the same email address.
+ */
+export class EmailVerificationRequiredError extends Error {
+  readonly code = "EMAIL_VERIFICATION_REQUIRED" as const;
+
+  constructor(email: string) {
+    super(`Email verification required before linking account for ${email}`);
+    this.name = "EmailVerificationRequiredError";
+  }
+}
+
+export function isEmailVerificationRequiredError(
+  error: unknown,
+): error is EmailVerificationRequiredError {
+  return (
+    error instanceof EmailVerificationRequiredError ||
+    (typeof error === "object" &&
+      error !== null &&
+      (error as { code?: unknown }).code === "EMAIL_VERIFICATION_REQUIRED")
+  );
 }
 
 /**
@@ -43,7 +68,7 @@ export function createIdentityUseCases(deps: IdentityUseCaseDeps) {
   async function resolveUserInTx(
     session: AuthSessionInfo,
   ): Promise<UserRecord> {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
         return await deps.uow.run(async (repos) => {
           const existingByIdentity = await repos.users.findByAuthIdentity(
@@ -58,7 +83,11 @@ export function createIdentityUseCases(deps: IdentityUseCaseDeps) {
           let user = await repos.users.findByEmail(email);
           const nowIso = deps.clock.now().toISOString();
 
-          if (!user) {
+          if (user) {
+            if (session.emailVerified !== true) {
+              throw new EmailVerificationRequiredError(email);
+            }
+          } else {
             const displayName = session.name.trim() || email;
             user = await repos.users.create({
               id: deps.idGenerator.next("usr"),
@@ -78,7 +107,7 @@ export function createIdentityUseCases(deps: IdentityUseCaseDeps) {
           return user;
         });
       } catch (error) {
-        if (!isUniqueViolationError(error) || attempt >= 1) {
+        if (!isUniqueViolationError(error) || attempt >= 2) {
           throw error;
         }
       }
