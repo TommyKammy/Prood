@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: prood
+      POSTGRES_PASSWORD: prood
+      POSTGRES_DB: prood_test
+    ports:
+      - "${PROOD_PG_PORT:-54329}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U prood -d prood_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 15

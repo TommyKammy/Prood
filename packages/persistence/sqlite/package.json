@@ -1,0 +1,23 @@
+{
+  "name": "@prood/persistence-sqlite",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@prood/contracts": "workspace:*",
+    "@prood/persistence-common": "workspace:*",
+    "better-sqlite3": "^13.2.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0"
+  }
+}

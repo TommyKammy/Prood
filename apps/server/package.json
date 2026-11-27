@@ -1,0 +1,29 @@
+{
+  "name": "@prood/server",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./app": {
+      "types": "./dist/app.d.ts",
+      "default": "./dist/app.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.11",
+    "@prood/application": "workspace:*",
+    "@prood/contracts": "workspace:*",
+    "@prood/domain": "workspace:*",
+    "@prood/persistence-common": "workspace:*",
+    "@prood/persistence-postgres": "workspace:*",
+    "@prood/persistence-sqlite": "workspace:*",
+    "hono": "^4.13.23"
+  }
+}

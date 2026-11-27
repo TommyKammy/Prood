@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  common:
+    name: common (build, boundaries, unit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm typecheck
+      - run: pnpm check:boundaries
+      - run: pnpm test:unit
+      - run: pnpm measure:shell
+
+  sqlite:
+    name: sqlite (file persistence & FK)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:ts
+      - run: pnpm test:db:sqlite
+
+  postgres:
+    name: postgres (real server & FK)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: prood
+          POSTGRES_PASSWORD: prood
+          POSTGRES_DB: prood_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U prood -d prood_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:ts
+      - run: pnpm test:db:postgres
+        env:
+          DATABASE_URL: postgres://prood:prood@127.0.0.1:5432/prood_test

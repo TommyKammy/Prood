@@ -1,0 +1,13 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/domain" },
+    { "path": "packages/contracts" },
+    { "path": "packages/application" },
+    { "path": "packages/persistence/common" },
+    { "path": "packages/persistence/sqlite" },
+    { "path": "packages/persistence/postgres" },
+    { "path": "apps/server" },
+    { "path": "apps/web" }
+  ]
+}
