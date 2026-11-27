@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../../packages/domain" },
+    { "path": "../../packages/contracts" },
+    { "path": "../../packages/application" },
+    { "path": "../../packages/persistence/common" },
+    { "path": "../../packages/persistence/sqlite" },
+    { "path": "../../packages/persistence/postgres" }
+  ],
+  "include": ["src"]
+}

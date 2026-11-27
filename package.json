@@ -1,0 +1,40 @@
+{
+  "name": "prood",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.34.9",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build:ts": "tsc -b",
+    "build:web": "pnpm --filter @prood/web build",
+    "build": "pnpm build:ts && pnpm build:web",
+    "typecheck": "tsc -b",
+    "check:boundaries": "node scripts/check-boundaries.mjs",
+    "measure:shell": "node scripts/measure-shell.mjs",
+    "test:unit": "vitest run --project unit",
+    "test:db:sqlite": "PROOD_TEST_DB=sqlite vitest run --project db-contracts",
+    "test:db:postgres": "PROOD_TEST_DB=postgres vitest run --project db-contracts"
+  },
+  "devDependencies": {
+    "@prood/application": "workspace:*",
+    "@prood/contracts": "workspace:*",
+    "@prood/domain": "workspace:*",
+    "@prood/persistence-common": "workspace:*",
+    "@prood/persistence-postgres": "workspace:*",
+    "@prood/persistence-sqlite": "workspace:*",
+    "@prood/server": "workspace:*",
+    "@prood/web": "workspace:*",
+    "@types/node": "^22.15.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.2",
+    "vitest": "^3.2.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
+  }
+}

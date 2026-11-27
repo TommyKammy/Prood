@@ -1,0 +1,27 @@
+{
+  "name": "@prood/web",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "default": "./src/index.ts"
+    },
+    "./i18n": {
+      "types": "./dist/types/i18n/messages.d.ts",
+      "default": "./src/i18n/messages.ts"
+    }
+  },
+  "scripts": {
+    "build:types": "tsc -b",
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@prood/contracts": "workspace:*",
+    "@prood/domain": "workspace:*"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
