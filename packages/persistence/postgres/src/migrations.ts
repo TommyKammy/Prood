@@ -306,8 +306,8 @@ export const POSTGRES_MIGRATIONS: readonly MigrationDefinition[] = [
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       )`,
-      `CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks (workspace_id, project_id, position, id)`,
-      `CREATE INDEX IF NOT EXISTS tasks_parent_idx ON tasks (parent_task_id)`,
+      `CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks (project_id, position, created_at, id)`,
+      `CREATE INDEX IF NOT EXISTS tasks_parent_idx ON tasks (parent_task_id, position, created_at, id)`,
       `CREATE TABLE IF NOT EXISTS outbox_events (
         id TEXT NOT NULL PRIMARY KEY,
         event_id TEXT NOT NULL UNIQUE,

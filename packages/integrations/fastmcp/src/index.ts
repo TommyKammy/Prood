@@ -442,6 +442,7 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
             existing.session.updateAuth(sessionAuth);
             const scopeError = checkSessionScopes(existing.session, parsedBody);
             if (scopeError) {
+              await notifyAuthFailure("INSUFFICIENT_SCOPE", "Missing tool scope");
               return scopeError;
             }
             return existing.transport.handleRequest(request, parsedBody);
@@ -493,6 +494,7 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
         connectedSession = await server.connect(transport, sessionAuth);
         const scopeError = checkSessionScopes(connectedSession, parsedBody);
         if (scopeError) {
+          await notifyAuthFailure("INSUFFICIENT_SCOPE", "Missing tool scope");
           await Promise.allSettled([connectedSession.close(), transport.close()]);
           return scopeError;
         }
@@ -520,6 +522,10 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
         existing.ownerSubject !== authResult.token.subject ||
         existing.ownerClientId !== authResult.token.clientId
       ) {
+        await notifyAuthFailure(
+          "SESSION_PRINCIPAL_MISMATCH",
+          "Session belongs to a different principal",
+        );
         return jsonRpcErrorResponse(
           403,
           -32003,

@@ -36,6 +36,7 @@ import {
 import {
   createSqliteDatabase,
   mapSqliteError,
+  openSqliteConnection,
 } from "@prood/persistence-sqlite";
 import { createApp } from "@prood/server/app";
 
@@ -51,6 +52,7 @@ const AUTH_SECRET = "prood-work-outbox-test-secret-at-least-32-chars";
 
 interface IsolatedDb {
   openClient(): KyselyBackedDatabaseClient;
+  sqliteFilePath?: string;
   cleanup(): Promise<void>;
 }
 
@@ -70,6 +72,7 @@ async function createIsolatedDb(): Promise<IsolatedDb> {
     const dir = mkdtempSync(join(tmpdir(), "prood-work-sqlite-"));
     const filePath = join(dir, "work.sqlite");
     const ctx: IsolatedDb = {
+      sqliteFilePath: filePath,
       openClient() {
         const client = createSqliteDatabase({ filePath });
         opened.push(client);
@@ -919,5 +922,22 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
     expect(
       allEvents.filter((e) => e.reasonCode === "EMAIL_VERIFICATION_REQUIRED").length,
     ).toBeGreaterThanOrEqual(6);
+
+    if (targetDb === "sqlite" && ctx.sqliteFilePath) {
+      const sqliteConn = openSqliteConnection(ctx.sqliteFilePath);
+      try {
+        const rows = sqliteConn
+          .prepare(
+            "EXPLAIN QUERY PLAN SELECT * FROM tasks WHERE project_id = ? ORDER BY position ASC, created_at ASC, id ASC",
+          )
+          .all(project.id) as Array<{ detail: string }>;
+        const planText = rows.map((r) => r.detail).join(" | ");
+        expect(planText).toContain("SEARCH tasks USING INDEX tasks_project_idx");
+        expect(planText).not.toContain("SCAN tasks");
+        expect(planText).not.toContain("USE TEMP B-TREE");
+      } finally {
+        sqliteConn.close();
+      }
+    }
   });
 });
