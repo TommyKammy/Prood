@@ -157,14 +157,8 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
     return evicted;
   }
 
-  async function evictSessions(
-    nowMs: number,
-    reserveSlotForNew = false,
-  ): Promise<void> {
-    const maxAllowed = reserveSlotForNew
-      ? Math.max(0, maxActiveSessions - 1)
-      : maxActiveSessions;
-    const evicted = collectEvictions(nowMs, maxAllowed);
+  async function evictSessions(nowMs: number): Promise<void> {
+    const evicted = collectEvictions(nowMs, maxActiveSessions);
     if (evicted.length > 0) {
       await Promise.allSettled(evicted.map(closeSessionEntry));
     }
@@ -263,20 +257,21 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
           return existing.transport.handleRequest(request, parsedBody);
         }
 
-        await evictSessions(nowMs, true);
-
         let connectedSession: FastMCPSession<ProodMcpSessionAuth> | undefined;
+        let initializedSessionId: string | undefined;
+        const pendingEvictionCloses: Promise<void>[] = [];
         const transport = new WebStreamableHTTPServerTransport({
           sessionIdGenerator: () => globalThis.crypto.randomUUID(),
           enableJsonResponse: true,
           onsessioninitialized: (newSessionId) => {
+            initializedSessionId = newSessionId;
             const callbackNowMs = deps.clock.now().getTime();
             const overflow = collectEvictions(
               callbackNowMs,
               Math.max(0, maxActiveSessions - 1),
             );
             for (const entry of overflow) {
-              void closeSessionEntry(entry);
+              pendingEvictionCloses.push(closeSessionEntry(entry));
             }
             if (connectedSession) {
               activeSessions.set(newSessionId, {
@@ -298,10 +293,19 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
         connectedSession = await server.connect(transport, sessionAuth);
         const scopeError = checkSessionScopes(connectedSession, parsedBody);
         if (scopeError) {
-          await connectedSession.close();
+          await Promise.allSettled([connectedSession.close(), transport.close()]);
           return scopeError;
         }
-        return transport.handleRequest(request, parsedBody);
+        try {
+          return await transport.handleRequest(request, parsedBody);
+        } finally {
+          if (pendingEvictionCloses.length > 0) {
+            await Promise.allSettled(pendingEvictionCloses);
+          }
+          if (!initializedSessionId) {
+            await Promise.allSettled([connectedSession.close(), transport.close()]);
+          }
+        }
       }
 
       if (!sessionId) {
