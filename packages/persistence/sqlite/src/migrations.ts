@@ -1,4 +1,4 @@
-import type { MigrationDefinition } from "@prood/persistence-common";
+import { automationMigration, type MigrationDefinition } from "@prood/persistence-common";
 
 export const SQLITE_MIGRATIONS: readonly MigrationDefinition[] = [
   {
@@ -339,4 +339,5 @@ export const SQLITE_MIGRATIONS: readonly MigrationDefinition[] = [
       `CREATE INDEX IF NOT EXISTS outbox_events_target_idx ON outbox_events (target_type, target_id)`,
     ],
   },
+  automationMigration,
 ];

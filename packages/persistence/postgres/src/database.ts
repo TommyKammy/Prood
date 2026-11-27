@@ -156,7 +156,7 @@ export function createPostgresDatabase(
 
             return txStorage.run(true, async () => {
               try {
-                return await fn(createKyselyRepositories(trx, mapPostgresError));
+                return await fn(createKyselyRepositories(trx, mapPostgresError, undefined, true));
               } catch (error) {
                 if (!isPersistenceError(error)) {
                   hasBusinessError = true;

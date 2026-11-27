@@ -26,3 +26,17 @@ writeFileSync(
 );
 copyFileSync(resolve(__dirname, "src/styles.css"), resolve(distDir, "shell.css"));
 copyFileSync(resolve(__dirname, "public/index.html"), resolve(distDir, "index.html"));
+
+await esbuild.build({
+  entryPoints: [resolve(__dirname, "src/automation.ts")],
+  bundle: true,
+  format: "esm",
+  platform: "browser",
+  target: "es2022",
+  minify: true,
+  outfile: resolve(distDir, "automation.js"),
+});
+copyFileSync(
+  resolve(__dirname, "public/automation.html"),
+  resolve(distDir, "automation.html"),
+);

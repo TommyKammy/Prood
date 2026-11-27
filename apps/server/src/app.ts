@@ -265,6 +265,31 @@ export function createApp(deps: AppDeps): Hono {
       }
     });
 
+    app.post("/api/v1/projects/:projectId/automation/:rule", async (c) => {
+      c.header("Cache-Control", "no-store");
+      if (c.req.header("content-type")?.split(";")[0] !== "application/json")
+        return c.json(errorBody("VALIDATION_ERROR", "error.validation"), 400);
+      const session = await requireSessionOrRecord(c);
+      if (!session) return c.json(errorBody("UNAUTHORIZED", "error.unauthorized"), 401);
+      if (!workUseCases || !identityUseCases)
+        return c.json(errorBody("INTERNAL_ERROR", "error.generic"), 500);
+      const actor = await resolveActorOrRespond(c, session);
+      if (!actor.ok) return actor.response;
+      const project = c.req.param("projectId"),
+        rule = c.req.param("rule");
+      const body = await parseJsonBody<Record<string, unknown>>(c);
+      if (!isValidEntityId("prj", project) || !body)
+        return c.json(errorBody("VALIDATION_ERROR", "error.validation"), 400);
+      const result =
+        body.op === "start" &&
+        typeof body.task === "string" &&
+        isValidEntityId("tsk", body.task)
+          ? await workUseCases.manualAutomation(actor.actor, project, rule, body.task)
+          : await workUseCases.manageAutomation(actor.actor, project, rule, body);
+      if (!result.ok) return c.json(errorBody(result.code, result.messageKey), result.status);
+      return c.json(result.data);
+    });
+
     app.post("/api/v1/workspaces/:workspaceId/projects", async (c) => {
       c.header("Cache-Control", "no-store");
       const session = await requireSessionOrRecord(c);

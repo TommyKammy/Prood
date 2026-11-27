@@ -1,3 +1,4 @@
+import { routeTaskEvent, parseRule, type RuleDefinition, type TaskField } from "./automation.js";
 import {
   CONTRACT_VERSION,
   type ApiErrorCode,
@@ -14,6 +15,7 @@ import {
   type UpdateTaskRequest,
 } from "@prood/contracts";
 import {
+  canManageProject,
   canReadProject,
   canWriteProjectTasks,
   isValidEntityId,
@@ -163,7 +165,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
     },
   ): Promise<OutboxEventRecord> {
     const nowIso = deps.clock.now().toISOString();
-    return repos.outbox.append({
+    const event = await repos.outbox.append({
       id: deps.idGenerator.next("out"),
       eventId: deps.idGenerator.next("evt"),
       schemaVersion: OUTBOX_SCHEMA_VERSION,
@@ -182,9 +184,14 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         schemaVersion: OUTBOX_SCHEMA_VERSION,
         ...(params.actor.clientId ? { clientId: params.actor.clientId } : {}),
         ...params.payload,
+        ...(params.actor.channel === "automation" && params.actor.parentRun
+          ? { parentRun: params.actor.parentRun }
+          : {}),
       },
       occurredAt: nowIso,
     });
+    await routeTaskEvent(repos,event);
+    return event;
   }
 
   async function resolveActorProjectRole(
@@ -240,7 +247,256 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
     return null;
   }
 
+  async function allowedValue(
+    repos: TransactionRepositories,
+    project: ProjectRecord,
+    field: TaskField,
+    value: string | null,
+  ) {
+    if (value === null) return true;
+    if (field === "statusId")
+      return (
+        isValidEntityId("sts", value) &&
+        (await repos.statuses.findById(value))?.projectId === project.id
+      );
+    return (
+      isValidEntityId("usr", value) &&
+      canReadProject(await resolveActorProjectRole(repos, value, project))
+    );
+  }
+  async function validCandidates(
+    repos: TransactionRepositories,
+    project: ProjectRecord,
+    def: RuleDefinition,
+  ) {
+    const field = def.when === "status.changed" ? "statusId" : "assigneeId";
+    for (const value of [def.from, def.to])
+      if (value !== undefined && !(await allowedValue(repos, project, field, value)))
+        return false;
+    return (
+      (typeof def.action.value === "object" && def.action.value !== null) ||
+      (await allowedValue(
+        repos,
+        project,
+        def.action.field,
+        def.action.value as string | null,
+      ))
+    );
+  }
+
   return {
+    async manageAutomation(
+      actor: AuditActorContext,
+      projectId: ProjectId,
+      rule: string,
+      command: Record<string, unknown>,
+    ): Promise<
+      WorkUseCaseResult<{
+        rule: string;
+        revision: number;
+        project: ProjectId;
+        delegate: UserId;
+        delegateName: string;
+        projectName: string;
+        labels: Record<string, string>;
+        enabled: boolean;
+        definition: RuleDefinition;
+      }>
+    > {
+      return deps.uow.run(async (repos) => {
+        const project = await repos.projects.findById(projectId);
+        if (
+          !project ||
+          !actor.userId ||
+          !canManageProject(await resolveActorProjectRole(repos, actor.userId, project))
+        )
+          return fail(404, "NOT_FOUND", "error.notFound");
+        const op = command.op;
+        if (
+          !/^[A-Za-z0-9_-]{1,80}$/.test(rule) ||
+          typeof op !== "string" ||
+          !["preview", "publish", "stop"].includes(op) ||
+          Object.keys(command).some(
+            (k) => !["op", "revision", "definition", "delegate"].includes(k),
+          )
+        )
+          return fail(400, "VALIDATION_ERROR", "error.validation");
+        const prior = (await repos.automation.rules(projectId)).find((r) => r.rule === rule);
+        const expected = prior?.revision ?? 0;
+        if (command.revision !== expected) return fail(409, "CONFLICT", "error.conflict");
+        const stop = op === "stop";
+        if (stop && !prior) return fail(404, "NOT_FOUND", "error.notFound");
+        const definition = stop ? prior!.definition : parseRule(command.definition);
+        if (
+          !definition ||
+          (!stop &&
+            (command.delegate !== actor.userId ||
+              !(await validCandidates(repos, project, definition))))
+        )
+          return fail(400, "VALIDATION_ERROR", "error.validation");
+        const delegate = stop ? prior!.actor : actor.userId;
+        const delegateName = (await repos.users.findById(delegate))?.displayName ?? delegate;
+        const labels: Record<string, string> = {};
+        if (!stop)
+          for (const id of [definition.from, definition.to, definition.action.value]) {
+            if (typeof id !== "string") continue;
+            if (isValidEntityId("usr", id))
+              labels[id] = (await repos.users.findById(id))?.displayName ?? id;
+            if (isValidEntityId("sts", id))
+              labels[id] = (await repos.statuses.findById(id))?.name ?? id;
+          }
+        const data = {
+          project: projectId,
+          projectName: project.name,
+          labels,
+          rule,
+          revision: expected + 1,
+          delegate,
+          delegateName,
+          definition,
+          enabled: !stop,
+        };
+        if (op !== "preview") {
+          if (
+            !(await repos.automation.save(
+              {
+                ...data,
+                actor: delegate,
+                delegation:
+                  !prior || !prior.enabled || stop || prior.actor !== delegate
+                    ? data.revision
+                    : prior.delegation,
+              },
+              expected,
+            ))
+          )
+            return fail(409, "CONFLICT", "error.conflict");
+          await appendOutbox(repos, {
+            workspaceId: project.workspaceId,
+            projectId,
+            eventType: "automation.rule." + op,
+            action: "automation." + op,
+            outcome: "succeeded",
+            actor,
+            targetType: "rule",
+            targetId: rule,
+            reasonCode: null,
+            payload: { delegate, revision: data.revision, enabled: data.enabled },
+          });
+        }
+        return { ok: true, data };
+      });
+    },
+
+    async manualAutomation(
+      actor: AuditActorContext,
+      projectId: ProjectId,
+      rule: string,
+      id: TaskPublicId,
+    ): Promise<WorkUseCaseResult<{ event: string }>> {
+      return deps.uow.run(async (repos) => {
+        const task = await repos.tasks.findById(id, true);
+        const resolved = task && (await resolveTaskEffectiveProject(repos, task));
+        if (
+          !task ||
+          !resolved ||
+          resolved.project.id !== projectId ||
+          !canWriteProjectTasks(
+            await resolveActorProjectRole(repos, actor.userId, resolved.project),
+          )
+        )
+          return fail(404, "NOT_FOUND", "error.notFound");
+        const sub = (await repos.automation.rules(projectId)).find(
+          (r) => r.rule === rule && r.enabled && r.definition.when === "manual",
+        );
+        if (!sub) return fail(404, "NOT_FOUND", "error.notFound");
+        const e = await appendOutbox(repos, {
+          workspaceId: task.workspaceId,
+          projectId,
+          eventType: "task.manual",
+          action: "automation.start",
+          outcome: "succeeded",
+          actor,
+          targetType: "task",
+          targetId: id,
+          reasonCode: null,
+          payload: {
+            rule,
+            taskVersion: task.version,
+            statusId: task.statusId,
+            assigneeId: task.assigneeId,
+          },
+        });
+        return { ok: true, data: { event: e.eventId } };
+      });
+    },
+
+    // Internal worker port; the queue's stored intent is authoritative. Stage 8.2 only prepares changes.
+    async prepareAutomation(
+      workspace: WorkspaceId,
+      event: string,
+      rule: string,
+      run: string,
+      projectId: ProjectId,
+      revision: number,
+    ) {
+      return deps.uow.run(async (repos) => {
+        const d = await repos.automation.intent(workspace, event, rule);
+        if (!d || d.project !== projectId || d.revision !== revision)
+          return { status: "denied" } as const;
+        const p = d.proposal;
+        const task = await repos.tasks.findById(p.task, true);
+        const resolved = task && (await resolveTaskEffectiveProject(repos, task));
+        const sub = (await repos.automation.rules(d.project)).find((r) => r.rule === rule);
+        const field = p.definition.action.field;
+        const ref = p.definition.action.value;
+        const value = ref !== null && typeof ref === "object" ? p.fields[ref.event] : ref;
+        const authorized = !!(
+          task &&
+          resolved &&
+          task.workspaceId === workspace &&
+          resolved.project.id === d.project &&
+          sub?.enabled &&
+          sub.delegation === p.delegation &&
+          sub.actor === p.delegate &&
+          canWriteProjectTasks(
+            await resolveActorProjectRole(repos, p.delegate, resolved.project),
+          ) &&
+          (await allowedValue(repos, resolved.project, field, value))
+        );
+        const status = !authorized
+          ? "denied"
+          : task!.version !== p.version ||
+              (p.definition.ifUnassigned && task!.assigneeId !== null)
+            ? "skipped"
+            : "prepared";
+        if (await repos.automation.firstCheck(d, run, status))
+          await appendOutbox(repos, {
+            workspaceId: workspace,
+            projectId: d.project,
+            eventType: "automation." + status,
+            action: "automation.prepare",
+            outcome: authorized ? "succeeded" : "denied",
+            actor: { userId: p.delegate, actorType: "user", channel: "automation" },
+            targetType: "rule",
+            targetId: rule,
+            reasonCode: status === "prepared" ? null : status,
+            payload: {
+              origin: p.origin,
+              delegate: p.delegate,
+              rule,
+              revision: d.revision,
+              run,
+              cause: event,
+              ...(authorized && { taskId: p.task, field }),
+            },
+          });
+        return status === "prepared"
+          ? ({ status, field, value } as const)
+          : ({ status } as const);
+      });
+    },
+
     async recordEntryAuthFailure(input: {
       channel: EventChannel;
       path: string;
@@ -437,6 +693,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       projectId: ProjectId,
       input: CreateTaskRequest,
     ): Promise<WorkUseCaseResult<TaskResponse>> {
+      if (actor.channel === "automation") return fail(403, "FORBIDDEN", "error.forbidden");
       if (!isPlainObject(input)) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
@@ -464,16 +721,14 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       if (
         input.statusId !== undefined &&
         input.statusId !== null &&
-        (typeof input.statusId !== "string" ||
-          !isValidEntityId("sts", input.statusId))
+        (typeof input.statusId !== "string" || !isValidEntityId("sts", input.statusId))
       ) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
       if (
         input.assigneeId !== undefined &&
         input.assigneeId !== null &&
-        (typeof input.assigneeId !== "string" ||
-          !isValidEntityId("usr", input.assigneeId))
+        (typeof input.assigneeId !== "string" || !isValidEntityId("usr", input.assigneeId))
       ) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
@@ -485,8 +740,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
 
-      const description =
-        typeof input.description === "string" ? input.description : "";
+      const description = typeof input.description === "string" ? input.description : "";
 
       return deps.uow.run(async (repos) => {
         let effectiveProject = await repos.projects.findById(projectId);
@@ -510,19 +764,13 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         }
 
         const storedProjectId =
-          parentTaskId && input.inheritParentProject !== false
-            ? null
-            : effectiveProject.id;
+          parentTaskId && input.inheritParentProject !== false ? null : effectiveProject.id;
 
         if (storedProjectId === null && parentDepth + 1 >= MAX_PARENT_HOPS) {
           return fail(400, "VALIDATION_ERROR", "error.validation");
         }
 
-        const role = await resolveActorProjectRole(
-          repos,
-          actor.userId,
-          effectiveProject,
-        );
+        const role = await resolveActorProjectRole(repos, actor.userId, effectiveProject);
         if (!canWriteProjectTasks(role)) {
           await appendOutbox(repos, {
             workspaceId: effectiveProject.workspaceId,
@@ -546,9 +794,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
             return fail(400, "VALIDATION_ERROR", "error.validation");
           }
         } else if (input.statusId === undefined) {
-          const projectStatuses = await repos.statuses.listByProject(
-            effectiveProject.id,
-          );
+          const projectStatuses = await repos.statuses.listByProject(effectiveProject.id);
           resolvedStatusId = projectStatuses[0]?.id ?? null;
         }
 
@@ -592,6 +838,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           reasonCode: null,
           payload: {
             taskId: task.id,
+            taskVersion: task.version,
             projectId: effectiveProject.id,
             projectKind: effectiveProject.kind,
             parentTaskId: task.parentTaskId,
@@ -626,11 +873,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         }
         const effectiveProject = resolved.project;
 
-        const role = await resolveActorProjectRole(
-          repos,
-          actor.userId,
-          effectiveProject,
-        );
+        const role = await resolveActorProjectRole(repos, actor.userId, effectiveProject);
         if (!canReadProject(role)) {
           await appendOutbox(repos, {
             workspaceId: effectiveProject.workspaceId,
@@ -692,11 +935,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           frontier.push(task.id);
         }
 
-        for (
-          let depth = 0;
-          depth < MAX_PARENT_HOPS && frontier.length > 0;
-          depth += 1
-        ) {
+        for (let depth = 0; depth < MAX_PARENT_HOPS && frontier.length > 0; depth += 1) {
           const children = await repos.tasks.listSubtasksByParentIds(frontier);
           const nextFrontier: TaskPublicId[] = [];
           for (const child of children) {
@@ -715,9 +954,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           ok: true,
           data: {
             contractVersion: CONTRACT_VERSION,
-            tasks: Array.from(collected.values()).map((t) =>
-              toTaskDto(t, project.id),
-            ),
+            tasks: Array.from(collected.values()).map((t) => toTaskDto(t, project.id)),
           },
         };
       });
@@ -728,6 +965,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       taskId: TaskPublicId,
       patch: UpdateTaskRequest & Record<string, unknown>,
     ): Promise<WorkUseCaseResult<TaskResponse>> {
+      if (actor.channel === "automation") return fail(403, "FORBIDDEN", "error.forbidden");
       if (!isPlainObject(patch)) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
@@ -746,16 +984,14 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       if (
         patch.statusId !== undefined &&
         patch.statusId !== null &&
-        (typeof patch.statusId !== "string" ||
-          !isValidEntityId("sts", patch.statusId))
+        (typeof patch.statusId !== "string" || !isValidEntityId("sts", patch.statusId))
       ) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
       if (
         patch.assigneeId !== undefined &&
         patch.assigneeId !== null &&
-        (typeof patch.assigneeId !== "string" ||
-          !isValidEntityId("usr", patch.assigneeId))
+        (typeof patch.assigneeId !== "string" || !isValidEntityId("usr", patch.assigneeId))
       ) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
@@ -775,7 +1011,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       }
 
       return deps.uow.run(async (repos) => {
-        const existing = await repos.tasks.findById(taskId);
+        const existing = await repos.tasks.findById(taskId, true);
         if (!existing) {
           return fail(404, "NOT_FOUND", "error.notFound");
         }
@@ -785,11 +1021,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         }
         const effectiveProject = resolved.project;
 
-        const role = await resolveActorProjectRole(
-          repos,
-          actor.userId,
-          effectiveProject,
-        );
+        const role = await resolveActorProjectRole(repos, actor.userId, effectiveProject);
         if (!canWriteProjectTasks(role)) {
           await appendOutbox(repos, {
             workspaceId: effectiveProject.workspaceId,
@@ -826,17 +1058,11 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         const nowIso = deps.clock.now().toISOString();
         const updated = await repos.tasks.update(existing.id, {
           ...(patch.title !== undefined ? { title: patch.title.trim() } : {}),
-          ...(patch.description !== undefined
-            ? { description: patch.description }
-            : {}),
+          ...(patch.description !== undefined ? { description: patch.description } : {}),
           ...(patch.statusId !== undefined ? { statusId: patch.statusId } : {}),
-          ...(patch.assigneeId !== undefined
-            ? { assigneeId: patch.assigneeId }
-            : {}),
+          ...(patch.assigneeId !== undefined ? { assigneeId: patch.assigneeId } : {}),
           ...(patch.dueOn !== undefined ? { dueOn: patch.dueOn } : {}),
-          ...(patch.completedAt !== undefined
-            ? { completedAt: patch.completedAt }
-            : {}),
+          ...(patch.completedAt !== undefined ? { completedAt: patch.completedAt } : {}),
           updatedAt: nowIso,
         });
         if (!updated) {
@@ -855,6 +1081,9 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           reasonCode: null,
           payload: {
             taskId: updated.id,
+            taskVersion: updated.version,
+            before: { statusId: existing.statusId, assigneeId: existing.assigneeId },
+            after: { statusId: updated.statusId, assigneeId: updated.assigneeId },
             projectId: effectiveProject.id,
             changes: {
               ...(patch.title !== undefined ? { title: updated.title } : {}),
@@ -862,9 +1091,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
                 ? { description: updated.description }
                 : {}),
               ...(patch.statusId !== undefined ? { statusId: updated.statusId } : {}),
-              ...(patch.assigneeId !== undefined
-                ? { assigneeId: updated.assigneeId }
-                : {}),
+              ...(patch.assigneeId !== undefined ? { assigneeId: updated.assigneeId } : {}),
               ...(patch.dueOn !== undefined ? { dueOn: updated.dueOn } : {}),
               ...(patch.completedAt !== undefined
                 ? { completedAt: updated.completedAt }

@@ -3,6 +3,7 @@ import { WebStreamableHTTPServerTransport } from "fastmcp/edge";
 import { z } from "zod";
 import {
   createMcpIdentityUseCase,
+  createWorkUseCases,
   type Clock,
   type IdGenerator,
   type McpHttpHandler,
@@ -10,6 +11,7 @@ import {
   type McpVerifiedToken,
   type UnitOfWork,
 } from "@prood/application";
+import { isValidEntityId } from "@prood/domain";
 import { MCP_REQUIRED_WHOAMI_SCOPE } from "@prood/contracts";
 
 const DEFAULT_SESSION_IDLE_TTL_MS = 30 * 60 * 1000;
@@ -48,6 +50,8 @@ interface ActiveSessionEntry {
 }
 
 const TOOL_REQUIRED_SCOPES = new Map<string, readonly string[]>([
+  ["create_task", ["prood:write"]],
+  ["update_task", ["prood:write"]],
   ["whoami", [MCP_REQUIRED_WHOAMI_SCOPE]],
 ]);
 
@@ -186,6 +190,66 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
       deps.onWhoamiExecuted?.();
       const profile = await identityUseCase.whoami(sessionAuth, deps.resource);
       return JSON.stringify(profile);
+    },
+  });
+
+  const work = createWorkUseCases(deps);
+  async function writer(token: ProodMcpSessionAuth | undefined) {
+    if (!token?.scopes.includes("prood:write")) throw Error("Task write scope required");
+    const profile = await identityUseCase.whoami(token, deps.resource);
+    if (!isValidEntityId("usr", profile.userId)) throw Error("Invalid principal");
+    return {
+      userId: profile.userId,
+      actorType: "agent",
+      channel: "mcp",
+      clientId: token.clientId,
+    } as const;
+  }
+  const statusId = z
+    .string()
+    .refine((v) => isValidEntityId("sts", v))
+    .nullable()
+    .optional();
+  const assigneeId = z
+    .string()
+    .refine((v) => isValidEntityId("usr", v))
+    .nullable()
+    .optional();
+  server.addTool({
+    name: "create_task",
+    description: "Create a task in an accessible project.",
+    scopes: ["prood:write"],
+    parameters: z
+      .object({ projectId: z.string(), title: z.string(), statusId, assigneeId })
+      .strict(),
+    execute: async ({ projectId, title, statusId, assigneeId }, ctx) => {
+      if (!isValidEntityId("prj", projectId)) throw Error("Invalid project");
+      const result = await work.createTask(await writer(ctx.session), projectId, {
+        title,
+        statusId,
+        assigneeId,
+      });
+      if (!result.ok) throw Error(result.code);
+      return JSON.stringify(result.data);
+    },
+  });
+  server.addTool({
+    name: "update_task",
+    description: "Update a task's status or assignee.",
+    scopes: ["prood:write"],
+    parameters: z.object({ taskId: z.string(), statusId, assigneeId }).strict(),
+    execute: async ({ taskId, statusId, assigneeId }, ctx) => {
+      if (
+        !isValidEntityId("tsk", taskId) ||
+        (statusId === undefined && assigneeId === undefined)
+      )
+        throw Error("Invalid task change");
+      const result = await work.updateTask(await writer(ctx.session), taskId, {
+        statusId,
+        assigneeId,
+      });
+      if (!result.ok) throw Error(result.code);
+      return JSON.stringify(result.data);
     },
   });
 

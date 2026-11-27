@@ -384,7 +384,7 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
     });
 
     const v4 = await db.migrate();
-    expect(v4).toEqual({ appliedVersions: [4, 5], currentVersion: 5 });
+    expect(v4).toEqual({ appliedVersions: [4, 5, 8], currentVersion: 8 });
 
     const loaded = await db.uow.run(async (repos) => ({
       workspace: await repos.workspaces.findById(wksId),
@@ -462,7 +462,7 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
     const { accessToken, clientId } = await issueOAuthAccessToken({
       baseURL: server.baseURL,
       cookieJar: jar,
-      scope: `openid profile email ${MCP_REQUIRED_WHOAMI_SCOPE}`,
+      scope: `openid profile email ${MCP_REQUIRED_WHOAMI_SCOPE} prood:write`,
       resource: server.mcpResource,
     });
 
@@ -506,6 +506,88 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
       expect(whoami.workspaces).toHaveLength(1);
       expect(whoami.workspaces[0]?.workspaceId).toBe(wksId);
       expect(server.getWhoamiExecutedCount()).toBe(1);
+
+      const req = async (path: string, body: unknown, method = "POST") =>
+        fetch(server.baseURL + path, {
+          method,
+          headers: {
+            "content-type": "application/json",
+            cookie: jar.toHeader(),
+            origin: server.baseURL,
+          },
+          body: JSON.stringify(body),
+        });
+      const pr = await req("/api/v1/workspaces/" + wksId + "/projects", {
+        name: "Automation",
+        kind: "general",
+        visibility: "private",
+      });
+      expect(pr.status).toBe(201);
+      const { project } = await pr.json();
+      for (const [id, when] of [
+        ["create", "task.created"],
+        ["assigned", "assignee.changed"],
+        ["status", "status.changed"],
+      ]) {
+        const rule = await req("/api/v1/projects/" + project.id + "/automation/" + id, {
+          op: "publish",
+          revision: 0,
+          delegate: me.user.id,
+          definition: { when, action: { field: "assigneeId", value: me.user.id } },
+        });
+        expect(rule.status).toBe(200);
+      }
+      const result = await client.callTool({
+        name: "create_task",
+        arguments: { projectId: project.id, title: "From MCP" },
+      });
+      expect(result.isError).not.toBe(true);
+      const task = JSON.parse((result.content as { text: string }[])[0]!.text).task;
+      expect(
+        (
+          await client.callTool({
+            name: "update_task",
+            arguments: {
+              taskId: task.id,
+              assigneeId: me.user.id,
+              statusId: project.statuses[1].id,
+            },
+          })
+        ).isError,
+      ).not.toBe(true);
+      const path = "/api/v1/projects/" + project.id + "/tasks";
+      const web = await req(path, { title: "From Web" });
+      expect(web.status).toBe(201);
+      const webTask = (await web.json()).task;
+      expect(
+        (
+          await req(
+            "/api/v1/tasks/" + webTask.id,
+            { assigneeId: me.user.id, statusId: project.statuses[1].id },
+            "PATCH",
+          )
+        ).status,
+      ).toBe(200);
+      const envelopes = await db.kysely
+        .selectFrom("automation_deliveries")
+        .selectAll()
+        .where("workspace", "=", wksId)
+        .execute();
+      expect(envelopes.map((r) => r.rule).sort()).toEqual([
+        "assigned",
+        "assigned",
+        "create",
+        "create",
+        "status",
+        "status",
+      ]);
+      const audit = await db.uow.run((r) => r.outbox.listByWorkspace(wksId));
+      expect(
+        audit
+          .filter((e) => e.eventType === "task.updated")
+          .map((e) => e.channel)
+          .sort(),
+      ).toEqual(["mcp", "web"]);
     } finally {
       await client.close();
     }

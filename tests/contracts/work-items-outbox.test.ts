@@ -4,6 +4,9 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createSystemIdGenerator,
+  deliverNext,
+  routeTaskEvent,
+  type Delivery,
   createWorkUseCases,
   type UnitOfWork,
 } from "@prood/application";
@@ -256,7 +259,7 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
     });
 
     const v5 = await db.migrate();
-    expect(v5).toEqual({ appliedVersions: [5], currentVersion: 5 });
+    expect(v5).toEqual({ appliedVersions: [5, 8], currentVersion: 8 });
 
     const loaded = await db.uow.run(async (repos) => ({
       ws: await repos.workspaces.findById(wksId),
@@ -1094,5 +1097,193 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
       grandchild.data.task.id,
     ].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
     expect(batchRows.map((t) => t.id)).toEqual(expectedOrder);
+  });
+  it("pins both subscribers at commit, fences leases and filters real transitions across Web and MCP operations", async () => {
+    const ctx = await createIsolatedDb();
+    const db = ctx.openClient();
+    await db.migrate();
+    const ids = createSystemIdGenerator();
+    const h = createServerHarness(db);
+    const workspace = ids.next("wks");
+    const user = await h.signUpUser("flow@example.com", "Owner");
+    let now = Date.now();
+    const clock = { now: () => new Date(now) };
+    await db.uow.run(async (r) => {
+      await r.workspaces.create({
+        id: workspace,
+        slug: "business",
+        name: "Business",
+        createdAt: clock.now().toISOString(),
+      });
+      await r.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: workspace,
+        userId: user.userId,
+        role: "admin",
+        createdAt: clock.now().toISOString(),
+      });
+    });
+    const actor = { userId: user.userId, actorType: "user", channel: "mcp" } as const;
+    const created = await h.workUseCases.createProject(actor, workspace, {
+      name: "Board",
+      kind: "general",
+      visibility: "private",
+    });
+    if (!created.ok) throw Error("project");
+    const project = created.data.project;
+    const definition = {
+      when: "assignee.changed",
+      from: null,
+      to: user.userId,
+      action: { field: "statusId", value: project.statuses[0]!.id },
+    } as const;
+    for (const rule of ["one", "two"])
+      await db.uow.run((r) =>
+        r.automation.save(
+          {
+            project: project.id,
+            rule,
+            actor: user.userId,
+            enabled: true,
+            revision: 1,
+            delegation: 1,
+            definition,
+          },
+          0,
+        ),
+      );
+    const task = await h.workUseCases.createTask(actor, project.id, { title: "Review" });
+    if (!task.ok) throw Error("task");
+    const id = task.data.task.id;
+    const web = await h.request("/api/v1/tasks/" + id, {
+      method: "PATCH",
+      cookieHeader: user.jar.toHeader(),
+      json: { assigneeId: user.userId },
+    });
+    expect(web.status).toBe(200);
+    expect((await h.workUseCases.updateTask(actor, id, { assigneeId: user.userId })).ok).toBe(
+      true,
+    );
+    expect(
+      (await h.workUseCases.updateTask(actor, id, { description: "ordinary edit" })).ok,
+    ).toBe(true);
+    const deps = { uow: db.uow, idGenerator: ids, clock };
+    const original = (await db.uow.run((r) => r.outbox.listByWorkspace(workspace))).find(
+      (e) => e.eventType === "task.updated",
+    )!;
+    // Historical patches lack a preimage. A matching event in a rolled-back transaction is invisible too.
+    await db.uow.run((r) =>
+      routeTaskEvent(r, {
+        ...original,
+        eventId: ids.next("evt"),
+        payload: { changes: { assigneeId: user.userId } },
+      }),
+    );
+    await expect(
+      db.uow.run(async (r) => {
+        const e = await r.outbox.append({
+          ...original,
+          id: ids.next("out"),
+          eventId: ids.next("evt"),
+          payload: {
+            before: { assigneeId: null },
+            after: { assigneeId: user.userId },
+            taskVersion: 2,
+          },
+        });
+        await routeTaskEvent(r, e);
+        throw Error("abort task change");
+      }),
+    ).rejects.toThrow("abort task change");
+    const seen: Delivery[] = [];
+    await expect(
+      deliverNext(
+        deps,
+        workspace,
+        (d) => {
+          seen.push(d);
+          throw Error("lost acknowledgement");
+        },
+        10,
+      ),
+    ).rejects.toThrow("lost acknowledgement");
+    await db.uow.run((r) =>
+      r.automation.save(
+        {
+          project: project.id,
+          rule: "one",
+          revision: 2,
+          delegation: 1,
+          actor: user.userId,
+          enabled: true,
+          definition,
+        },
+        1,
+      ),
+    );
+    expect(
+      await deliverNext(deps, workspace, (d) => {
+        seen.push(d);
+        return "second";
+      }),
+    ).toBe(true);
+    expect(
+      await deliverNext(deps, ids.next("wks"), () => {
+        throw Error("crossed workspace");
+      }),
+    ).toBe(false);
+    now += 11;
+    const reopened = ctx.openClient();
+    expect(
+      await deliverNext({ ...deps, uow: reopened.uow }, workspace, (d) => {
+        seen.push(d);
+        return "first";
+      }),
+    ).toBe(true);
+    expect(seen.map((d) => [d.rule, d.revision])).toEqual([
+      ["one", 1],
+      ["two", 1],
+      ["one", 1],
+    ]);
+    expect(seen[2]).toEqual(seen[0]);
+    expect(seen[0]!.proposal.version).toBe(2);
+    expect(
+      await deliverNext(deps, workspace, () => {
+        throw Error("extra delivery");
+      }),
+    ).toBe(false);
+    await h.workUseCases.updateTask(actor, id, { assigneeId: null });
+    await h.workUseCases.updateTask(actor, id, { assigneeId: user.userId });
+    expect(
+      await deliverNext(deps, workspace, (d) => {
+        expect(d.revision).toBe(2);
+        expect(d.proposal.version).toBe(6);
+        return "next";
+      }),
+    ).toBe(true);
+    // Leave the second subscriber with a live, then expired owner while another client confirms.
+    let release!: (id: string) => void, entered!: () => void;
+    const receiving = new Promise<void>((r) => {
+      entered = r;
+    });
+    const waiting = deliverNext(
+      deps,
+      workspace,
+      () => {
+        entered();
+        return new Promise<string>((r) => {
+          release = r;
+        });
+      },
+      5,
+    );
+    await receiving;
+    now += 10;
+    expect(await deliverNext({ ...deps, uow: reopened.uow }, workspace, () => "winner")).toBe(
+      true,
+    );
+    release("obsolete");
+    expect(await waiting).toBe(false);
+    expect(await deps.uow.run((r) => r.automation.lookup(workspace, "obsolete"))).toBeNull();
   });
 });

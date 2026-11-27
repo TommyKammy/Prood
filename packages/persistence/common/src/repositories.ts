@@ -1,4 +1,4 @@
-import type { Kysely, Transaction } from "kysely";
+import { sql, type Kysely, type Transaction } from "kysely";
 import type {
   AppendOutboxEventInput,
   AuthIdentityRecord,
@@ -161,8 +161,9 @@ function toProjectStatusRecord(row: ProjectStatusTable): ProjectStatusRecord {
   };
 }
 
-function toTaskRecord(row: TaskTable): TaskRecord {
+function toTaskRecord(row: import("kysely").Selectable<TaskTable>): TaskRecord {
   return {
+    version: Number(row.version),
     id: row.id as TaskPublicId,
     workspaceId: row.workspace_id as WorkspaceId,
     projectId: row.project_id as ProjectId | null,
@@ -242,6 +243,7 @@ export function createKyselyRepositories(
   executor: DbExecutor,
   mapError: (error: unknown) => never,
   assertActive?: () => void,
+  postgres = false,
 ): TransactionRepositories {
   const workspaces: WorkspaceRepository = {
     async create(input: CreateWorkspaceInput): Promise<WorkspaceRecord> {
@@ -707,6 +709,7 @@ export function createKyselyRepositories(
           executor
             .insertInto("tasks")
             .values({
+              version: 1,
               id: input.id,
               workspace_id: input.workspaceId,
               project_id: input.projectId,
@@ -730,13 +733,14 @@ export function createKyselyRepositories(
       return toTaskRecord(row);
     },
 
-    async findById(id: TaskPublicId): Promise<TaskRecord | null> {
+    async findById(id: TaskPublicId, forUpdate=false): Promise<TaskRecord | null> {
       const row = await runQuery(
         () =>
           executor
             .selectFrom("tasks")
             .selectAll()
             .where("id", "=", id)
+            .$if(postgres && forUpdate, q=>q.forUpdate())
             .executeTakeFirst(),
         mapError,
         assertActive,
@@ -859,7 +863,7 @@ export function createKyselyRepositories(
         () =>
           executor
             .updateTable("tasks")
-            .set(patch)
+            .set({...patch,version:sql<number>`version + 1`})
             .where("id", "=", id)
             .returningAll()
             .executeTakeFirst(),
@@ -944,7 +948,183 @@ export function createKyselyRepositories(
     },
   };
 
+  const automation: TransactionRepositories["automation"] = {
+    async rules(project) {
+      const rows = await runQuery(
+        () =>
+          executor
+            .selectFrom("automation_rules")
+            .selectAll()
+            .where("project", "=", project)
+            .orderBy("rule")
+            .execute(),
+        mapError,
+        assertActive,
+      );
+      return rows.map((r) => ({
+        project,
+        rule: r.rule,
+        revision: r.revision,
+        delegation: r.delegation,
+        actor: r.actor as UserId,
+        enabled: !!r.enabled,
+        definition: JSON.parse(r.definition),
+      }));
+    },
+    async save(rule, expected) {
+      const values = {
+        revision: rule.revision,
+        delegation: rule.delegation,
+        actor: rule.actor,
+        enabled: Number(rule.enabled),
+        definition: JSON.stringify(rule.definition),
+      };
+      if (!expected) {
+        const row = await runQuery(
+          () =>
+            executor
+              .insertInto("automation_rules")
+              .values({ ...values, project: rule.project, rule: rule.rule })
+              .onConflict((c) => c.columns(["project", "rule"]).doNothing())
+              .returning("rule")
+              .executeTakeFirst(),
+          mapError,
+          assertActive,
+        );
+        return !!row;
+      }
+      const row = await runQuery(
+        () =>
+          executor
+            .updateTable("automation_rules")
+            .set(values)
+            .where("project", "=", rule.project)
+            .where("rule", "=", rule.rule)
+            .where("revision", "=", expected)
+            .returning("rule")
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return !!row;
+    },
+    async enqueue(d, reason) {
+      await runQuery(
+        () =>
+          executor
+            .insertInto("automation_deliveries")
+            .values({
+              workspace: d.organization,
+              project: d.project,
+              rule: d.rule,
+              event: d.event,
+              envelope: JSON.stringify(d),
+              reason,
+              run: null,
+              token: null,
+              expires: null,
+            })
+            .execute(),
+        mapError,
+        assertActive,
+      );
+    },
+    async claim(workspace, token, now, expires) {
+      const row = await runQuery(
+        () =>
+          executor
+            .selectFrom("automation_deliveries")
+            .selectAll()
+            .where("workspace", "=", workspace)
+            .where("run", "is", null)
+            .where("reason", "is", null)
+            .where((eb) => eb.or([eb("expires", "is", null), eb("expires", "<=", now)]))
+            .orderBy("event")
+            .orderBy("rule")
+            .limit(1)
+            .$if(postgres, (q) => q.forUpdate().skipLocked())
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      if (!row) return null;
+      await runQuery(
+        () =>
+          executor
+            .updateTable("automation_deliveries")
+            .set({ token, expires })
+            .where("event", "=", row.event)
+            .where("rule", "=", row.rule)
+            .execute(),
+        mapError,
+        assertActive,
+      );
+      return JSON.parse(row.envelope);
+    },
+    async confirm(d, token, run, now) {
+      const row = await runQuery(
+        () =>
+          executor
+            .updateTable("automation_deliveries")
+            .set({ run, token: null, expires: null })
+            .where("workspace", "=", d.organization)
+            .where("event", "=", d.event)
+            .where("rule", "=", d.rule)
+            .where("token", "=", token)
+            .where("expires", ">", now)
+            .returning("run")
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return !!row;
+    },
+    async firstCheck(d, run, status) {
+      return !!(await runQuery(
+        () =>
+          executor
+            .insertInto("automation_checks")
+            .values({ event: d.event, rule: d.rule, run, status })
+            .onConflict((c) => c.columns(["event", "rule", "run", "status"]).doNothing())
+            .returning("event")
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      ));
+    },
+    async intent(workspace, event, rule) {
+      const row = await runQuery(
+        () =>
+          executor
+            .selectFrom("automation_deliveries")
+            .select("envelope")
+            .where("workspace", "=", workspace)
+            .where("event", "=", event)
+            .where("rule", "=", rule)
+            .where("reason", "is", null)
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return row ? JSON.parse(row.envelope) : null;
+    },
+    async lookup(workspace, run) {
+      const row = await runQuery(
+        () =>
+          executor
+            .selectFrom("automation_deliveries")
+            .select("envelope")
+            .where("workspace", "=", workspace)
+            .where("run", "=", run)
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return row ? JSON.parse(row.envelope) : null;
+    },
+  };
   return {
+    automation,
     workspaces,
     workspaceSettings,
     users,

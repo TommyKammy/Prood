@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Review automation · Prood</title>
+    <link rel="stylesheet" href="/shell.css" />
+    <script type="module" src="/automation/review.js"></script>
+  </head>
+  <body>
+    <main>
+      <h1>Review automation</h1>
+      <form id="rule-form">
+        <p>
+          <label>Project ID <input name="project" required /></label>
+        </p>
+        <p>
+          <label>Rule ID <input name="rule" required pattern="[A-Za-z0-9_\-]+" /></label>
+        </p>
+        <p>
+          <label
+            >Current revision (0 for a new rule)
+            <input name="revision" type="number" min="0" value="0" required
+          /></label>
+        </p>
+        <p>
+          <label
+            >Rule definition (JSON)<br /><textarea
+              name="definition"
+              rows="8"
+              cols="50"
+              required
+            >
+{"when":"manual","action":{"field":"assigneeId","value":null}}</textarea
+            >
+          </label>
+        </p>
+        <button>Preview rule</button>
+      </form>
+      <section id="confirmation" hidden>
+        <h2>Confirm delegation</h2>
+        <dl id="summary"></dl>
+        <button id="publish">Delegate and publish</button>
+      </section>
+      <p id="feedback" role="status"></p>
+    </main>
+  </body>
+</html>

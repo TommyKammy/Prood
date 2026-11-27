@@ -108,6 +108,18 @@ export function mountWebShellAssets(rootApp: Hono, customWebDistDir?: string): v
     isHtml: boolean;
   }> = [
     {
+      route: "/automation/review",
+      file: "automation.html",
+      contentType: "text/html; charset=utf-8",
+      isHtml: true,
+    },
+    {
+      route: "/automation/review.js",
+      file: "automation.js",
+      contentType: "text/javascript; charset=utf-8",
+      isHtml: false,
+    },
+    {
       route: "/",
       file: "index.html",
       contentType: "text/html; charset=utf-8",

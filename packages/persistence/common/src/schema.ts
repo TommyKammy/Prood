@@ -114,6 +114,7 @@ export interface ProjectStatusTable {
 }
 
 export interface TaskTable {
+  version: import("kysely").Generated<number>;
   id: string;
   workspace_id: string;
   project_id: string | null;
@@ -158,6 +159,27 @@ export interface OutboxEventTable {
 }
 
 export interface ProodDatabase {
+  automation_checks: { event: string; rule: string; run: string; status: string };
+  automation_rules: {
+    project: string;
+    rule: string;
+    revision: number;
+    delegation: number;
+    actor: string;
+    enabled: number;
+    definition: string;
+  };
+  automation_deliveries: {
+    workspace: string;
+    project: string;
+    event: string;
+    rule: string;
+    envelope: string;
+    token: string | null;
+    expires: string | null;
+    run: string | null;
+    reason: string | null;
+  };
   prood_schema_migrations: SchemaMigrationTable;
   workspaces: WorkspaceTable;
   workspace_settings: WorkspaceSettingsTable;

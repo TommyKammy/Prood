@@ -34,3 +34,5 @@ Measured on 2026-11-27 (macOS arm64, Apple M3 Ultra, Node.js v22.23.0) after `pn
 - `shell.js`: `17,309` bytes raw (`5,118` bytes gzip level-9)
 - `shell.css`: `3,325` bytes raw (`979` bytes gzip level-9)
 - Total: `20,974` bytes raw (`6,318` bytes gzip level-9)
+
+The Phase 8 rule review page is a separate HTML/JS entry point at `/automation/review`. The common shell does not import its script or the Draflow runtime.
