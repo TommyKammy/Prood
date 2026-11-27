@@ -21,6 +21,7 @@
     "@prood/application": "workspace:*",
     "@prood/contracts": "workspace:*",
     "@prood/domain": "workspace:*",
+    "@prood/integration-better-auth": "workspace:*",
     "@prood/persistence-common": "workspace:*",
     "@prood/persistence-postgres": "workspace:*",
     "@prood/persistence-sqlite": "workspace:*",

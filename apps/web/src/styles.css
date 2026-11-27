@@ -1,19 +1,25 @@
 :root {
   color-scheme: light dark;
   --prood-bg: #ffffff;
+  --prood-surface: #ffffff;
   --prood-fg: #111827;
   --prood-muted: #6b7280;
   --prood-border: #e5e7eb;
   --prood-accent: #1d4ed8;
+  --prood-danger: #b91c1c;
+  --prood-danger-bg: #fef2f2;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
     --prood-bg: #0f172a;
+    --prood-surface: #111827;
     --prood-fg: #f8fafc;
     --prood-muted: #94a3b8;
     --prood-border: #1e293b;
     --prood-accent: #60a5fa;
+    --prood-danger: #fca5a5;
+    --prood-danger-bg: #450a0a;
   }
 }
 
@@ -49,6 +55,12 @@ body {
   font-size: 0.875rem;
 }
 
+.prood-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .prood-btn-primary {
   background: var(--prood-accent);
   color: #ffffff;
@@ -59,14 +71,102 @@ body {
   cursor: pointer;
 }
 
+.prood-btn-primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.prood-btn-secondary {
+  background: transparent;
+  color: var(--prood-fg);
+  border: 1px solid var(--prood-border);
+  border-radius: 6px;
+  padding: 0.45rem 0.85rem;
+  font-size: 0.875rem;
+  cursor: pointer;
+}
+
+.prood-btn-full {
+  width: 100%;
+}
+
 .prood-main {
   max-width: 960px;
   margin: 2rem auto;
   padding: 0 1.25rem;
 }
 
+.prood-login-wrap {
+  display: flex;
+  min-height: 55vh;
+  align-items: center;
+  justify-content: center;
+}
+
+.prood-login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  width: 100%;
+  max-width: 340px;
+  padding: 1.5rem;
+  border: 1px solid var(--prood-border);
+  border-radius: 8px;
+  background: var(--prood-surface);
+}
+
+.prood-login-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.prood-login-subtitle {
+  margin: 0.25rem 0 0;
+  font-size: 0.8125rem;
+  color: var(--prood-muted);
+}
+
+.prood-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.prood-label {
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.prood-input {
+  width: 100%;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--prood-border);
+  border-radius: 6px;
+  background: var(--prood-bg);
+  color: var(--prood-fg);
+  font-size: 0.875rem;
+}
+
+.prood-auth-feedback {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  background: var(--prood-danger-bg);
+  color: var(--prood-danger);
+  font-size: 0.8125rem;
+}
+
+.prood-identity-bar,
+.prood-section-heading,
 .prood-count {
   color: var(--prood-muted);
+  font-size: 0.875rem;
+}
+
+.prood-workspace-list {
+  margin: 0.5rem 0 1.25rem;
+  padding-left: 1.25rem;
   font-size: 0.875rem;
 }
 

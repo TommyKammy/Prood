@@ -5,7 +5,7 @@ import {
   createKyselyRepositories,
   executeWithTransientRetry,
   isPersistenceError,
-  type DatabaseClient,
+  type KyselyBackedDatabaseClient,
   type MigrationRunOptions,
   type MigrationRunResult,
   type ProodDatabase,
@@ -77,7 +77,7 @@ export async function dropPostgresSchema(
  */
 export function createPostgresDatabase(
   options: PostgresDatabaseOptions,
-): DatabaseClient {
+): KyselyBackedDatabaseClient {
   if (options.schema !== undefined && !VALID_PG_IDENTIFIER.test(options.schema)) {
     throw new RangeError(`Invalid PostgreSQL schema identifier: ${options.schema}`);
   }
@@ -175,6 +175,7 @@ export function createPostgresDatabase(
 
   return {
     driver: "postgres",
+    kysely: db,
     uow,
 
     async ping(): Promise<{ ok: true }> {

@@ -76,29 +76,56 @@ for (const file of collectFiles(resolve(rootDir, "packages/domain/src"), (f) => 
   }
 }
 
-// 3. contracts & application must not import node:*, DB drivers, Kysely, or persistence packages
-const coreForbidden = [/^node:/, "pg", "better-sqlite3", "kysely", /^@prood\/persistence-/];
+// 3. contracts & application must not import node:*, DB drivers, Kysely, Better Auth, or persistence packages
+const coreForbidden = [
+  /^node:/,
+  "pg",
+  "better-sqlite3",
+  "kysely",
+  "better-auth",
+  "@prood/integration-better-auth",
+  /^@prood\/persistence-/,
+];
 assertNoForbiddenImports(resolve(rootDir, "packages/contracts/src"), coreForbidden, "contracts");
 assertNoForbiddenImports(resolve(rootDir, "packages/application/src"), coreForbidden, "application");
 
 // 4. persistence/common must remain driver- and node-free (Cloudflare D1 portability)
 assertNoForbiddenImports(
   resolve(rootDir, "packages/persistence/common/src"),
-  [/^node:/, "pg", "better-sqlite3"],
+  [/^node:/, "pg", "better-sqlite3", "better-auth", "@prood/integration-better-auth"],
   "persistence-common",
 );
 
 // 5. apps/server/src/app.ts must remain Cloudflare Workers portable
 assertNoForbiddenImports(
   resolve(rootDir, "apps/server/src/app.ts"),
-  [/^node:/, "pg", "better-sqlite3", "kysely", "@prood/persistence-sqlite", "@prood/persistence-postgres", "@hono/node-server"],
+  [
+    /^node:/,
+    "pg",
+    "better-sqlite3",
+    "kysely",
+    "better-auth",
+    "@prood/integration-better-auth",
+    "@prood/persistence-sqlite",
+    "@prood/persistence-postgres",
+    "@hono/node-server",
+  ],
   "server-app",
 );
 
-// 6. apps/web/src/** must not import node:*, DB drivers, Kysely, persistence, or server
+// 6. apps/web/src/** must not import node:*, DB drivers, Kysely, Better Auth, persistence, or server
 assertNoForbiddenImports(
   resolve(rootDir, "apps/web/src"),
-  [/^node:/, "pg", "better-sqlite3", "kysely", /^@prood\/persistence-/, "@prood/server"],
+  [
+    /^node:/,
+    "pg",
+    "better-sqlite3",
+    "kysely",
+    "better-auth",
+    "@prood/integration-better-auth",
+    /^@prood\/persistence-/,
+    "@prood/server",
+  ],
   "web-src",
 );
 
@@ -109,12 +136,14 @@ if (webDistFiles.length === 0) {
 }
 const forbiddenBundleMarkers = [
   "better-sqlite3",
+  "better-auth",
   "pg-protocol",
   "kysely",
   "node:fs",
   "node:net",
   "DATABASE_URL",
   "PROOD_DB_URL",
+  "PROOD_AUTH_SECRET",
 ];
 for (const file of webDistFiles) {
   const contents = readFileSync(file, "utf8");

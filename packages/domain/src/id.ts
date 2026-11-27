@@ -14,6 +14,8 @@ export type EntityId<P extends PublicEntityPrefix> = `${P}_${string}`;
 
 export type TaskPublicId = EntityId<"tsk">;
 export type WorkspaceId = EntityId<"wks">;
+export type UserId = EntityId<"usr">;
+export type MembershipId = EntityId<"mbr">;
 
 const TIMESTAMP_LENGTH = 10;
 const RANDOM_LENGTH = 16;
