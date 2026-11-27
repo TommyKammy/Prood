@@ -58,6 +58,10 @@ export interface WorkUseCaseDeps {
 const MAX_PARENT_HOPS = 16;
 const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 function fail<T>(
   status: 400 | 401 | 403 | 404 | 409,
   code: ApiErrorCode,
@@ -212,7 +216,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
   async function resolveTaskEffectiveProject(
     repos: TransactionRepositories,
     task: TaskRecord,
-  ): Promise<ProjectRecord | null> {
+  ): Promise<{ project: ProjectRecord; depth: number } | null> {
     let current: TaskRecord | null = task;
     const visited = new Set<string>();
     for (let hop = 0; hop < MAX_PARENT_HOPS && current; hop += 1) {
@@ -221,7 +225,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         if (!project || project.workspaceId !== task.workspaceId) {
           return null;
         }
-        return project;
+        return { project, depth: hop };
       }
       if (!current.parentTaskId || visited.has(current.parentTaskId)) {
         return null;
@@ -272,16 +276,22 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       workspaceId: WorkspaceId,
       input: CreateProjectRequest,
     ): Promise<WorkUseCaseResult<ProjectResponse>> {
+      if (!isPlainObject(input)) {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
       const name = typeof input.name === "string" ? input.name.trim() : "";
       if (!name) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
       const kind = input.kind ?? "general";
-      if (!isValidProjectKind(kind)) {
+      if (typeof kind !== "string" || !isValidProjectKind(kind)) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
       const visibility = input.visibility ?? "workspace";
-      if (!isValidProjectVisibility(visibility)) {
+      if (typeof visibility !== "string" || !isValidProjectVisibility(visibility)) {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
+      if (input.description !== undefined && typeof input.description !== "string") {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
       const description =
@@ -427,35 +437,50 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       projectId: ProjectId,
       input: CreateTaskRequest,
     ): Promise<WorkUseCaseResult<TaskResponse>> {
+      if (!isPlainObject(input)) {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
       const title = typeof input.title === "string" ? input.title.trim() : "";
       if (!title) {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
+      if (input.description !== undefined && typeof input.description !== "string") {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
+      if (
+        input.inheritParentProject !== undefined &&
+        typeof input.inheritParentProject !== "boolean"
+      ) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
       if (
         input.parentTaskId !== undefined &&
         input.parentTaskId !== null &&
-        !isValidEntityId("tsk", input.parentTaskId)
+        (typeof input.parentTaskId !== "string" ||
+          !isValidEntityId("tsk", input.parentTaskId))
       ) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
       if (
         input.statusId !== undefined &&
         input.statusId !== null &&
-        !isValidEntityId("sts", input.statusId)
+        (typeof input.statusId !== "string" ||
+          !isValidEntityId("sts", input.statusId))
       ) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
       if (
         input.assigneeId !== undefined &&
         input.assigneeId !== null &&
-        !isValidEntityId("usr", input.assigneeId)
+        (typeof input.assigneeId !== "string" ||
+          !isValidEntityId("usr", input.assigneeId))
       ) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
       if (
         input.dueOn !== undefined &&
         input.dueOn !== null &&
-        !ISO_DATE_REGEX.test(input.dueOn)
+        (typeof input.dueOn !== "string" || !ISO_DATE_REGEX.test(input.dueOn))
       ) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
@@ -470,16 +495,27 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         }
 
         const parentTaskId = input.parentTaskId ?? null;
+        let parentDepth = 0;
         if (parentTaskId) {
           const parentTask = await repos.tasks.findById(parentTaskId);
           if (!parentTask) {
             return fail(404, "NOT_FOUND", "error.notFound");
           }
-          const parentProject = await resolveTaskEffectiveProject(repos, parentTask);
-          if (!parentProject || parentProject.id !== effectiveProject.id) {
+          const parentResolved = await resolveTaskEffectiveProject(repos, parentTask);
+          if (!parentResolved || parentResolved.project.id !== effectiveProject.id) {
             return fail(400, "VALIDATION_ERROR", "error.validation");
           }
-          effectiveProject = parentProject;
+          effectiveProject = parentResolved.project;
+          parentDepth = parentResolved.depth;
+        }
+
+        const storedProjectId =
+          parentTaskId && input.inheritParentProject !== false
+            ? null
+            : effectiveProject.id;
+
+        if (storedProjectId === null && parentDepth + 1 >= MAX_PARENT_HOPS) {
+          return fail(400, "VALIDATION_ERROR", "error.validation");
         }
 
         const role = await resolveActorProjectRole(
@@ -526,11 +562,6 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
             return fail(400, "VALIDATION_ERROR", "error.validation");
           }
         }
-
-        const storedProjectId =
-          parentTaskId && input.inheritParentProject !== false
-            ? null
-            : effectiveProject.id;
 
         const nowIso = deps.clock.now().toISOString();
         const taskId = deps.idGenerator.next("tsk");
@@ -589,10 +620,11 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         if (!task) {
           return fail(404, "NOT_FOUND", "error.notFound");
         }
-        const effectiveProject = await resolveTaskEffectiveProject(repos, task);
-        if (!effectiveProject) {
+        const resolved = await resolveTaskEffectiveProject(repos, task);
+        if (!resolved) {
           return fail(404, "NOT_FOUND", "error.notFound");
         }
+        const effectiveProject = resolved.project;
 
         const role = await resolveActorProjectRole(
           repos,
@@ -691,30 +723,48 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       taskId: TaskPublicId,
       patch: UpdateTaskRequest & Record<string, unknown>,
     ): Promise<WorkUseCaseResult<TaskResponse>> {
+      if (!isPlainObject(patch)) {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
       if ("id" in patch && patch.id !== undefined) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
-      if (patch.title !== undefined && patch.title.trim() === "") {
+      if (
+        patch.title !== undefined &&
+        (typeof patch.title !== "string" || patch.title.trim() === "")
+      ) {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
+      if (patch.description !== undefined && typeof patch.description !== "string") {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
       if (
         patch.statusId !== undefined &&
         patch.statusId !== null &&
-        !isValidEntityId("sts", patch.statusId)
+        (typeof patch.statusId !== "string" ||
+          !isValidEntityId("sts", patch.statusId))
       ) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
       if (
         patch.assigneeId !== undefined &&
         patch.assigneeId !== null &&
-        !isValidEntityId("usr", patch.assigneeId)
+        (typeof patch.assigneeId !== "string" ||
+          !isValidEntityId("usr", patch.assigneeId))
       ) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
       if (
         patch.dueOn !== undefined &&
         patch.dueOn !== null &&
-        !ISO_DATE_REGEX.test(patch.dueOn)
+        (typeof patch.dueOn !== "string" || !ISO_DATE_REGEX.test(patch.dueOn))
+      ) {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
+      if (
+        patch.completedAt !== undefined &&
+        patch.completedAt !== null &&
+        typeof patch.completedAt !== "string"
       ) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
@@ -724,13 +774,11 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         if (!existing) {
           return fail(404, "NOT_FOUND", "error.notFound");
         }
-        const effectiveProject = await resolveTaskEffectiveProject(
-          repos,
-          existing,
-        );
-        if (!effectiveProject) {
+        const resolved = await resolveTaskEffectiveProject(repos, existing);
+        if (!resolved) {
           return fail(404, "NOT_FOUND", "error.notFound");
         }
+        const effectiveProject = resolved.project;
 
         const role = await resolveActorProjectRole(
           repos,
@@ -805,6 +853,9 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
             projectId: effectiveProject.id,
             changes: {
               ...(patch.title !== undefined ? { title: updated.title } : {}),
+              ...(patch.description !== undefined
+                ? { description: updated.description }
+                : {}),
               ...(patch.statusId !== undefined ? { statusId: updated.statusId } : {}),
               ...(patch.assigneeId !== undefined
                 ? { assigneeId: updated.assigneeId }

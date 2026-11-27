@@ -153,20 +153,46 @@ export function createApp(deps: AppDeps): Hono {
       return session;
     }
 
-    async function resolveActor(
+    async function resolveActorOrRespond(
+      c: Context,
       session: AuthSessionInfo,
-    ): Promise<AuditActorContext> {
-      const user = await identityUseCases!.resolveProodUser(session);
-      return {
-        userId: user.id,
-        actorType: "user",
-        channel: "web",
-      };
+    ): Promise<
+      { ok: true; actor: AuditActorContext } | { ok: false; response: Response }
+    > {
+      try {
+        const user = await identityUseCases!.resolveProodUser(session);
+        return {
+          ok: true,
+          actor: {
+            userId: user.id,
+            actorType: "user",
+            channel: "web",
+          },
+        };
+      } catch (error) {
+        if (isEmailVerificationRequiredError(error)) {
+          await recordAuthFailure(c.req.path, "EMAIL_VERIFICATION_REQUIRED");
+          return {
+            ok: false,
+            response: c.json(
+              errorBody("FORBIDDEN", "error.emailVerificationRequired"),
+              403,
+            ),
+          };
+        }
+        throw error;
+      }
     }
 
-    async function parseJsonBody<T>(c: Context): Promise<T | null> {
+    async function parseJsonBody<T extends Record<string, unknown>>(
+      c: Context,
+    ): Promise<T | null> {
       try {
-        return (await c.req.json()) as T;
+        const parsed = (await c.req.json()) as unknown;
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          return null;
+        }
+        return parsed as T;
       } catch {
         return null;
       }
@@ -252,26 +278,23 @@ export function createApp(deps: AppDeps): Hono {
       if (!isValidEntityId("wks", workspaceId)) {
         return c.json(errorBody("NOT_FOUND", "error.notFound"), 404);
       }
-      const body = await parseJsonBody<CreateProjectRequest>(c);
+      const body = await parseJsonBody<CreateProjectRequest & Record<string, unknown>>(c);
       if (!body) {
         return c.json(errorBody("VALIDATION_ERROR", "error.validation"), 400);
       }
-      try {
-        const actor = await resolveActor(session);
-        const result = await workUseCases.createProject(actor, workspaceId, body);
-        if (!result.ok) {
-          return c.json(errorBody(result.code, result.messageKey), result.status);
-        }
-        return c.json(result.data, 201);
-      } catch (error) {
-        if (isEmailVerificationRequiredError(error)) {
-          return c.json(
-            errorBody("FORBIDDEN", "error.emailVerificationRequired"),
-            403,
-          );
-        }
-        throw error;
+      const actorResult = await resolveActorOrRespond(c, session);
+      if (!actorResult.ok) {
+        return actorResult.response;
       }
+      const result = await workUseCases.createProject(
+        actorResult.actor,
+        workspaceId,
+        body,
+      );
+      if (!result.ok) {
+        return c.json(errorBody(result.code, result.messageKey), result.status);
+      }
+      return c.json(result.data, 201);
     });
 
     app.get("/api/v1/workspaces/:workspaceId/projects", async (c) => {
@@ -287,8 +310,11 @@ export function createApp(deps: AppDeps): Hono {
       if (!isValidEntityId("wks", workspaceId)) {
         return c.json(errorBody("FORBIDDEN", "error.forbidden"), 403);
       }
-      const actor = await resolveActor(session);
-      const result = await workUseCases.listProjects(actor, workspaceId);
+      const actorResult = await resolveActorOrRespond(c, session);
+      if (!actorResult.ok) {
+        return actorResult.response;
+      }
+      const result = await workUseCases.listProjects(actorResult.actor, workspaceId);
       return sendWorkResult(c, result);
     });
 
@@ -305,12 +331,15 @@ export function createApp(deps: AppDeps): Hono {
       if (!isValidEntityId("prj", projectId)) {
         return c.json(errorBody("NOT_FOUND", "error.notFound"), 404);
       }
-      const body = await parseJsonBody<CreateTaskRequest>(c);
+      const body = await parseJsonBody<CreateTaskRequest & Record<string, unknown>>(c);
       if (!body) {
         return c.json(errorBody("VALIDATION_ERROR", "error.validation"), 400);
       }
-      const actor = await resolveActor(session);
-      const result = await workUseCases.createTask(actor, projectId, body);
+      const actorResult = await resolveActorOrRespond(c, session);
+      if (!actorResult.ok) {
+        return actorResult.response;
+      }
+      const result = await workUseCases.createTask(actorResult.actor, projectId, body);
       if (!result.ok) {
         return c.json(errorBody(result.code, result.messageKey), result.status);
       }
@@ -330,8 +359,11 @@ export function createApp(deps: AppDeps): Hono {
       if (!isValidEntityId("prj", projectId)) {
         return c.json(errorBody("NOT_FOUND", "error.notFound"), 404);
       }
-      const actor = await resolveActor(session);
-      const result = await workUseCases.listProjectTasks(actor, projectId);
+      const actorResult = await resolveActorOrRespond(c, session);
+      if (!actorResult.ok) {
+        return actorResult.response;
+      }
+      const result = await workUseCases.listProjectTasks(actorResult.actor, projectId);
       return sendWorkResult(c, result);
     });
 
@@ -348,8 +380,11 @@ export function createApp(deps: AppDeps): Hono {
       if (!isValidEntityId("tsk", taskId)) {
         return c.json(errorBody("NOT_FOUND", "error.notFound"), 404);
       }
-      const actor = await resolveActor(session);
-      const result = await workUseCases.getTask(actor, taskId);
+      const actorResult = await resolveActorOrRespond(c, session);
+      if (!actorResult.ok) {
+        return actorResult.response;
+      }
+      const result = await workUseCases.getTask(actorResult.actor, taskId);
       return sendWorkResult(c, result);
     });
 
@@ -370,8 +405,11 @@ export function createApp(deps: AppDeps): Hono {
       if (!body) {
         return c.json(errorBody("VALIDATION_ERROR", "error.validation"), 400);
       }
-      const actor = await resolveActor(session);
-      const result = await workUseCases.updateTask(actor, taskId, body);
+      const actorResult = await resolveActorOrRespond(c, session);
+      if (!actorResult.ok) {
+        return actorResult.response;
+      }
+      const result = await workUseCases.updateTask(actorResult.actor, taskId, body);
       return sendWorkResult(c, result);
     });
   }

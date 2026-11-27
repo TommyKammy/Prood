@@ -759,4 +759,165 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
       ),
     ).toBe(true);
   });
+
+  it("enforces subtask depth limit, validates runtime patch types, records description updates, and handles unverified email across work routes", async () => {
+    const ctx = await createIsolatedDb();
+    const db = ctx.openClient();
+    await db.migrate();
+    const ids = createSystemIdGenerator();
+    const harness = createServerHarness(db);
+
+    const wksId = ids.next("wks");
+    const preUserId = ids.next("usr");
+    const now = "2026-11-27T13:30:00.000Z";
+    await db.uow.run(async (repos) => {
+      await repos.workspaces.create({
+        id: wksId,
+        slug: "hardening-ws",
+        name: "Hardening Workspace",
+        createdAt: now,
+      });
+      await repos.users.create({
+        id: preUserId,
+        email: "pre-existing@example.com",
+        displayName: "Pre Existing",
+        createdAt: now,
+      });
+    });
+
+    const owner = await harness.signUpUser("owner-depth@example.com", "Owner");
+    await db.uow.run((repos) =>
+      repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: owner.userId,
+        role: "admin",
+        createdAt: now,
+      }),
+    );
+
+    const projRes = await harness.request(`/api/v1/workspaces/${wksId}/projects`, {
+      method: "POST",
+      cookieHeader: owner.jar.toHeader(),
+      json: { name: "Depth Test Project", kind: "general", visibility: "workspace" },
+    });
+    expect(projRes.status).toBe(201);
+    const project = ((await projRes.json()) as ProjectResponse).project;
+
+    // 1. Subtask depth limit: root (depth 0) + 15 inherited levels (depth 1..15) succeed and remain readable
+    let parentId: string | undefined;
+    for (let level = 0; level < 16; level += 1) {
+      const res = await harness.request(`/api/v1/projects/${project.id}/tasks`, {
+        method: "POST",
+        cookieHeader: owner.jar.toHeader(),
+        json: {
+          title: `Level ${level}`,
+          ...(parentId ? { parentTaskId: parentId } : {}),
+        },
+      });
+      expect(res.status).toBe(201);
+      parentId = ((await res.json()) as TaskResponse).task.id;
+    }
+    expect((await harness.request(`/api/v1/tasks/${parentId}`, { cookieHeader: owner.jar.toHeader() })).status).toBe(200);
+
+    // Level 16 (depth 16, exceeding MAX_PARENT_HOPS=16) must be rejected with 400
+    const tooDeepRes = await harness.request(`/api/v1/projects/${project.id}/tasks`, {
+      method: "POST",
+      cookieHeader: owner.jar.toHeader(),
+      json: { title: "Level 16 too deep", parentTaskId: parentId },
+    });
+    expect(tooDeepRes.status).toBe(400);
+    expect(((await tooDeepRes.json()) as ApiErrorResponse).error.code).toBe("VALIDATION_ERROR");
+
+    // 2. Runtime JSON / patch type validation -> 400 VALIDATION_ERROR (never 500)
+    const rootList = ((await (
+      await harness.request(`/api/v1/projects/${project.id}/tasks`, {
+        cookieHeader: owner.jar.toHeader(),
+      })
+    ).json()) as TaskListResponse).tasks;
+    const targetTaskId = rootList[0]!.id;
+
+    for (const invalidPatch of [
+      { title: 123 },
+      { title: null },
+      { description: 42 },
+      "primitive-body",
+    ]) {
+      const badPatchRes = await harness.request(`/api/v1/tasks/${targetTaskId}`, {
+        method: "PATCH",
+        cookieHeader: owner.jar.toHeader(),
+        json: invalidPatch,
+      });
+      expect(badPatchRes.status).toBe(400);
+      expect(((await badPatchRes.json()) as ApiErrorResponse).error.code).toBe(
+        "VALIDATION_ERROR",
+      );
+    }
+
+    // 3. Description-only PATCH records `description` inside `task.updated` outbox `changes`
+    const descUpdateRes = await harness.request(`/api/v1/tasks/${targetTaskId}`, {
+      method: "PATCH",
+      cookieHeader: owner.jar.toHeader(),
+      json: { description: "Updated audit description" },
+    });
+    expect(descUpdateRes.status).toBe(200);
+    expect(((await descUpdateRes.json()) as TaskResponse).task.description).toBe(
+      "Updated audit description",
+    );
+
+    const wsOutbox = await db.uow.run((repos) => repos.outbox.listByWorkspace(wksId));
+    const latestUpdate = wsOutbox.filter((e) => e.eventType === "task.updated").pop();
+    expect(latestUpdate?.payload.changes).toEqual({
+      description: "Updated audit description",
+    });
+
+    // 4. Unverified sign-up session sharing pre-existing email returns 403 error.emailVerificationRequired across all work routes
+    const unverifiedJar = new CookieJar();
+    const signupRes = await harness.request("/api/auth/sign-up/email", {
+      method: "POST",
+      json: {
+        email: "pre-existing@example.com",
+        password: "hijack-password-123",
+        name: "Unverified",
+      },
+    });
+    expect(signupRes.status).toBe(200);
+    unverifiedJar.updateFrom(signupRes);
+
+    for (const reqSpec of [
+      { path: `/api/v1/workspaces/${wksId}/projects`, method: "GET" as const },
+      {
+        path: `/api/v1/workspaces/${wksId}/projects`,
+        method: "POST" as const,
+        json: { name: "Blocked" },
+      },
+      { path: `/api/v1/projects/${project.id}/tasks`, method: "GET" as const },
+      {
+        path: `/api/v1/projects/${project.id}/tasks`,
+        method: "POST" as const,
+        json: { title: "Blocked" },
+      },
+      { path: `/api/v1/tasks/${targetTaskId}`, method: "GET" as const },
+      {
+        path: `/api/v1/tasks/${targetTaskId}`,
+        method: "PATCH" as const,
+        json: { title: "Blocked" },
+      },
+    ]) {
+      const res = await harness.request(reqSpec.path, {
+        method: reqSpec.method,
+        cookieHeader: unverifiedJar.toHeader(),
+        json: reqSpec.json,
+      });
+      expect(res.status).toBe(403);
+      expect(((await res.json()) as ApiErrorResponse).error.messageKey).toBe(
+        "error.emailVerificationRequired",
+      );
+    }
+
+    const allEvents = await db.uow.run((repos) => repos.outbox.listAll());
+    expect(
+      allEvents.filter((e) => e.reasonCode === "EMAIL_VERIFICATION_REQUIRED").length,
+    ).toBeGreaterThanOrEqual(6);
+  });
 });
