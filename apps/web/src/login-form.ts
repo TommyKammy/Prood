@@ -125,6 +125,7 @@ export class ProodLoginFormElement extends BaseElement {
     try {
       const res = await fetch("/api/auth/sign-in/email", {
         method: "POST",
+        credentials: "same-origin",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: this.email, password: this.password }),
       });

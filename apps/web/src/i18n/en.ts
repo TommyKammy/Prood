@@ -16,6 +16,8 @@ export const enMessages = {
   "auth.signInButton": "Sign in",
   "auth.signingIn": "Signing in...",
   "auth.signOutButton": "Sign out",
+  "auth.signingOut": "Signing out...",
+  "auth.signOutFailed": "Unable to sign out. Please try again.",
   "auth.invalidCredentials": "Invalid email or password.",
   "auth.networkError": "Network error. Your input has been preserved; please try again.",
   "auth.workspacesHeading": "Workspaces",

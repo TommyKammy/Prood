@@ -5,10 +5,14 @@ import { ProodLoginFormElement } from "./login-form.js";
 const BaseElement =
   typeof HTMLElement !== "undefined" ? HTMLElement : (class {} as typeof HTMLElement);
 
+export type ShellAuthState = "loading" | "authenticated" | "unauthenticated";
+
 export class ProodShellElement extends BaseElement {
   private i18n: I18nInstance = createI18n();
   private sessionProfile: MeResponse | null = null;
-  private authState: "loading" | "authenticated" | "unauthenticated" = "loading";
+  private authState: ShellAuthState = "loading";
+  private signingOut = false;
+  private signOutError = "";
 
   connectedCallback(): void {
     this.addEventListener("prood-authenticated", () => {
@@ -22,6 +26,14 @@ export class ProodShellElement extends BaseElement {
     this.render();
   }
 
+  getAuthState(): ShellAuthState {
+    return this.authState;
+  }
+
+  getSignOutError(): string {
+    return this.signOutError;
+  }
+
   async refreshSession(): Promise<void> {
     if (typeof fetch === "undefined") {
       return;
@@ -31,6 +43,7 @@ export class ProodShellElement extends BaseElement {
       if (res.ok) {
         this.sessionProfile = (await res.json()) as MeResponse;
         this.authState = "authenticated";
+        this.signOutError = "";
       } else {
         this.sessionProfile = null;
         this.authState = "unauthenticated";
@@ -42,15 +55,32 @@ export class ProodShellElement extends BaseElement {
     this.render();
   }
 
-  private async signOut(): Promise<void> {
+  async signOut(): Promise<boolean> {
+    if (typeof fetch === "undefined" || this.signingOut) {
+      return false;
+    }
+    this.signingOut = true;
+    this.signOutError = "";
+    this.render();
+
     try {
-      await fetch("/api/auth/sign-out", {
+      const res = await fetch("/api/auth/sign-out", {
         method: "POST",
         credentials: "same-origin",
       });
+      if (res.ok || res.status === 401) {
+        this.sessionProfile = null;
+        this.authState = "unauthenticated";
+        this.signOutError = "";
+        return true;
+      }
+      this.signOutError = this.i18n.t("auth.signOutFailed");
+      return false;
+    } catch {
+      this.signOutError = this.i18n.t("auth.signOutFailed");
+      return false;
     } finally {
-      this.sessionProfile = null;
-      this.authState = "unauthenticated";
+      this.signingOut = false;
       this.render();
     }
   }
@@ -88,7 +118,10 @@ export class ProodShellElement extends BaseElement {
       const signOutBtn = document.createElement("button");
       signOutBtn.type = "button";
       signOutBtn.className = "prood-btn-secondary";
-      signOutBtn.textContent = t("auth.signOutButton");
+      signOutBtn.disabled = this.signingOut;
+      signOutBtn.textContent = this.signingOut
+        ? t("auth.signingOut")
+        : t("auth.signOutButton");
       signOutBtn.addEventListener("click", () => {
         void this.signOut();
       });
@@ -115,6 +148,15 @@ export class ProodShellElement extends BaseElement {
     }
 
     if (this.authState === "authenticated" && this.sessionProfile) {
+      if (this.signOutError) {
+        const errorBanner = document.createElement("p");
+        errorBanner.className = "prood-auth-feedback";
+        errorBanner.setAttribute("role", "alert");
+        errorBanner.setAttribute("data-signout-error", "");
+        errorBanner.textContent = this.signOutError;
+        main.appendChild(errorBanner);
+      }
+
       const identityBar = document.createElement("p");
       identityBar.className = "prood-identity-bar";
       identityBar.textContent = t("auth.signedInAs", {
