@@ -54,8 +54,16 @@ export function createI18n(options: I18nOptions = {}): I18nInstance {
   let currentLocale: LocaleCode = normalizeLocaleTag(options.locale ?? DEFAULT_LOCALE);
   const catalogs: Record<string, PartialMessageCatalog> = {
     en: enMessages,
-    ...(options.catalogs ?? {}),
   };
+  if (options.catalogs) {
+    for (const [rawKey, catalog] of Object.entries(options.catalogs)) {
+      const canonicalKey = normalizeLocaleTag(rawKey);
+      catalogs[canonicalKey] = {
+        ...(catalogs[canonicalKey] ?? {}),
+        ...catalog,
+      };
+    }
+  }
 
   function findCatalog(
     locale: string,

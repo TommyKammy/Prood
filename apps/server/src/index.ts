@@ -32,11 +32,17 @@ export function resolveServerConfig(
     throw new RangeError(`Invalid PORT: ${rawPort}`);
   }
 
-  const hostname = env.HOST?.trim() || "127.0.0.1";
-  const baseURL = (env.PROOD_BASE_URL ?? `http://${hostname}:${port}`).replace(
+  const rawHost = env.HOST?.trim() || "127.0.0.1";
+  const hostname =
+    rawHost.startsWith("[") && rawHost.endsWith("]")
+      ? rawHost.slice(1, -1)
+      : rawHost;
+  const urlHost = hostname.includes(":") ? `[${hostname}]` : hostname;
+  const baseURL = (env.PROOD_BASE_URL ?? `http://${urlHost}:${port}`).replace(
     /\/+$/,
     "",
   );
+  new URL(baseURL);
   const mcpResource = `${baseURL}/mcp`;
 
   const rawSecret = env.PROOD_AUTH_SECRET;
@@ -152,6 +158,65 @@ export function mountWebShellAssets(rootApp: Hono, customWebDistDir?: string): v
   }
 }
 
+export interface ShutdownServerOptions {
+  server: {
+    close(callback: () => void): unknown;
+    closeIdleConnections?: () => void;
+    closeAllConnections?: () => void;
+  };
+  closeMcp?: () => Promise<void>;
+  closeDb: () => Promise<void>;
+  timeoutMs?: number;
+}
+
+/**
+ * Initiates HTTP closure, terminates active MCP SSE streams so server.close()
+ * can drain cleanly, enforces a bounded fallback timeout, and closes the DB.
+ */
+export async function shutdownServerResources(
+  options: ShutdownServerOptions,
+): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? 5000;
+  const serverClosed = new Promise<void>((resolveClose) => {
+    options.server.close(() => resolveClose());
+  });
+
+  if (options.closeMcp) {
+    await Promise.allSettled([options.closeMcp()]);
+  }
+  options.server.closeIdleConnections?.();
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  try {
+    await Promise.race([
+      serverClosed,
+      new Promise<void>((resolveTimeout) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          options.server.closeAllConnections?.();
+          resolveTimeout();
+        }, timeoutMs);
+        if (typeof timer === "object" && "unref" in timer) {
+          timer.unref();
+        }
+      }),
+    ]);
+    if (timedOut) {
+      await Promise.race([
+        serverClosed,
+        new Promise<void>((r) => setTimeout(r, 50)),
+      ]);
+    }
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+
+  await Promise.allSettled([options.closeDb()]);
+}
+
 export async function startNodeServer(): Promise<void> {
   const config = resolveServerConfig();
   const db = selectDatabaseClient();
@@ -205,10 +270,11 @@ export async function startNodeServer(): Promise<void> {
       return;
     }
     shuttingDown = true;
-    await new Promise<void>((resolveClose) => {
-      server.close(() => resolveClose());
+    await shutdownServerResources({
+      server,
+      closeMcp: mcpHandler.close,
+      closeDb: () => db.close(),
     });
-    await Promise.allSettled([mcpHandler.close?.(), db.close()]);
   };
 
   process.once("SIGINT", () => {

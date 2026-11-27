@@ -94,5 +94,17 @@ describe("@prood/web i18n", () => {
 
     invalid.setLocale("");
     expect(invalid.getLocale()).toBe("en");
+
+    // Noncanonical catalog keys are canonicalized alongside locale
+    const portuguese = createI18n({
+      locale: "pt-br",
+      catalogs: {
+        "pt-br": {
+          "action.createTask": "Criar tarefa",
+        },
+      },
+    });
+    expect(portuguese.getLocale()).toBe("pt-BR");
+    expect(portuguese.t("action.createTask")).toBe("Criar tarefa");
   });
 });

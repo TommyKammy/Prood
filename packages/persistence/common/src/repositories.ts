@@ -157,7 +157,8 @@ export function createKyselyRepositories(
           executor
             .selectFrom("workspaces")
             .selectAll()
-            .where("slug", "=", normalized)
+            .where((eb) => eb(eb.fn<string>("lower", ["slug"]), "=", normalized))
+            .orderBy("id", "asc")
             .executeTakeFirst(),
         mapError,
         assertActive,
@@ -254,7 +255,8 @@ export function createKyselyRepositories(
           executor
             .selectFrom("users")
             .selectAll()
-            .where("email", "=", normalized)
+            .where((eb) => eb(eb.fn<string>("lower", ["email"]), "=", normalized))
+            .orderBy("id", "asc")
             .executeTakeFirst(),
         mapError,
         assertActive,

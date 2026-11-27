@@ -9,6 +9,7 @@ import {
   createApp,
   mountWebShellAssets,
   resolveServerConfig,
+  shutdownServerResources,
 } from "@prood/server";
 
 describe("@prood/server Web-Standard app", () => {
@@ -204,6 +205,66 @@ describe("@prood/server Web-Standard app", () => {
       hostname: "127.0.0.1",
       baseURL: "http://127.0.0.1:3000",
     });
+
+    // IPv6 host bracketing
+    const ipv6Cfg = resolveServerConfig({ HOST: "::1", PORT: "3000" });
+    expect(ipv6Cfg).toMatchObject({
+      port: 3000,
+      hostname: "::1",
+      baseURL: "http://[::1]:3000",
+      mcpResource: "http://[::1]:3000/mcp",
+    });
+    expect(() => new URL(ipv6Cfg.baseURL)).not.toThrow();
+    expect(resolveServerConfig({ HOST: "[::1]", PORT: "4000" })).toMatchObject({
+      hostname: "::1",
+      baseURL: "http://[::1]:4000",
+    });
+
+    // Shutdown closes MCP streams before HTTP server finishes draining
+    let closeCallback!: () => void;
+    const steps: string[] = [];
+    await shutdownServerResources({
+      server: {
+        close(cb) {
+          steps.push("server.close");
+          closeCallback = cb;
+        },
+        closeIdleConnections() {
+          steps.push("server.closeIdleConnections");
+        },
+      },
+      closeMcp: async () => {
+        steps.push("closeMcp");
+        closeCallback();
+      },
+      closeDb: async () => {
+        steps.push("closeDb");
+      },
+      timeoutMs: 500,
+    });
+    expect(steps).toEqual([
+      "server.close",
+      "closeMcp",
+      "server.closeIdleConnections",
+      "closeDb",
+    ]);
+
+    // Bounded shutdown fallback triggers closeAllConnections if a stream stalls
+    let forcedAll = false;
+    await shutdownServerResources({
+      server: {
+        close() {
+          // Intentionally never fires callback
+        },
+        closeAllConnections() {
+          forcedAll = true;
+        },
+      },
+      closeMcp: async () => {},
+      closeDb: async () => {},
+      timeoutMs: 20,
+    });
+    expect(forcedAll).toBe(true);
 
     // Static web asset security headers on /, /oauth/consent, /oauth/consent/
     const assetDir = mkdtempSync(join(tmpdir(), "prood-web-assets-"));

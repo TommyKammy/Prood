@@ -595,6 +595,40 @@ describe(`DB migrations, UnitOfWork, error mapping & concurrency (${targetDb})`,
     expect(normalizedLookup.workspace?.id).toBe(wksId);
     expect(normalizedLookup.user?.id).toBe(usrId);
 
+    // 5b. Pre-existing mixed-case records inserted prior to normalization remain reachable
+    const legacyWksId = ids.next("wks");
+    const legacyUsrId = ids.next("usr");
+    await db.kysely
+      .insertInto("workspaces")
+      .values({
+        id: legacyWksId,
+        slug: "Legacy-Mixed",
+        name: "Legacy Mixed Workspace",
+        created_at: now,
+        updated_at: now,
+      })
+      .execute();
+    await db.kysely
+      .insertInto("users")
+      .values({
+        id: legacyUsrId,
+        email: "Legacy.Mixed@Example.COM",
+        display_name: "Legacy Mixed User",
+        created_at: now,
+        updated_at: now,
+      })
+      .execute();
+    const legacyLookup = await db.uow.run(async (repos) => ({
+      wsExact: await repos.workspaces.findBySlug("Legacy-Mixed"),
+      wsLower: await repos.workspaces.findBySlug("legacy-mixed"),
+      usrExact: await repos.users.findByEmail("Legacy.Mixed@Example.COM"),
+      usrLower: await repos.users.findByEmail("legacy.mixed@example.com"),
+    }));
+    expect(legacyLookup.wsExact?.id).toBe(legacyWksId);
+    expect(legacyLookup.wsLower?.id).toBe(legacyWksId);
+    expect(legacyLookup.usrExact?.id).toBe(legacyUsrId);
+    expect(legacyLookup.usrLower?.id).toBe(legacyUsrId);
+
     // 6. Error mappers unwrap nested cause / AggregateError, classify CONNECTION_ERROR, and make PG 57014 non-retryable
     try {
       mapPostgresError(
