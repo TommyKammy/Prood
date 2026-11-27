@@ -25,7 +25,29 @@ describe("@prood/web i18n", () => {
 
     expect(i18n.t("action.createTask")).toBe("タスクを作成");
     expect(i18n.t("empty.tasks.title")).toBe("No tasks yet");
+    expect(i18n.formatTaskCount(1)).toBe("1件のタスク");
     expect(i18n.formatTaskCount(3)).toBe("3件のタスク");
+  });
+
+  it("applies English plural rules when count keys are missing or locale is unregistered", () => {
+    const jaWithoutCatalog = createI18n({ locale: "ja" });
+    expect(jaWithoutCatalog.formatTaskCount(0)).toBe("0 tasks");
+    expect(jaWithoutCatalog.formatTaskCount(1)).toBe("1 task");
+    expect(jaWithoutCatalog.formatTaskCount(2)).toBe("2 tasks");
+
+    const jaPartialWithoutCounts = createI18n({
+      locale: "ja",
+      catalogs: {
+        ja: {
+          "action.createTask": "タスクを作成",
+        },
+      },
+    });
+    expect(jaPartialWithoutCounts.formatTaskCount(1)).toBe("1 task");
+
+    const frUnregistered = createI18n({ locale: "fr" });
+    expect(frUnregistered.formatTaskCount(0)).toBe("0 tasks");
+    expect(frUnregistered.formatTaskCount(1)).toBe("1 task");
   });
 
   it("falls back to English when switched to an unregistered locale", () => {

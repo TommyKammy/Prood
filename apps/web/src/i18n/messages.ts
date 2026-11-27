@@ -82,10 +82,24 @@ export function createI18n(options: I18nOptions = {}): I18nInstance {
     },
 
     formatTaskCount(count: number): string {
-      const rule = new Intl.PluralRules(currentLocale).select(count);
-      const key: MessageKey = rule === "one" ? "task.count.one" : "task.count.other";
-      return interpolate(resolveTemplate(key), {
-        count: new Intl.NumberFormat(currentLocale).format(count),
+      const activeCatalog = catalogs[currentLocale];
+      if (activeCatalog) {
+        const activeRule = new Intl.PluralRules(currentLocale).select(count);
+        const activeKey: MessageKey =
+          activeRule === "one" ? "task.count.one" : "task.count.other";
+        const localizedTemplate = activeCatalog[activeKey];
+        if (localizedTemplate !== undefined) {
+          return interpolate(localizedTemplate, {
+            count: new Intl.NumberFormat(currentLocale).format(count),
+          });
+        }
+      }
+
+      const fallbackRule = new Intl.PluralRules(DEFAULT_LOCALE).select(count);
+      const fallbackKey: MessageKey =
+        fallbackRule === "one" ? "task.count.one" : "task.count.other";
+      return interpolate(enMessages[fallbackKey], {
+        count: new Intl.NumberFormat(DEFAULT_LOCALE).format(count),
       });
     },
   };

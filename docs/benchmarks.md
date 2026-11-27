@@ -23,6 +23,6 @@ PR 01 fixes the benchmark conditions and baseline transfer metrics so subsequent
 ### PR 01 — Common Web Shell Baseline
 Measured on 2026-11-27 (macOS arm64, Apple M3 Ultra, Node.js v22.23.0) after `pnpm build` via `pnpm measure:shell`:
 
-- `shell.js`: `3,024` bytes raw (`1,309` bytes gzip level-9)
+- `shell.js`: `3,207` bytes raw (`1,352` bytes gzip level-9)
 - `shell.css`: `1,340` bytes raw (`584` bytes gzip level-9)
-- Total: `4,364` bytes raw (`1,893` bytes gzip level-9)
+- Total: `4,547` bytes raw (`1,936` bytes gzip level-9)
