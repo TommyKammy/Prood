@@ -1,16 +1,34 @@
 import type { Kysely, Transaction } from "kysely";
 import type {
+  AuthIdentityRecord,
+  CreateMembershipInput,
+  CreateUserInput,
   CreateWorkspaceInput,
+  LinkAuthIdentityInput,
   TransactionRepositories,
   UpsertWorkspaceSettingsInput,
+  UserRecord,
+  UserRepository,
+  WorkspaceMembershipRecord,
+  WorkspaceMembershipRepository,
   WorkspaceRecord,
   WorkspaceRepository,
   WorkspaceSettingsRecord,
   WorkspaceSettingsRepository,
 } from "@prood/application";
-import type { LocaleCode, WorkspaceId } from "@prood/domain";
+import type { WorkspaceMembershipSummary } from "@prood/contracts";
 import type {
+  LocaleCode,
+  MembershipId,
+  UserId,
+  WorkspaceId,
+  WorkspaceRole,
+} from "@prood/domain";
+import type {
+  AuthIdentityTable,
   ProodDatabase,
+  UserTable,
+  WorkspaceMembershipTable,
   WorkspaceSettingsTable,
   WorkspaceTable,
 } from "./schema.js";
@@ -34,6 +52,38 @@ function toWorkspaceSettingsRecord(
     workspaceId: row.workspace_id as WorkspaceId,
     defaultLocale: row.default_locale as LocaleCode,
     devProjectsEnabled: Number(row.dev_projects_enabled) === 1,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toUserRecord(row: UserTable): UserRecord {
+  return {
+    id: row.id as UserId,
+    email: row.email,
+    displayName: row.display_name,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toAuthIdentityRecord(row: AuthIdentityTable): AuthIdentityRecord {
+  return {
+    authProvider: row.auth_provider,
+    authSubject: row.auth_subject,
+    userId: row.user_id as UserId,
+    createdAt: row.created_at,
+  };
+}
+
+function toWorkspaceMembershipRecord(
+  row: WorkspaceMembershipTable,
+): WorkspaceMembershipRecord {
+  return {
+    id: row.id as MembershipId,
+    workspaceId: row.workspace_id as WorkspaceId,
+    userId: row.user_id as UserId,
+    role: row.role as WorkspaceRole,
+    createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
@@ -166,5 +216,172 @@ export function createKyselyRepositories(
     },
   };
 
-  return { workspaces, workspaceSettings };
+  const users: UserRepository = {
+    async findById(id: UserId): Promise<UserRecord | null> {
+      const row = await runQuery(
+        () =>
+          executor
+            .selectFrom("users")
+            .selectAll()
+            .where("id", "=", id)
+            .executeTakeFirst(),
+        mapError,
+      );
+      return row ? toUserRecord(row) : null;
+    },
+
+    async findByEmail(email: string): Promise<UserRecord | null> {
+      const row = await runQuery(
+        () =>
+          executor
+            .selectFrom("users")
+            .selectAll()
+            .where("email", "=", email)
+            .executeTakeFirst(),
+        mapError,
+      );
+      return row ? toUserRecord(row) : null;
+    },
+
+    async findByAuthIdentity(
+      authProvider: string,
+      authSubject: string,
+    ): Promise<UserRecord | null> {
+      const row = await runQuery(
+        () =>
+          executor
+            .selectFrom("auth_identities")
+            .innerJoin("users", "users.id", "auth_identities.user_id")
+            .select([
+              "users.id",
+              "users.email",
+              "users.display_name",
+              "users.created_at",
+              "users.updated_at",
+            ])
+            .where("auth_identities.auth_provider", "=", authProvider)
+            .where("auth_identities.auth_subject", "=", authSubject)
+            .executeTakeFirst(),
+        mapError,
+      );
+      return row ? toUserRecord(row) : null;
+    },
+
+    async create(input: CreateUserInput): Promise<UserRecord> {
+      const row = await runQuery(
+        () =>
+          executor
+            .insertInto("users")
+            .values({
+              id: input.id,
+              email: input.email,
+              display_name: input.displayName,
+              created_at: input.createdAt,
+              updated_at: input.createdAt,
+            })
+            .returningAll()
+            .executeTakeFirstOrThrow(),
+        mapError,
+      );
+      return toUserRecord(row);
+    },
+
+    async linkAuthIdentity(
+      input: LinkAuthIdentityInput,
+    ): Promise<AuthIdentityRecord> {
+      const row = await runQuery(
+        () =>
+          executor
+            .insertInto("auth_identities")
+            .values({
+              auth_provider: input.authProvider,
+              auth_subject: input.authSubject,
+              user_id: input.userId,
+              created_at: input.createdAt,
+            })
+            .returningAll()
+            .executeTakeFirstOrThrow(),
+        mapError,
+      );
+      return toAuthIdentityRecord(row);
+    },
+  };
+
+  const memberships: WorkspaceMembershipRepository = {
+    async create(
+      input: CreateMembershipInput,
+    ): Promise<WorkspaceMembershipRecord> {
+      const row = await runQuery(
+        () =>
+          executor
+            .insertInto("workspace_memberships")
+            .values({
+              id: input.id,
+              workspace_id: input.workspaceId,
+              user_id: input.userId,
+              role: input.role,
+              created_at: input.createdAt,
+              updated_at: input.createdAt,
+            })
+            .returningAll()
+            .executeTakeFirstOrThrow(),
+        mapError,
+      );
+      return toWorkspaceMembershipRecord(row);
+    },
+
+    async findByWorkspaceAndUser(
+      workspaceId: WorkspaceId,
+      userId: UserId,
+    ): Promise<WorkspaceMembershipRecord | null> {
+      const row = await runQuery(
+        () =>
+          executor
+            .selectFrom("workspace_memberships")
+            .selectAll()
+            .where("workspace_id", "=", workspaceId)
+            .where("user_id", "=", userId)
+            .executeTakeFirst(),
+        mapError,
+      );
+      return row ? toWorkspaceMembershipRecord(row) : null;
+    },
+
+    async listSummariesForUser(
+      userId: UserId,
+    ): Promise<WorkspaceMembershipSummary[]> {
+      const rows = await runQuery(
+        () =>
+          executor
+            .selectFrom("workspace_memberships")
+            .innerJoin(
+              "workspaces",
+              "workspaces.id",
+              "workspace_memberships.workspace_id",
+            )
+            .select([
+              "workspace_memberships.id as membership_id",
+              "workspaces.id as workspace_id",
+              "workspaces.slug as workspace_slug",
+              "workspaces.name as workspace_name",
+              "workspace_memberships.role as role",
+            ])
+            .where("workspace_memberships.user_id", "=", userId)
+            .orderBy("workspaces.created_at", "asc")
+            .orderBy("workspaces.id", "asc")
+            .execute(),
+        mapError,
+      );
+
+      return rows.map((row) => ({
+        membershipId: row.membership_id as MembershipId,
+        workspaceId: row.workspace_id as WorkspaceId,
+        workspaceSlug: row.workspace_slug,
+        workspaceName: row.workspace_name,
+        role: row.role as WorkspaceRole,
+      }));
+    },
+  };
+
+  return { workspaces, workspaceSettings, users, memberships };
 }

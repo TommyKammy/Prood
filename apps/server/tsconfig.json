@@ -10,7 +10,8 @@
     { "path": "../../packages/application" },
     { "path": "../../packages/persistence/common" },
     { "path": "../../packages/persistence/sqlite" },
-    { "path": "../../packages/persistence/postgres" }
+    { "path": "../../packages/persistence/postgres" },
+    { "path": "../../packages/integrations/better-auth" }
   ],
   "include": ["src"]
 }

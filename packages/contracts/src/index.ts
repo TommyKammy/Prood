@@ -1,4 +1,10 @@
-import type { LocaleCode } from "@prood/domain";
+import type {
+  LocaleCode,
+  MembershipId,
+  UserId,
+  WorkspaceId,
+  WorkspaceRole,
+} from "@prood/domain";
 
 export const CONTRACT_VERSION = 1 as const;
 
@@ -18,4 +24,45 @@ export interface HealthResponse {
   dbDriver: DbDriverKind;
   locale: LocaleCode;
   timestamp: string;
+}
+
+export interface AuthUserSummary {
+  id: UserId;
+  email: string;
+  displayName: string;
+}
+
+export interface WorkspaceMembershipSummary {
+  membershipId: MembershipId;
+  workspaceId: WorkspaceId;
+  workspaceSlug: string;
+  workspaceName: string;
+  role: WorkspaceRole;
+}
+
+export interface MeResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  user: AuthUserSummary;
+  memberships: WorkspaceMembershipSummary[];
+}
+
+export interface WorkspaceMembershipResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  workspace: {
+    id: WorkspaceId;
+    slug: string;
+    name: string;
+  };
+  membership: {
+    id: MembershipId;
+    role: WorkspaceRole;
+  };
+}
+
+export interface ApiErrorResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  error: {
+    code: ApiErrorCode;
+    messageKey: string;
+  };
 }

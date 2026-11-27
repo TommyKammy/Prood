@@ -1,4 +1,6 @@
+import type { Kysely } from "kysely";
 import type { DatabaseHealthPort, UnitOfWork } from "@prood/application";
+import type { ProodDatabase } from "./schema.js";
 
 export interface MigrationDefinition {
   readonly version: number;
@@ -20,4 +22,8 @@ export interface DatabaseClient extends DatabaseHealthPort {
   migrate(options?: MigrationRunOptions): Promise<MigrationRunResult>;
   getAppliedMigrationVersions(): Promise<number[]>;
   close(): Promise<void>;
+}
+
+export interface KyselyBackedDatabaseClient extends DatabaseClient {
+  readonly kysely: Kysely<ProodDatabase>;
 }

@@ -1,4 +1,11 @@
-import type { LocaleCode, WorkspaceId } from "@prood/domain";
+import type { WorkspaceMembershipSummary } from "@prood/contracts";
+import type {
+  LocaleCode,
+  MembershipId,
+  UserId,
+  WorkspaceId,
+  WorkspaceRole,
+} from "@prood/domain";
 
 export interface WorkspaceRecord {
   id: WorkspaceId;
@@ -15,6 +22,30 @@ export interface WorkspaceSettingsRecord {
   updatedAt: string;
 }
 
+export interface UserRecord {
+  id: UserId;
+  email: string;
+  displayName: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AuthIdentityRecord {
+  authProvider: string;
+  authSubject: string;
+  userId: UserId;
+  createdAt: string;
+}
+
+export interface WorkspaceMembershipRecord {
+  id: MembershipId;
+  workspaceId: WorkspaceId;
+  userId: UserId;
+  role: WorkspaceRole;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface CreateWorkspaceInput {
   id: WorkspaceId;
   slug: string;
@@ -27,6 +58,28 @@ export interface UpsertWorkspaceSettingsInput {
   defaultLocale: LocaleCode;
   devProjectsEnabled: boolean;
   updatedAt: string;
+}
+
+export interface CreateUserInput {
+  id: UserId;
+  email: string;
+  displayName: string;
+  createdAt: string;
+}
+
+export interface LinkAuthIdentityInput {
+  authProvider: string;
+  authSubject: string;
+  userId: UserId;
+  createdAt: string;
+}
+
+export interface CreateMembershipInput {
+  id: MembershipId;
+  workspaceId: WorkspaceId;
+  userId: UserId;
+  role: WorkspaceRole;
+  createdAt: string;
 }
 
 export interface WorkspaceRepository {
@@ -45,9 +98,31 @@ export interface WorkspaceSettingsRepository {
   findByWorkspaceId(workspaceId: WorkspaceId): Promise<WorkspaceSettingsRecord | null>;
 }
 
+export interface UserRepository {
+  findById(id: UserId): Promise<UserRecord | null>;
+  findByEmail(email: string): Promise<UserRecord | null>;
+  findByAuthIdentity(
+    authProvider: string,
+    authSubject: string,
+  ): Promise<UserRecord | null>;
+  create(input: CreateUserInput): Promise<UserRecord>;
+  linkAuthIdentity(input: LinkAuthIdentityInput): Promise<AuthIdentityRecord>;
+}
+
+export interface WorkspaceMembershipRepository {
+  create(input: CreateMembershipInput): Promise<WorkspaceMembershipRecord>;
+  findByWorkspaceAndUser(
+    workspaceId: WorkspaceId,
+    userId: UserId,
+  ): Promise<WorkspaceMembershipRecord | null>;
+  listSummariesForUser(userId: UserId): Promise<WorkspaceMembershipSummary[]>;
+}
+
 export interface TransactionRepositories {
   readonly workspaces: WorkspaceRepository;
   readonly workspaceSettings: WorkspaceSettingsRepository;
+  readonly users: UserRepository;
+  readonly memberships: WorkspaceMembershipRepository;
 }
 
 /**

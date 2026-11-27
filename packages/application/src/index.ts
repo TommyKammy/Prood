@@ -5,6 +5,7 @@ import {
   type HealthResponse,
 } from "@prood/contracts";
 
+export * from "./auth.js";
 export * from "./id.js";
 export * from "./persistence.js";
 

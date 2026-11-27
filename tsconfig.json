@@ -7,6 +7,7 @@
     { "path": "packages/persistence/common" },
     { "path": "packages/persistence/sqlite" },
     { "path": "packages/persistence/postgres" },
+    { "path": "packages/integrations/better-auth" },
     { "path": "apps/server" },
     { "path": "apps/web" }
   ]

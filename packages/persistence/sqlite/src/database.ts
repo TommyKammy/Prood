@@ -5,7 +5,7 @@ import {
   createKyselyRepositories,
   executeWithTransientRetry,
   isPersistenceError,
-  type DatabaseClient,
+  type KyselyBackedDatabaseClient,
   type MigrationRunOptions,
   type MigrationRunResult,
   type ProodDatabase,
@@ -42,7 +42,7 @@ export function openSqliteConnection(
  */
 export function createSqliteDatabase(
   options: SqliteDatabaseOptions,
-): DatabaseClient {
+): KyselyBackedDatabaseClient {
   const busyTimeoutMs = options.busyTimeoutMs ?? 5000;
   const retryPolicy = {
     maxRetryAttempts: options.maxRetryAttempts ?? 3,
@@ -131,6 +131,7 @@ export function createSqliteDatabase(
 
   return {
     driver: "sqlite",
+    kysely: db,
     uow,
 
     async ping(): Promise<{ ok: true }> {

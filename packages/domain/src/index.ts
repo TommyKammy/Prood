@@ -1,6 +1,7 @@
 import { isValidEntityId, type TaskPublicId } from "./id.js";
 
 export * from "./id.js";
+export * from "./identity.js";
 
 export type LocaleCode = "en" | "ja" | (string & {});
 
