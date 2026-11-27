@@ -129,6 +129,40 @@ describe("@prood/server Web-Standard app", () => {
               },
             ],
           },
+          projects: {
+            create: async () => {
+              throw new Error("not implemented");
+            },
+            findById: async () => null,
+            listByWorkspace: async () => [],
+            upsertMembership: async () => {
+              throw new Error("not implemented");
+            },
+            findMembership: async () => null,
+          },
+          statuses: {
+            create: async () => {
+              throw new Error("not implemented");
+            },
+            findById: async () => null,
+            listByProject: async () => [],
+          },
+          tasks: {
+            create: async () => {
+              throw new Error("not implemented");
+            },
+            findById: async () => null,
+            listByProject: async () => [],
+            listSubtasks: async () => [],
+            update: async () => null,
+          },
+          outbox: {
+            append: async () => {
+              throw new Error("not implemented");
+            },
+            listByWorkspace: async () => [],
+            listAll: async () => [],
+          },
         }),
     };
 

@@ -23,6 +23,11 @@ export interface ProodMcpServerDeps {
   idGenerator: IdGenerator;
   clock: Clock;
   onWhoamiExecuted?: () => void;
+  onAuthFailure?: (info: {
+    path: string;
+    reasonCode: string;
+    detail?: string;
+  }) => Promise<void> | void;
   sessionIdleTtlMs?: number;
   maxActiveSessions?: number;
   maxSessionsPerPrincipal?: number;
@@ -330,15 +335,38 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
 
   return {
     async handleRequest(request: Request): Promise<Response> {
+      const requestPath = (() => {
+        try {
+          return new URL(request.url).pathname;
+        } catch {
+          return "/mcp";
+        }
+      })();
+      const notifyAuthFailure = async (
+        reasonCode: string,
+        detail?: string,
+      ): Promise<void> => {
+        if (!deps.onAuthFailure) {
+          return;
+        }
+        try {
+          await deps.onAuthFailure({ path: requestPath, reasonCode, detail });
+        } catch {
+          // Preserve HTTP auth response if audit recording fails
+        }
+      };
+
       const originHeader = request.headers.get("origin");
       if (originHeader && trustedOriginSet && trustedOriginSet.size > 0) {
         let normalizedOrigin = originHeader;
         try {
           normalizedOrigin = new URL(originHeader).origin;
         } catch {
+          await notifyAuthFailure("INVALID_ORIGIN", "Malformed Origin header");
           return jsonRpcErrorResponse(403, -32003, "Invalid Origin header");
         }
         if (!trustedOriginSet.has(normalizedOrigin)) {
+          await notifyAuthFailure("ORIGIN_NOT_ALLOWED", normalizedOrigin);
           return jsonRpcErrorResponse(403, -32003, "Origin not allowed");
         }
       }
@@ -350,6 +378,10 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
         request.headers,
       );
       if (!authResult.ok) {
+        await notifyAuthFailure(
+          authResult.error.toUpperCase(),
+          authResult.description,
+        );
         return buildUnauthorizedResponse(
           authResult.status,
           authResult.error,
@@ -382,6 +414,10 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
             existing.ownerSubject !== authResult.token.subject ||
             existing.ownerClientId !== authResult.token.clientId
           ) {
+            await notifyAuthFailure(
+              "SESSION_PRINCIPAL_MISMATCH",
+              "Session belongs to a different principal",
+            );
             return jsonRpcErrorResponse(
               403,
               -32003,
@@ -393,6 +429,7 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
             authResult.token.scopes,
           );
           if (earlyScopeError) {
+            await notifyAuthFailure("INSUFFICIENT_SCOPE", "Missing tool scope");
             return earlyScopeError;
           }
 

@@ -44,6 +44,7 @@ export const enMessages = {
   "empty.tasks.title": "No tasks yet",
   "empty.tasks.description": "Create your first task to collaborate with agents.",
   "error.generic": "Something went wrong. Please try again.",
+  "error.validation": "The submitted request data is invalid.",
   "error.unauthorized": "Authentication required. Please sign in.",
   "error.forbidden": "You do not have permission to perform this action.",
   "error.emailVerificationRequired":

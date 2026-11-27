@@ -3,7 +3,10 @@ import { Hono } from "hono";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createSystemIdGenerator } from "@prood/application";
+import {
+  createSystemIdGenerator,
+  createWorkUseCases,
+} from "@prood/application";
 import { createBetterAuthAdapter } from "@prood/integration-better-auth";
 import { createProodMcpServer } from "@prood/integration-fastmcp";
 import type { KyselyBackedDatabaseClient } from "@prood/persistence-common";
@@ -233,6 +236,11 @@ export async function startNodeServer(): Promise<void> {
 
   const clock = { now: () => new Date() };
   const idGenerator = createSystemIdGenerator();
+  const workUseCases = createWorkUseCases({
+    uow: db.uow,
+    idGenerator,
+    clock,
+  });
 
   const mcpHandler = createProodMcpServer({
     resource: config.mcpResource,
@@ -241,6 +249,13 @@ export async function startNodeServer(): Promise<void> {
     idGenerator,
     clock,
     trustedOrigins: [origin],
+    onAuthFailure: (info) =>
+      workUseCases.recordEntryAuthFailure({
+        channel: "mcp",
+        path: info.path,
+        reasonCode: info.reasonCode,
+        detail: info.detail,
+      }),
   });
 
   const apiApp = createApp({

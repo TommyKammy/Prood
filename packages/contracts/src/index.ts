@@ -1,6 +1,17 @@
 import type {
+  ActorType,
+  EventChannel,
+  EventId,
+  EventOutcome,
   LocaleCode,
   MembershipId,
+  OutboxId,
+  ProjectId,
+  ProjectKind,
+  ProjectVisibility,
+  StatusCategory,
+  StatusId,
+  TaskPublicId,
   UserId,
   WorkspaceId,
   WorkspaceRole,
@@ -78,4 +89,108 @@ export interface McpWhoamiResponse {
   scopes: string[];
   resource: string;
   workspaces: WorkspaceMembershipSummary[];
+}
+
+export interface ProjectStatusDto {
+  id: StatusId;
+  projectId: ProjectId;
+  name: string;
+  category: StatusCategory;
+  position: number;
+}
+
+export interface ProjectDto {
+  id: ProjectId;
+  workspaceId: WorkspaceId;
+  kind: ProjectKind;
+  visibility: ProjectVisibility;
+  name: string;
+  description: string;
+  statuses: ProjectStatusDto[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProjectResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  project: ProjectDto;
+}
+
+export interface ProjectListResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  projects: ProjectDto[];
+}
+
+export interface CreateProjectRequest {
+  name: string;
+  description?: string;
+  kind?: ProjectKind;
+  visibility?: ProjectVisibility;
+}
+
+export interface TaskDto {
+  id: TaskPublicId;
+  workspaceId: WorkspaceId;
+  projectId: ProjectId | null;
+  effectiveProjectId: ProjectId;
+  parentTaskId: TaskPublicId | null;
+  statusId: StatusId | null;
+  title: string;
+  description: string;
+  assigneeId: UserId | null;
+  createdBy: UserId | null;
+  dueOn: string | null;
+  completedAt: string | null;
+  position: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TaskResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  task: TaskDto;
+}
+
+export interface TaskListResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  tasks: TaskDto[];
+}
+
+export interface CreateTaskRequest {
+  title: string;
+  description?: string;
+  parentTaskId?: TaskPublicId | null;
+  inheritParentProject?: boolean;
+  statusId?: StatusId | null;
+  assigneeId?: UserId | null;
+  dueOn?: string | null;
+}
+
+export interface UpdateTaskRequest {
+  title?: string;
+  description?: string;
+  statusId?: StatusId | null;
+  assigneeId?: UserId | null;
+  dueOn?: string | null;
+  completedAt?: string | null;
+}
+
+export interface OutboxEventDto {
+  id: OutboxId;
+  eventId: EventId;
+  schemaVersion: number;
+  workspaceId: WorkspaceId | null;
+  projectId: ProjectId | null;
+  eventType: string;
+  action: string;
+  outcome: EventOutcome;
+  actorUserId: UserId | null;
+  actorType: ActorType;
+  channel: EventChannel;
+  targetType: string;
+  targetId: string | null;
+  reasonCode: string | null;
+  payload: Record<string, unknown>;
+  occurredAt: string;
+  deliveryStatus: "pending" | "leased" | "delivered" | "failed";
 }
