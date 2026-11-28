@@ -111,6 +111,7 @@ describe("@prood/server Web-Standard app", () => {
           },
           users: {
             findById: async () => null,
+            findByIds: async () => new Map(),
             findByEmail: async () => null,
             findByAuthIdentity: async () => ({
               id: usr1,
@@ -224,6 +225,35 @@ describe("@prood/server Web-Standard app", () => {
           idempotency: {
             findByKey: async () => null,
             createIfAbsent: async () => null,
+          },
+          realtimeEvents: {
+            append: async () => {
+              throw new Error("not implemented");
+            },
+            readSnapshotState: async () => ({
+              driver: "sqlite",
+              xmin: "0",
+              xmax: "0",
+              maxSeq: 0,
+              visibleAtOrAboveXmin: [],
+              retention: { prunedThroughTxid: "0", prunedThroughSeq: 0 },
+            }),
+            listAfterPosition: async () => ({
+              snapshot: {
+                driver: "sqlite",
+                xmin: "0",
+                xmax: "0",
+                maxSeq: 0,
+                visibleAtOrAboveXmin: [],
+                retention: { prunedThroughTxid: "0", prunedThroughSeq: 0 },
+              },
+              events: [],
+            }),
+            prune: async () => ({
+              deletedCount: 0,
+              prunedThroughTxid: "0",
+              prunedThroughSeq: 0,
+            }),
           },
         }),
     };

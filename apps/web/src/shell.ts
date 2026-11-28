@@ -37,6 +37,7 @@ import {
   isSafeRedirectUrl,
   ProodLoginFormElement,
 } from "./login-form.js";
+import type { RealtimeController } from "./realtime.js";
 import type { SearchPaletteController } from "./search-dialog.js";
 import type { renderSettingsPanel } from "./settings-panel.js";
 import type { renderTaskListView } from "./task-list.js";
@@ -135,6 +136,9 @@ export class ProodShellElement extends BaseElement {
   private settingsLoadPromise: Promise<void> | null = null;
   private renderTaskListFn: typeof renderTaskListView | null = null;
   private taskListLoadPromise: Promise<void> | null = null;
+  private realtime: RealtimeController | null = null;
+  private realtimeLoadPromise: Promise<void> | null = null;
+  private liveNotice = "";
 
   connectedCallback(): void {
     this.listenersController?.abort();
@@ -191,6 +195,7 @@ export class ProodShellElement extends BaseElement {
   disconnectedCallback(): void {
     this.listenersController?.abort();
     this.listenersController = null;
+    this.realtime?.close();
     this.searchPalette?.destroy();
     this.searchPalette = null;
     this.shellRoot = null;
@@ -235,6 +240,63 @@ export class ProodShellElement extends BaseElement {
     this.ensureMountNodes();
     const palette = await this.ensureSearchPalette();
     palette?.open();
+  }
+
+  private syncRealtime(): void {
+    const wsId =
+      this.authState === "authenticated" && !this.isConsentRoute()
+        ? this.activeWorkspaceId
+        : null;
+    if (!wsId) {
+      this.realtime?.close();
+      return;
+    }
+    if (this.realtime) {
+      this.realtime.connect(wsId);
+      return;
+    }
+    if (!this.realtimeLoadPromise && typeof EventSource === "function") {
+      this.realtimeLoadPromise = import("./realtime.js")
+        .then((mod) => {
+          this.realtime = mod.createRealtimeController({
+            onChange: (ev) => {
+              const applied = mod.applyRealtimeChangeToTasks(
+                this.tasks,
+                this.activeProjectId,
+                ev,
+              );
+              if (applied.changed) {
+                this.tasks = applied.tasks;
+                if (applied.highlightedTaskId !== undefined) {
+                  this.highlightedTaskId = applied.highlightedTaskId;
+                }
+                if (ev.task) {
+                  this.liveNotice = this.i18n.t("realtime.taskUpdated", {
+                    title: ev.task.title,
+                  });
+                }
+                this.render();
+              } else if (ev.eventType.indexOf("task.") !== 0 && this.activeWorkspaceId) {
+                void this.loadWorkspaceData(this.activeWorkspaceId, true);
+              }
+            },
+            onResync: () => {
+              if (this.activeWorkspaceId) {
+                void this.loadWorkspaceData(this.activeWorkspaceId, true);
+              }
+            },
+            onRevoked: () => {
+              void this.refreshSession();
+            },
+          });
+          if (this.authState === "authenticated" && this.activeWorkspaceId) {
+            this.realtime.connect(this.activeWorkspaceId);
+          }
+        })
+        .finally(() => {
+          this.realtimeLoadPromise = null;
+        });
+    }
   }
 
   private async ensureTaskList(): Promise<void> {
@@ -360,6 +422,7 @@ export class ProodShellElement extends BaseElement {
 
   private resetWorkspaceState(): void {
     this.cancelPendingWorkspaceMutations();
+    this.realtime?.close();
     this.workspaceDataSeq += 1;
     this.activeWorkspaceId = null;
     this.activeView = "list";
@@ -495,11 +558,16 @@ export class ProodShellElement extends BaseElement {
     }
   }
 
-  private async loadWorkspaceData(workspaceId: WorkspaceId): Promise<void> {
+  private async loadWorkspaceData(
+    workspaceId: WorkspaceId,
+    silent = false,
+  ): Promise<void> {
     const seq = ++this.workspaceDataSeq;
-    this.loadingWorkspace = true;
-    this.workspaceLoadError = "";
-    this.render();
+    if (!silent) {
+      this.loadingWorkspace = true;
+      this.workspaceLoadError = "";
+      this.render();
+    }
 
     const [projRes, wsSettingsRes] = await Promise.all([
       listProjects(workspaceId),
@@ -544,6 +612,7 @@ export class ProodShellElement extends BaseElement {
       this.resetDevSettingsDrafts();
     }
     this.syncUrlState();
+    this.syncRealtime();
     this.render();
 
     if (this.activeProjectId) {
@@ -623,6 +692,7 @@ export class ProodShellElement extends BaseElement {
     if (switchToList) this.activeView = "list";
     this.clearFeedback();
     this.syncUrlState();
+    this.syncRealtime();
     this.render();
     await this.loadProjectData(projectId);
   }
@@ -632,6 +702,7 @@ export class ProodShellElement extends BaseElement {
     this.activeView = view;
     this.clearFeedback();
     this.syncUrlState();
+    this.syncRealtime();
     this.render();
     if (view === "settings") {
       void this.ensureSettingsPanel();
@@ -1232,6 +1303,17 @@ export class ProodShellElement extends BaseElement {
           this.renderSidebar(activeMembership?.role ?? null),
           content,
         ),
+      );
+      main.appendChild(
+        el("div", {
+          cls: "prood-sr-only",
+          attrs: {
+            "aria-live": "polite",
+            "aria-atomic": "true",
+            "data-live-region": true,
+          },
+          text: this.liveNotice,
+        }),
       );
     }
 

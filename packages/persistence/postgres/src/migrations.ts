@@ -402,4 +402,34 @@ export const POSTGRES_MIGRATIONS: readonly MigrationDefinition[] = [
   },
   automationMigration,
   effectMigration,
+  {
+    version: 10,
+    name: "0010_init_realtime_events",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS realtime_events (
+        seq BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        txid xid8 NOT NULL DEFAULT pg_current_xact_id(),
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+        event_id TEXT NOT NULL UNIQUE,
+        event_type TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_id TEXT,
+        payload_json TEXT NOT NULL,
+        occurred_at TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )`,
+      `CREATE INDEX IF NOT EXISTS realtime_events_workspace_txid_seq_idx ON realtime_events (workspace_id, txid, seq)`,
+      `CREATE INDEX IF NOT EXISTS realtime_events_created_at_idx ON realtime_events (created_at, seq)`,
+      `CREATE TABLE IF NOT EXISTS realtime_retention_state (
+        id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+        pruned_through_txid TEXT NOT NULL DEFAULT '0',
+        pruned_through_seq BIGINT NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+      )`,
+      `INSERT INTO realtime_retention_state (id, pruned_through_txid, pruned_through_seq, updated_at)
+       VALUES (1, '0', 0, '1970-01-01T00:00:00.000Z')
+       ON CONFLICT (id) DO NOTHING`,
+    ],
+  },
 ];

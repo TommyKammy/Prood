@@ -10,6 +10,7 @@ import {
   type McpHttpHandler,
   type McpTokenVerifier,
   type McpVerifiedToken,
+  type RealtimeHub,
   type UnitOfWork,
   type WorkUseCaseResult,
 } from "@prood/application";
@@ -39,6 +40,7 @@ export interface ProodMcpServerDeps {
   uow: UnitOfWork;
   idGenerator: IdGenerator;
   clock: Clock;
+  realtimeHub?: RealtimeHub;
   onWhoamiExecuted?: () => void;
   onAuthFailure?: (info: {
     path: string;
@@ -149,6 +151,7 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
     uow: deps.uow,
     idGenerator: deps.idGenerator,
     clock: deps.clock,
+    realtimeHub: deps.realtimeHub,
   });
 
   function throwMcpToolError(

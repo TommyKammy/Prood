@@ -1,6 +1,7 @@
 import { sql, type Kysely, type Transaction } from "kysely";
 import type {
   AppendOutboxEventInput,
+  AppendRealtimeEventInput,
   AuthIdentityRecord,
   CreateIdempotencyRecordInput,
   CreateIssueKeyNamespaceInput,
@@ -25,6 +26,9 @@ import type {
   ProjectRepository,
   ProjectStatusRecord,
   ProjectStatusRepository,
+  RealtimeEventRecord,
+  RealtimeEventsRepository,
+  RealtimeSnapshotState,
   TaskIssueKeyView,
   TaskRecord,
   TaskRepository,
@@ -76,6 +80,7 @@ import type {
   ProjectMembershipTable,
   ProjectStatusTable,
   ProjectTable,
+  RealtimeEventTable,
   TaskTable,
   UserTable,
   WorkspaceMembershipTable,
@@ -494,6 +499,29 @@ export function createKyselyRepositories(
         assertActive,
       );
       return row ? toUserRecord(row) : null;
+    },
+
+    async findByIds(ids: readonly UserId[]): Promise<Map<UserId, UserRecord>> {
+      const uniqueIds = Array.from(new Set(ids));
+      const result = new Map<UserId, UserRecord>();
+      if (uniqueIds.length === 0) {
+        return result;
+      }
+      const rows = await runQuery(
+        () =>
+          executor
+            .selectFrom("users")
+            .selectAll()
+            .where("id", "in", uniqueIds)
+            .execute(),
+        mapError,
+        assertActive,
+      );
+      for (const row of rows) {
+        const record = toUserRecord(row);
+        result.set(record.id, record);
+      }
+      return result;
     },
 
     async findByEmail(email: string): Promise<UserRecord | null> {
@@ -2352,6 +2380,378 @@ export function createKyselyRepositories(
       return row ? toIdempotencyRecord(row) : null;
     },
   };
+  function toRealtimeEventRecord(row: {
+    seq: number | string;
+    txid: string;
+    workspace_id: string;
+    project_id: string | null;
+    event_id: string;
+    event_type: string;
+    target_type: string;
+    target_id: string | null;
+    payload_json: string;
+    occurred_at: string;
+    created_at: string;
+  }): RealtimeEventRecord {
+    let payload: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(row.payload_json) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        payload = parsed as Record<string, unknown>;
+      }
+    } catch {
+      payload = {};
+    }
+    return {
+      seq: Number(row.seq),
+      txid: String(row.txid),
+      workspaceId: row.workspace_id as WorkspaceId,
+      projectId: row.project_id as ProjectId | null,
+      eventId: row.event_id as EventId,
+      eventType: row.event_type,
+      targetType: row.target_type,
+      targetId: row.target_id,
+      payload,
+      occurredAt: row.occurred_at,
+      createdAt: row.created_at,
+    };
+  }
+
+  function compareRealtimePosition(
+    aTxid: bigint,
+    aSeq: number,
+    bTxid: bigint,
+    bSeq: number,
+  ): number {
+    if (aTxid !== bTxid) {
+      return aTxid < bTxid ? -1 : 1;
+    }
+    return aSeq - bSeq;
+  }
+
+  const realtimeEvents: RealtimeEventsRepository = {
+    async append(input: AppendRealtimeEventInput): Promise<RealtimeEventRecord> {
+      const row = await runQuery(
+        () =>
+          executor
+            .insertInto("realtime_events")
+            .values({
+              workspace_id: input.workspaceId,
+              project_id: input.projectId,
+              event_id: input.eventId,
+              event_type: input.eventType,
+              target_type: input.targetType,
+              target_id: input.targetId,
+              payload_json: JSON.stringify(input.payload),
+              occurred_at: input.occurredAt,
+              created_at: input.createdAt,
+            })
+            .returning([
+              "seq",
+              sql<string>`CAST(txid AS TEXT)`.as("txid"),
+              "workspace_id",
+              "project_id",
+              "event_id",
+              "event_type",
+              "target_type",
+              "target_id",
+              "payload_json",
+              "occurred_at",
+              "created_at",
+            ])
+            .executeTakeFirstOrThrow(),
+        mapError,
+        assertActive,
+      );
+      return toRealtimeEventRecord(row);
+    },
+
+    async readSnapshotState(workspaceId: WorkspaceId): Promise<RealtimeSnapshotState> {
+      const retentionRow = await runQuery(
+        () =>
+          executor
+            .selectFrom("realtime_retention_state")
+            .select(["pruned_through_txid", "pruned_through_seq"])
+            .where("id", "=", 1)
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      const retention = {
+        prunedThroughTxid: String(retentionRow?.pruned_through_txid ?? "0"),
+        prunedThroughSeq: Number(retentionRow?.pruned_through_seq ?? 0),
+      };
+
+      const maxSeqRes = await runQuery(
+        () =>
+          sql<{ max_seq: number | string }>`
+            SELECT COALESCE(MAX(seq), 0) AS max_seq FROM realtime_events
+          `.execute(executor),
+        mapError,
+        assertActive,
+      );
+      const maxSeq = Math.max(
+        Number(maxSeqRes.rows[0]?.max_seq ?? 0),
+        retention.prunedThroughSeq,
+      );
+
+      if (driver !== "postgres") {
+        return {
+          driver,
+          xmin: "0",
+          xmax: "0",
+          maxSeq,
+          visibleAtOrAboveXmin: [],
+          retention,
+        };
+      }
+
+      const snapRes = await runQuery(
+        () =>
+          sql<{ xmin: string; xmax: string }>`
+            SELECT
+              pg_snapshot_xmin(pg_current_snapshot())::text AS xmin,
+              pg_snapshot_xmax(pg_current_snapshot())::text AS xmax
+          `.execute(executor),
+        mapError,
+        assertActive,
+      );
+      const xmin = snapRes.rows[0]!.xmin;
+      const xmax = snapRes.rows[0]!.xmax;
+
+      const visibleRes = await runQuery(
+        () =>
+          sql<{ txid: string; seq: number | string }>`
+            SELECT txid::text AS txid, seq
+            FROM realtime_events
+            WHERE workspace_id = ${workspaceId}
+              AND txid >= CAST(${xmin} AS xid8)
+            ORDER BY txid ASC, seq ASC
+          `.execute(executor),
+        mapError,
+        assertActive,
+      );
+
+      return {
+        driver,
+        xmin,
+        xmax,
+        maxSeq,
+        visibleAtOrAboveXmin: visibleRes.rows.map((r) => ({
+          txid: String(r.txid),
+          seq: Number(r.seq),
+        })),
+        retention,
+      };
+    },
+
+    async listAfterPosition(input): Promise<{
+      snapshot: RealtimeSnapshotState;
+      events: RealtimeEventRecord[];
+    }> {
+      const snapshot = await realtimeEvents.readSnapshotState(input.workspaceId);
+      const limit = Math.max(1, Math.min(500, Math.trunc(input.limit)));
+      const uniqueExcludes = Array.from(
+        new Set(input.excludeSeqs.map((n) => Math.trunc(n)).filter((n) => n > 0)),
+      );
+
+      if (driver !== "postgres") {
+        const res = await runQuery(
+          () => {
+            let query = executor
+              .selectFrom("realtime_events")
+              .select([
+                "seq",
+                sql<string>`CAST(txid AS TEXT)`.as("txid"),
+                "workspace_id",
+                "project_id",
+                "event_id",
+                "event_type",
+                "target_type",
+                "target_id",
+                "payload_json",
+                "occurred_at",
+                "created_at",
+              ])
+              .where("workspace_id", "=", input.workspaceId)
+              .where("seq", ">", input.safeSeq);
+            if (uniqueExcludes.length > 0) {
+              query = query.where("seq", "not in", uniqueExcludes);
+            }
+            return query.orderBy("seq", "asc").limit(limit).execute();
+          },
+          mapError,
+          assertActive,
+        );
+        return { snapshot, events: res.map(toRealtimeEventRecord) };
+      }
+
+      const excludeClause =
+        uniqueExcludes.length > 0
+          ? sql` AND seq NOT IN (${sql.join(uniqueExcludes.map((s) => sql`${s}`))})`
+          : sql``;
+      const res = await runQuery(
+        () =>
+          sql<{
+            seq: number | string;
+            txid: string;
+            workspace_id: string;
+            project_id: string | null;
+            event_id: string;
+            event_type: string;
+            target_type: string;
+            target_id: string | null;
+            payload_json: string;
+            occurred_at: string;
+            created_at: string;
+          }>`
+            SELECT
+              seq,
+              txid::text AS txid,
+              workspace_id,
+              project_id,
+              event_id,
+              event_type,
+              target_type,
+              target_id,
+              payload_json,
+              occurred_at,
+              created_at
+            FROM realtime_events
+            WHERE workspace_id = ${input.workspaceId}
+              AND (
+                txid > CAST(${input.safeTxid} AS xid8)
+                OR (txid = CAST(${input.safeTxid} AS xid8) AND seq > ${input.safeSeq})
+              )
+              ${excludeClause}
+            ORDER BY txid ASC, seq ASC
+            LIMIT ${limit}
+          `.execute(executor),
+        mapError,
+        assertActive,
+      );
+      return { snapshot, events: res.rows.map(toRealtimeEventRecord) };
+    },
+
+    async prune(input): Promise<{
+      deletedCount: number;
+      prunedThroughTxid: string;
+      prunedThroughSeq: number;
+    }> {
+      const stateQuery =
+        driver === "postgres"
+          ? sql<{ pruned_through_txid: string; pruned_through_seq: number | string }>`
+              SELECT pruned_through_txid, pruned_through_seq
+              FROM realtime_retention_state
+              WHERE id = 1
+              FOR UPDATE
+            `
+          : sql<{ pruned_through_txid: string; pruned_through_seq: number | string }>`
+              SELECT pruned_through_txid, pruned_through_seq
+              FROM realtime_retention_state
+              WHERE id = 1
+            `;
+      const currentStateRes = await runQuery(
+        () => stateQuery.execute(executor),
+        mapError,
+        assertActive,
+      );
+      let bestTxid = BigInt(currentStateRes.rows[0]?.pruned_through_txid ?? "0");
+      let bestSeq = Number(currentStateRes.rows[0]?.pruned_through_seq ?? 0);
+      let deletedCount = 0;
+
+      const considerDeleted = (rows: Array<{ txid: string; seq: number | string }>) => {
+        deletedCount += rows.length;
+        for (const row of rows) {
+          const rTxid = BigInt(row.txid);
+          const rSeq = Number(row.seq);
+          if (compareRealtimePosition(rTxid, rSeq, bestTxid, bestSeq) > 0) {
+            bestTxid = rTxid;
+            bestSeq = rSeq;
+          }
+        }
+      };
+
+      if (input.beforeCreatedAt !== undefined) {
+        const res = await runQuery(
+          () =>
+            driver === "postgres"
+              ? sql<{ seq: number | string; txid: string }>`
+                  DELETE FROM realtime_events
+                  WHERE created_at < ${input.beforeCreatedAt}
+                    AND txid < pg_snapshot_xmin(pg_current_snapshot())
+                  RETURNING seq, txid::text AS txid
+                `.execute(executor)
+              : sql<{ seq: number | string; txid: string }>`
+                  DELETE FROM realtime_events
+                  WHERE created_at < ${input.beforeCreatedAt}
+                  RETURNING seq, CAST(txid AS TEXT) AS txid
+                `.execute(executor),
+          mapError,
+          assertActive,
+        );
+        considerDeleted(res.rows);
+      }
+
+      if (input.keepLast !== undefined) {
+        const keep = Math.max(0, Math.trunc(input.keepLast));
+        const res = await runQuery(
+          () =>
+            driver === "postgres"
+              ? sql<{ seq: number | string; txid: string }>`
+                  WITH preserved AS (
+                    SELECT seq
+                    FROM realtime_events
+                    ORDER BY txid DESC, seq DESC
+                    LIMIT ${keep}
+                  )
+                  DELETE FROM realtime_events
+                  WHERE txid < pg_snapshot_xmin(pg_current_snapshot())
+                    AND seq NOT IN (SELECT seq FROM preserved)
+                  RETURNING seq, txid::text AS txid
+                `.execute(executor)
+              : sql<{ seq: number | string; txid: string }>`
+                  WITH preserved AS (
+                    SELECT seq
+                    FROM realtime_events
+                    ORDER BY seq DESC
+                    LIMIT ${keep}
+                  )
+                  DELETE FROM realtime_events
+                  WHERE seq NOT IN (SELECT seq FROM preserved)
+                  RETURNING seq, CAST(txid AS TEXT) AS txid
+                `.execute(executor),
+          mapError,
+          assertActive,
+        );
+        considerDeleted(res.rows);
+      }
+
+      if (deletedCount > 0) {
+        await runQuery(
+          () =>
+            executor
+              .updateTable("realtime_retention_state")
+              .set({
+                pruned_through_txid: bestTxid.toString(),
+                pruned_through_seq: bestSeq,
+                updated_at: input.nowIso,
+              })
+              .where("id", "=", 1)
+              .execute(),
+          mapError,
+          assertActive,
+        );
+      }
+
+      return {
+        deletedCount,
+        prunedThroughTxid: bestTxid.toString(),
+        prunedThroughSeq: bestSeq,
+      };
+    },
+  };
+
   return {
     automation,
     driver,
@@ -2365,5 +2765,6 @@ export function createKyselyRepositories(
     issueKeys,
     outbox,
     idempotency,
+    realtimeEvents,
   };
 }
