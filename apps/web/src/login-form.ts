@@ -1,3 +1,4 @@
+import { alertBanner, el, fieldGroup } from "./dom.js";
 import { createI18n, type I18nInstance } from "./i18n/messages.js";
 
 const BaseElement =
@@ -7,21 +8,15 @@ let nextLoginFormId = 0;
 
 export function extractSignedOAuthQuery(search: string): string | undefined {
   const trimmed = search.replace(/^\?/, "");
-  if (!trimmed) {
-    return undefined;
-  }
+  if (!trimmed) return undefined;
   const params = new URLSearchParams(trimmed);
   return params.has("sig") && params.has("client_id") ? trimmed : undefined;
 }
 
 export function isSafeRedirectUrl(url: string): boolean {
   const trimmed = url.trim();
-  if (!trimmed) {
-    return false;
-  }
-  if (trimmed.startsWith("/") && !trimmed.startsWith("//")) {
-    return true;
-  }
+  if (!trimmed) return false;
+  if (trimmed.startsWith("/") && !trimmed.startsWith("//")) return true;
   try {
     const parsed = new URL(trimmed);
     return parsed.protocol === "http:" || parsed.protocol === "https:";
@@ -70,112 +65,79 @@ export class ProodLoginFormElement extends BaseElement {
   }
 
   private render(): void {
-    if (typeof document === "undefined") {
-      return;
-    }
+    if (typeof document === "undefined") return;
     const { t } = this.i18n;
     this.innerHTML = "";
 
-    const wrapper = document.createElement("div");
-    wrapper.className = "prood-login-wrap";
-
-    const form = document.createElement("form");
-    form.className = "prood-login-form";
-    form.setAttribute("data-login-form", "");
-    form.setAttribute("aria-label", t("aria.signInForm"));
-    form.setAttribute("aria-busy", String(this.busy));
-
-    const headingGroup = document.createElement("div");
-    const title = document.createElement("h1");
-    title.className = "prood-login-title";
-    title.textContent = t("auth.signInTitle");
-
-    const subtitle = document.createElement("p");
-    subtitle.className = "prood-login-subtitle";
-    subtitle.textContent = t("auth.signInSubtitle");
-    headingGroup.append(title, subtitle);
-
     const emailId = `prood-login-email-${this.instanceId}`;
-    const emailGroup = document.createElement("div");
-    emailGroup.className = "prood-field";
-    const emailLabel = document.createElement("label");
-    emailLabel.htmlFor = emailId;
-    emailLabel.className = "prood-label";
-    emailLabel.textContent = t("auth.emailLabel");
-    const emailInput = document.createElement("input");
-    emailInput.id = emailId;
-    emailInput.name = "email";
-    emailInput.type = "email";
-    emailInput.required = true;
-    emailInput.autocomplete = "email";
-    emailInput.placeholder = t("auth.emailPlaceholder");
-    emailInput.className = "prood-input";
-    emailInput.value = this.email;
-    emailInput.addEventListener("input", () => {
-      this.email = emailInput.value;
+    const emailInput = el("input", {
+      id: emailId,
+      type: "email",
+      required: true,
+      cls: "prood-input",
+      placeholder: t("auth.emailPlaceholder"),
+      val: this.email,
+      attrs: { name: "email", autocomplete: "email" },
+      on: { input: () => (this.email = emailInput.value) },
     });
     this.emailInputEl = emailInput;
-    emailGroup.append(emailLabel, emailInput);
 
     const passwordId = `prood-login-password-${this.instanceId}`;
-    const passwordGroup = document.createElement("div");
-    passwordGroup.className = "prood-field";
-    const passwordLabel = document.createElement("label");
-    passwordLabel.htmlFor = passwordId;
-    passwordLabel.className = "prood-label";
-    passwordLabel.textContent = t("auth.passwordLabel");
-    const passwordInput = document.createElement("input");
-    passwordInput.id = passwordId;
-    passwordInput.name = "password";
-    passwordInput.type = "password";
-    passwordInput.required = true;
-    passwordInput.autocomplete = "current-password";
-    passwordInput.placeholder = t("auth.passwordPlaceholder");
-    passwordInput.className = "prood-input";
-    passwordInput.value = this.password;
-    passwordInput.addEventListener("input", () => {
-      this.password = passwordInput.value;
+    const passwordInput = el("input", {
+      id: passwordId,
+      type: "password",
+      required: true,
+      cls: "prood-input",
+      placeholder: t("auth.passwordPlaceholder"),
+      val: this.password,
+      attrs: { name: "password", autocomplete: "current-password" },
+      on: { input: () => (this.password = passwordInput.value) },
     });
     this.passwordInputEl = passwordInput;
-    passwordGroup.append(passwordLabel, passwordInput);
 
-    form.append(headingGroup, emailGroup, passwordGroup);
+    const feedback = alertBanner(this.errorMessage);
+    if (feedback) feedback.setAttribute("data-auth-feedback", "");
 
-    if (this.errorMessage) {
-      const feedback = document.createElement("p");
-      feedback.className = "prood-auth-feedback";
-      feedback.setAttribute("role", "alert");
-      feedback.setAttribute("data-auth-feedback", "");
-      feedback.textContent = this.errorMessage;
-      form.appendChild(feedback);
-    }
+    const form = el(
+      "form",
+      {
+        cls: "prood-login-form",
+        attrs: {
+          "data-login-form": true,
+          "aria-label": t("aria.signInForm"),
+          "aria-busy": String(this.busy),
+        },
+        on: {
+          submit: (event) => {
+            event.preventDefault();
+            if (this.emailInputEl) this.email = this.emailInputEl.value;
+            if (this.passwordInputEl) this.password = this.passwordInputEl.value;
+            void this.submit();
+          },
+        },
+      },
+      el(
+        "div",
+        {},
+        el("h1", { cls: "prood-login-title", text: t("auth.signInTitle") }),
+        el("p", { cls: "prood-login-subtitle", text: t("auth.signInSubtitle") }),
+      ),
+      fieldGroup(emailId, t("auth.emailLabel"), emailInput),
+      fieldGroup(passwordId, t("auth.passwordLabel"), passwordInput),
+      feedback,
+      el("button", {
+        type: "submit",
+        disabled: this.busy,
+        cls: "prood-btn-primary prood-btn-full",
+        text: this.busy ? t("auth.signingIn") : t("auth.signInButton"),
+      }),
+    );
 
-    const submitBtn = document.createElement("button");
-    submitBtn.type = "submit";
-    submitBtn.disabled = this.busy;
-    submitBtn.className = "prood-btn-primary prood-btn-full";
-    submitBtn.textContent = this.busy ? t("auth.signingIn") : t("auth.signInButton");
-    form.appendChild(submitBtn);
-
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      if (this.emailInputEl) {
-        this.email = this.emailInputEl.value;
-      }
-      if (this.passwordInputEl) {
-        this.password = this.passwordInputEl.value;
-      }
-      void this.submit();
-    });
-
-    wrapper.appendChild(form);
-    this.appendChild(wrapper);
+    this.appendChild(el("div", { cls: "prood-login-wrap" }, form));
   }
 
   async submit(): Promise<void> {
-    if (typeof fetch === "undefined" || this.inFlight) {
-      return;
-    }
+    if (typeof fetch === "undefined" || this.inFlight) return;
     this.inFlight = true;
     this.busy = true;
     this.errorMessage = "";
@@ -245,9 +207,7 @@ export class ProodLoginFormElement extends BaseElement {
       this.errorMessage = this.i18n.t("auth.networkError");
     } finally {
       this.inFlight = false;
-      if (!redirecting) {
-        this.busy = false;
-      }
+      if (!redirecting) this.busy = false;
       this.render();
     }
   }

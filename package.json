@@ -32,6 +32,7 @@
     "@prood/web": "workspace:*",
     "@types/node": "^22.15.0",
     "esbuild": "^0.25.0",
+    "happy-dom": "^21.0.4",
     "typescript": "^5.8.2",
     "vitest": "^3.2.0"
   },

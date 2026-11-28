@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -150,6 +150,7 @@ describe("@prood/server Web-Standard app", () => {
                 role: "admin",
               },
             ],
+            deleteByWorkspaceAndUser: async () => false,
           },
           projects: {
             create: async () => {
@@ -164,6 +165,7 @@ describe("@prood/server Web-Standard app", () => {
               throw new Error("not implemented");
             },
             findMembership: async () => null,
+            deleteMembership: async () => false,
           },
           statuses: {
             create: async () => {
@@ -171,16 +173,23 @@ describe("@prood/server Web-Standard app", () => {
             },
             findById: async () => null,
             listByProject: async () => [],
+            update: async () => null,
+            deleteById: async () => false,
           },
           tasks: {
             create: async () => {
               throw new Error("not implemented");
             },
             findById: async () => null,
+            lockByIdsForUpdate: async () => [],
             listByProject: async () => [],
             listSubtasks: async () => [],
             listSubtasksByParentIds: async () => [],
+            searchInWorkspace: async () => [],
             update: async () => null,
+            clearParentTaskIds: async () => {},
+            updateStatusForTaskIds: async () => {},
+            replaceStatusInProject: async () => {},
             deleteById: async () => false,
           },
           issueKeys: {
@@ -194,6 +203,10 @@ describe("@prood/server Web-Standard app", () => {
             listPrefixesByNamespace: async () => [],
             listPrefixesByNamespaceIds: async () => [],
             findPrefixOwner: async () => null,
+            findProjectIdByWorkspacePrefix: async () => null,
+            findProjectIdsByWorkspacesAndPrefix: async () => [],
+            findTaskIdByWorkspaceKey: async () => null,
+            findTaskIdsByWorkspacesAndKey: async () => [],
             reservePrefix: async () => null,
             initCounter: async () => {},
             allocateNextNumber: async () => 1,
@@ -207,6 +220,10 @@ describe("@prood/server Web-Standard app", () => {
             },
             listByWorkspace: async () => [],
             listAll: async () => [],
+          },
+          idempotency: {
+            findByKey: async () => null,
+            createIfAbsent: async () => null,
           },
         }),
     };
@@ -367,9 +384,23 @@ describe("@prood/server Web-Standard app", () => {
         expect(res.headers.get("cache-control")).toBe("no-store");
         expect(res.headers.get("x-content-type-options")).toBe("nosniff");
       }
+      mkdirSync(join(assetDir, "chunks"), { recursive: true });
+      writeFileSync(join(assetDir, "chunks", "settings-ABC123.js"), "export const x=1;");
+      writeFileSync(join(assetDir, "chunks", "settings-ABC123.js.map"), "{}");
+
       const jsRes = await rootApp.request("/shell.js");
       expect(jsRes.status).toBe(200);
       expect(jsRes.headers.get("x-content-type-options")).toBe("nosniff");
+
+      const chunkRes = await rootApp.request("/chunks/settings-ABC123.js");
+      expect(chunkRes.status).toBe(200);
+      expect(chunkRes.headers.get("content-type")).toContain("application/javascript");
+      expect(chunkRes.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+      expect(chunkRes.headers.get("x-content-type-options")).toBe("nosniff");
+
+      expect((await rootApp.request("/chunks/settings-ABC123.js.map")).status).toBe(404);
+      expect((await rootApp.request("/chunks/..%2Fshell.js")).status).toBe(404);
+      expect((await rootApp.request("/chunks/missing-000.js")).status).toBe(404);
     } finally {
       rmSync(assetDir, { recursive: true, force: true });
     }

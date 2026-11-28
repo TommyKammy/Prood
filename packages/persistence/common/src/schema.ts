@@ -189,6 +189,19 @@ export interface OutboxEventTable {
   created_at: string;
 }
 
+export interface IdempotencyRecordTable {
+  actor_user_id: string;
+  operation: string;
+  idempotency_key: string;
+  request_fingerprint: string;
+  workspace_id: string | null;
+  project_id: string | null;
+  target_type: string;
+  target_id: string;
+  response_json: string;
+  created_at: string;
+}
+
 export interface ProodDatabase {
   automation_receipts: {
     workspace: string;
@@ -238,4 +251,5 @@ export interface ProodDatabase {
   issue_key_prefixes: IssueKeyPrefixTable;
   task_issue_keys: TaskIssueKeyTable;
   outbox_events: OutboxEventTable;
+  idempotency_records: IdempotencyRecordTable;
 }

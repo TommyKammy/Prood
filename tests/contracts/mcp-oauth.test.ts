@@ -384,7 +384,7 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
     });
 
     const v4 = await db.migrate();
-    expect(v4).toEqual({ appliedVersions: [4, 5, 6, 8, 9], currentVersion: 9 });
+    expect(v4).toEqual({ appliedVersions: [4, 5, 6, 7, 8, 9], currentVersion: 9 });
 
     const loaded = await db.uow.run(async (repos) => ({
       workspace: await repos.workspaces.findById(wksId),
@@ -539,10 +539,26 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
       }
       const result = await client.callTool({
         name: "create_task",
-        arguments: { projectId: project.id, title: "From MCP" },
+        arguments: {
+          projectRef: project.id,
+          title: "From MCP",
+          idempotencyKey: "mcp-auto-create-1",
+        },
       });
       expect(result.isError).not.toBe(true);
-      const task = JSON.parse((result.content as { text: string }[])[0]!.text).task;
+      const createdBody = JSON.parse((result.content as { text: string }[])[0]!.text);
+      expect(createdBody.idempotentReplay).toBe(false);
+      const task = createdBody.task;
+      const replayResult = await client.callTool({
+        name: "create_task",
+        arguments: {
+          projectRef: project.id,
+          title: "From MCP",
+          idempotencyKey: "mcp-auto-create-1",
+        },
+      });
+      expect(replayResult.isError).not.toBe(true);
+      expect(JSON.parse((replayResult.content as { text: string }[])[0]!.text).idempotentReplay).toBe(true);
       expect(
         (
           await client.callTool({
@@ -568,6 +584,22 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
           )
         ).status,
       ).toBe(200);
+      // Atomic start_task transition also triggers status.changed & assignee.changed once, and no-ops on replay.
+      const startCandidateRes = await req(path, { title: "Start via MCP" });
+      expect(startCandidateRes.status).toBe(201);
+      const startCandidate = (await startCandidateRes.json()).task;
+      const startRes = await client.callTool({
+        name: "start_task",
+        arguments: { taskRef: startCandidate.id },
+      });
+      expect(startRes.isError).not.toBe(true);
+      expect(JSON.parse((startRes.content as { text: string }[])[0]!.text).changed).toBe(true);
+      const startReplay = await client.callTool({
+        name: "start_task",
+        arguments: { taskRef: startCandidate.id },
+      });
+      expect(startReplay.isError).not.toBe(true);
+      expect(JSON.parse((startReplay.content as { text: string }[])[0]!.text).changed).toBe(false);
       const envelopes = await db.kysely
         .selectFrom("automation_deliveries")
         .selectAll()
@@ -576,8 +608,11 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
       expect(envelopes.map((r) => r.rule).sort()).toEqual([
         "assigned",
         "assigned",
+        "assigned",
         "create",
         "create",
+        "create",
+        "status",
         "status",
         "status",
       ]);
@@ -588,6 +623,11 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
           .map((e) => e.channel)
           .sort(),
       ).toEqual(["mcp", "web"]);
+      expect(
+        audit
+          .filter((e) => e.eventType === "task.started")
+          .map((e) => e.channel),
+      ).toEqual(["mcp"]);
     } finally {
       await client.close();
     }

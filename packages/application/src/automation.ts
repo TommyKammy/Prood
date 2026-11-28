@@ -112,7 +112,8 @@ export function matchesTrigger(
   } else if (def.when === "task.created") {
     if (eventType !== "task.created") return false;
   } else {
-    if (eventType !== "task.updated" || !before || !after) return false;
+    if ((eventType !== "task.updated" && eventType !== "task.started") || !before || !after)
+      return false;
     const field = def.when === "status.changed" ? "statusId" : "assigneeId";
     if (
       before[field] === after[field] ||
@@ -135,7 +136,7 @@ export async function routeTaskEvent(
     !e.workspaceId ||
     !e.targetId ||
     e.outcome !== "succeeded" ||
-    !["task.created", "task.updated", "task.manual"].includes(e.eventType)
+    !["task.created", "task.updated", "task.started", "task.manual"].includes(e.eventType)
   )
     return;
   const p = e.payload;

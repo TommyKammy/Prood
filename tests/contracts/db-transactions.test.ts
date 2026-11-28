@@ -133,8 +133,13 @@ describe(`DB migrations, UnitOfWork, error mapping & concurrency (${targetDb})`,
     expect(await db.getAppliedMigrationVersions()).toEqual([]);
 
     const first = await db.migrate();
-    expect(first).toEqual({ appliedVersions: [1, 2, 3, 4, 5, 6, 8, 9], currentVersion: 9 });
-    expect(await db.getAppliedMigrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 8, 9]);
+    expect(first).toEqual({
+      appliedVersions: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+      currentVersion: 9,
+    });
+    expect(await db.getAppliedMigrationVersions()).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9,
+    ]);
 
     const second = await db.migrate();
     expect(second).toEqual({ appliedVersions: [], currentVersion: 9 });
@@ -152,11 +157,15 @@ describe(`DB migrations, UnitOfWork, error mapping & concurrency (${targetDb})`,
       (a, b) => a - b,
     );
 
-    expect(allApplied).toEqual([1, 2, 3, 4, 5, 6, 8, 9]);
+    expect(allApplied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     expect(resA.currentVersion).toBe(9);
     expect(resB.currentVersion).toBe(9);
-    expect(await clientA.getAppliedMigrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 8, 9]);
-    expect(await clientB.getAppliedMigrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 8, 9]);
+    expect(await clientA.getAppliedMigrationVersions()).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9,
+    ]);
+    expect(await clientB.getAppliedMigrationVersions()).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9,
+    ]);
   });
 
   it("upgrades from v1 with existing workspace rows and backfills workspace_settings", async () => {
@@ -179,7 +188,10 @@ describe(`DB migrations, UnitOfWork, error mapping & concurrency (${targetDb})`,
     });
 
     const v2Result = await db.migrate();
-    expect(v2Result).toEqual({ appliedVersions: [2, 3, 4, 5, 6, 8, 9], currentVersion: 9 });
+    expect(v2Result).toEqual({
+      appliedVersions: [2, 3, 4, 5, 6, 7, 8, 9],
+      currentVersion: 9,
+    });
 
     const verify = await db.uow.run(async (repos) => ({
       workspace: await repos.workspaces.findById(wksId),

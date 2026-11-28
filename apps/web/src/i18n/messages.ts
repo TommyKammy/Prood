@@ -143,3 +143,14 @@ export function createI18n(options: I18nOptions = {}): I18nInstance {
     },
   };
 }
+
+/**
+ * Resolves a backend API error `messageKey` into the active UI locale, falling
+ * back to `error.generic` if the key is unknown.
+ */
+export function translateApiError(i18n: I18nInstance, messageKey: string): string {
+  if (Object.hasOwn(enMessages, messageKey)) {
+    return i18n.t(messageKey as MessageKey);
+  }
+  return i18n.t("error.generic");
+}
