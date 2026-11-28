@@ -1335,5 +1335,154 @@ describe("@prood/web async race regressions", () => {
       "Second task draft",
     );
   });
+
+  it("clears selectable search results immediately when changing the search query (4725652794)", async () => {
+    const userId = generateEntityId("usr", 1_795_000_000_000, new Uint8Array(10).fill(1));
+    const wksA = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(2));
+    const projA = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(3));
+    const projB = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(4));
+    const statusA = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(5));
+    const statusB = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(6));
+    const projCurrent = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(7));
+    const statusCur = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(8));
+    const projectCur = makeProject(wksA, projCurrent, statusCur, "Current Project");
+    const projectA = makeProject(wksA, projA, statusA, "Project Alpha");
+    const projectB = makeProject(wksA, projB, statusB, "Project Beta");
+    const task1 = {
+      ...makeTask(wksA, projA, statusA, 50, "Task One"),
+      issueKey: "PRD-1",
+    };
+    const task2 = {
+      ...makeTask(wksA, projB, statusB, 51, "Task Two"),
+      issueKey: "PRD-2",
+    };
+
+    let resolveSecondSearch!: (res: Response) => void;
+    const secondSearchDeferred = new Promise<Response>((resolve) => {
+      resolveSecondSearch = resolve;
+    });
+    const searchQueries: string[] = [];
+
+    const { win, doc, shell } = await mountMockedShell(async (path) => {
+      if (path === "/api/v1/me") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          user: { id: userId, email: "alice@example.com", displayName: "Alice" },
+          memberships: [
+            {
+              membershipId: makeMembershipId(170),
+              workspaceId: wksA,
+              workspaceSlug: "ws-a",
+              workspaceName: "WS Alpha",
+              role: "admin",
+            },
+          ],
+        } satisfies MeResponse);
+      }
+      if (path === `/api/v1/workspaces/${wksA}/projects`) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          projects: [projectCur, projectA, projectB],
+        });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/settings`) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          settings: {
+            workspaceId: wksA,
+            defaultLocale: "en",
+            devProjectsEnabled: false,
+            updatedAt: "2026-11-28T12:00:00.000Z",
+          } satisfies WorkspaceSettingsDto,
+        });
+      }
+      if (path.endsWith("/tasks")) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, tasks: [] });
+      }
+      if (path.endsWith("/dev-settings")) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          allowed: false,
+          canManage: true,
+          dev: null,
+          statuses: projectCur.statuses,
+        } satisfies ProjectDevSettingsResponse);
+      }
+      if (path.startsWith(`/api/v1/workspaces/${wksA}/tasks/search`)) {
+        const q = new URL(path, "http://127.0.0.1:3000").searchParams.get("q") ?? "";
+        searchQueries.push(q);
+        if (q === "PRD-1") {
+          return jsonResponse({
+            contractVersion: CONTRACT_VERSION,
+            items: [{ matchKind: "exact_key", task: task1 }],
+            nextCursor: null,
+          });
+        }
+        if (q === "PRD-2") {
+          return secondSearchDeferred;
+        }
+      }
+      throw new Error(`Unexpected request: GET ${path}`);
+    });
+
+    await waitForCondition(
+      () => shell.getActiveProjectId() === projCurrent,
+      "initial project loaded",
+    );
+
+    await shell.openSearch();
+    const searchInput = doc.querySelector<HTMLInputElement>("[data-search-input]")!;
+    const dialog = doc.querySelector<HTMLDialogElement>("[data-search-dialog]")!;
+    const searchForm = dialog.querySelector("form")!;
+
+    searchInput.value = "PRD-1";
+    searchInput.dispatchEvent(new win.Event("input") as unknown as Event);
+    await waitForCondition(
+      () => doc.querySelector(`[data-search-result-id="${task1.id}"]`) !== null,
+      "PRD-1 result rendered",
+    );
+
+    // Replace query with PRD-2 and immediately press Enter / submit before PRD-2 resolves
+    searchInput.value = "PRD-2";
+    searchInput.dispatchEvent(new win.Event("input") as unknown as Event);
+    expect(doc.querySelectorAll("[data-search-result-id]").length).toBe(0);
+
+    searchInput.dispatchEvent(
+      new win.KeyboardEvent("keydown", { key: "Enter", cancelable: true }) as unknown as Event,
+    );
+    searchForm.dispatchEvent(
+      new win.Event("submit", { cancelable: true }) as unknown as Event,
+    );
+    await waitForCondition(
+      () => searchQueries.includes("PRD-2"),
+      "PRD-2 search dispatched on submit",
+    );
+
+    // Previous PRD-1 result must NOT have been selected
+    expect(shell.getActiveProjectId()).toBe(projCurrent);
+    expect(dialog.open || dialog.hasAttribute("open")).toBe(true);
+    expect(doc.querySelectorAll("[data-search-result-id]").length).toBe(0);
+
+    // Once PRD-2 finishes, selecting via Enter navigates to task2's project (projB)
+    resolveSecondSearch(
+      jsonResponse({
+        contractVersion: CONTRACT_VERSION,
+        items: [{ matchKind: "exact_key", task: task2 }],
+        nextCursor: null,
+      }),
+    );
+    await waitForCondition(
+      () => doc.querySelector(`[data-search-result-id="${task2.id}"]`) !== null,
+      "PRD-2 result rendered",
+    );
+
+    searchInput.dispatchEvent(
+      new win.KeyboardEvent("keydown", { key: "Enter", cancelable: true }) as unknown as Event,
+    );
+    await waitForCondition(
+      () => shell.getActiveProjectId() === projB,
+      "PRD-2 selected on Enter",
+    );
+  });
 });
 

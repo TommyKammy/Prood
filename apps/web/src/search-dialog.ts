@@ -241,25 +241,30 @@ export class SearchPaletteController {
   private scheduleSearch(): void {
     this.clearDebounce();
     this.searchSeq += 1;
+    this.items = [];
+    this.activeIndex = -1;
+    this.renderResults();
     if (!this.searchInput.value.trim()) {
       void this.executeSearch();
       return;
     }
+    this.statusEl.textContent = this.callbacks.getContext().i18n.t("search.loading");
     this.debounceTimer = setTimeout(() => {
       void this.executeSearch();
     }, 150);
   }
 
   async executeSearch(): Promise<void> {
+    this.clearDebounce();
     const seq = ++this.searchSeq;
     const { workspaceId, activeProjectId, i18n } = this.callbacks.getContext();
     const { t } = i18n;
     const query = this.searchInput.value.trim();
+    this.items = [];
+    this.activeIndex = -1;
+    this.renderResults();
     if (!workspaceId || !query) {
-      this.items = [];
-      this.activeIndex = -1;
       this.statusEl.textContent = t("search.emptyPrompt");
-      this.renderResults();
       return;
     }
 
