@@ -842,6 +842,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           (await repos.automation.confirmed(workspace, event, rule)) ??
           (await repos.automation.operationRun(event, rule));
         if (known && known !== run) return { status: "conflict" } as const;
+        if (!canStart()) return { status: "canceled" } as const;
         if (probe) {
           if (await repos.automation.firstCheck(d, run, "review"))
             await appendOutbox(repos, {
@@ -862,7 +863,6 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
             });
           return { status: "review" } as const;
         }
-        if (!canStart()) return { status: "canceled" } as const;
         const outcome =
           !authorized || !task
             ? "denied"
@@ -970,19 +970,20 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         if (!def || !(await validCandidates(repos, pr, def)))
           return fail(400, "VALIDATION_ERROR", "error.validation");
         const fields = { statusId: task.statusId, assigneeId: task.assigneeId };
-        const events = await repos.automation.events(projectId, id);
         const sample =
           def.when === "manual"
             ? {
                 eventType: "task.manual",
                 payload: { rule, ...fields, taskVersion: task.version },
               }
-            : events.find(
-                (e) =>
-                  e.eventType ===
-                    (def.when === "task.created" ? "task.created" : "task.updated") &&
-                  e.outcome === "succeeded",
-              );
+            : (
+                await repos.automation.events(
+                  projectId,
+                  id,
+                  undefined,
+                  def.when === "task.created" ? "task.created" : "task.updated",
+                )
+              )[0];
         if (!sample || !matchesTrigger(def, rule, sample.eventType, sample.payload))
           return {
             ok: true as const,
@@ -1116,7 +1117,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
             actions,
           });
         }
-        for (const { delivery: d, run, reason } of await repos.automation.routed(
+        for (const { delivery: d, run, reason, at } of await repos.automation.routed(
           projectId,
           taskId,
           rule,
@@ -1134,7 +1135,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
             task: task.id,
             rule: d.rule,
             revision: d.revision,
-            at: "",
+            at,
             channel: "automation",
             actor: d.proposal.delegate,
             origin: d.proposal.origin,
@@ -1144,6 +1145,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
             actions: [],
           });
         }
+        entries.sort((a, b) => b.at.localeCompare(a.at));
         return { ok: true as const, data: { entries } };
       });
     },

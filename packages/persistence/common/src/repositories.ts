@@ -1618,11 +1618,12 @@ export function createKyselyRepositories(
       return (
         await query
           .innerJoin("outbox_events as e", "e.event_id", "d.event")
+          .select("e.occurred_at as at")
           .orderBy("e.occurred_at", "desc")
           .orderBy("d.event", "desc")
           .limit(100)
           .execute()
-      ).map((r) => ({ delivery: JSON.parse(r.envelope), run: r.run, reason: r.reason }));
+      ).map((r) => ({ delivery: JSON.parse(r.envelope), run: r.run, reason: r.reason, at: r.at }));
     },
     async members(workspace) {
       const rows = await executor
@@ -1634,7 +1635,7 @@ export function createKyselyRepositories(
         .execute();
       return rows.map((r) => ({ ...r, id: r.id as UserId }));
     },
-    async events(project, task, rule) {
+    async events(project, task, rule, sampleType) {
       let query = executor
         .selectFrom("outbox_events")
         .selectAll()
@@ -1653,6 +1654,11 @@ export function createKyselyRepositories(
           "automation.rule.publish",
           "automation.rule.stop",
         ]);
+      if (sampleType)
+        query = query
+          .where("event_type", "=", sampleType)
+          .where("target_type", "=", "task")
+          .where("outcome", "=", "succeeded");
       if (task) query = query.where("target_id", "=", task);
       if (rule)
         query = query.where((eb) =>
@@ -1668,7 +1674,11 @@ export function createKyselyRepositories(
           ]),
         );
       return (
-        await query.orderBy("occurred_at", "desc").orderBy("id", "desc").limit(100).execute()
+        await query
+          .orderBy("occurred_at", "desc")
+          .orderBy("id", "desc")
+          .limit(sampleType ? 1 : 100)
+          .execute()
       ).map(toOutboxEventRecord);
     },
     async lockOperation(workspace, run) {

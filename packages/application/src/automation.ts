@@ -69,12 +69,13 @@ export interface AutomationRepository {
     project: ProjectId,
     task?: TaskPublicId,
     rule?: string,
-  ): Promise<{ delivery: Delivery; run: string | null; reason: string | null }[]>;
+  ): Promise<{ delivery: Delivery; run: string | null; reason: string | null; at: string }[]>;
   members(workspace: WorkspaceId): Promise<{ id: UserId; name: string }[]>;
   events(
     project: ProjectId,
     task?: TaskPublicId,
     rule?: string,
+    sampleType?: "task.created" | "task.updated",
   ): Promise<OutboxEventRecord[]>;
   operationRun(event: string, rule: string): Promise<string | null>;
   receipt(workspace: string, run: string): Promise<EffectReceipt | null>;

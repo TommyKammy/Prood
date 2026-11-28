@@ -1491,6 +1491,33 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
       expect(await deliverNext(deps, workspace, () => run)).toBe(true);
       return [workspace, result.data.event, "assign", run, project.id, 1] as const;
     }
+    // A long stream of unrelated manual events must not hide the task's creation.
+    const sampleTask = await w.createTask(actor, project.id, { title: "Busy sample" });
+    if (!sampleTask.ok) throw Error("sample task");
+    const sampleId = sampleTask.data.task.id;
+    const created = await db.kysely
+      .selectFrom("outbox_events")
+      .selectAll()
+      .where("target_id", "=", sampleId)
+      .where("event_type", "=", "task.created")
+      .executeTakeFirstOrThrow();
+    await db.kysely
+      .insertInto("outbox_events")
+      .values(
+        Array.from({ length: 101 }, () => ({
+          ...created,
+          id: ids.next("evt"),
+          event_id: ids.next("evt"),
+          event_type: "task.manual",
+          occurred_at: new Date(Date.parse(created.occurred_at) + 1).toISOString(),
+        })),
+      )
+      .execute();
+    const creationTrial = await w.simulateAutomation(actor, project.id, "assign", sampleId, {
+      ...definition,
+      when: "task.created",
+    });
+    expect(creationTrial.ok && creationTrial.data.status).toBe("prepared");
     const beforeTrial = await db.uow.run((r) => r.outbox.listByWorkspace(workspace));
     const trial = await w.simulateAutomation(
       actor,
@@ -1509,6 +1536,12 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
       await db.kysely.selectFrom("automation_deliveries").where("rule","=","assign").selectAll().execute(),
     ).toHaveLength(0);
     const args = await start();
+    const pendingHistory = await w.automationHistory(actor, project.id, task.id, "assign");
+    expect(
+      pendingHistory.ok &&
+        pendingHistory.data.entries.find((e) => e.event === "automation.pending")?.at,
+    ).toBeTruthy();
+    expect((await w.executeAutomation(...args, true, () => false)).status).toBe("canceled");
     const broken = createWorkUseCases({
       ...deps,
       uow: {
