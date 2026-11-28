@@ -2,6 +2,7 @@ import { sql, type Kysely, type Transaction } from "kysely";
 import type {
   AppendOutboxEventInput,
   AuthIdentityRecord,
+  CreateIdempotencyRecordInput,
   CreateIssueKeyNamespaceInput,
   CreateMembershipInput,
   CreateProjectInput,
@@ -10,6 +11,8 @@ import type {
   CreateTaskIssueKeyInput,
   CreateUserInput,
   CreateWorkspaceInput,
+  IdempotencyRecord,
+  IdempotencyRepository,
   IssueKeyNamespaceRecord,
   IssueKeyPrefixRecord,
   IssueKeyRepository,
@@ -64,6 +67,7 @@ import {
 } from "@prood/domain";
 import type {
   AuthIdentityTable,
+  IdempotencyRecordTable,
   IssueKeyNamespaceTable,
   IssueKeyPrefixTable,
   OutboxEventTable,
@@ -244,6 +248,21 @@ function toOutboxEventRecord(row: OutboxEventTable): OutboxEventRecord {
     nextAttemptAt: row.next_attempt_at,
     deliveredAt: row.delivered_at,
     lastError: row.last_error,
+    createdAt: row.created_at,
+  };
+}
+
+function toIdempotencyRecord(row: IdempotencyRecordTable): IdempotencyRecord {
+  return {
+    actorUserId: row.actor_user_id as UserId,
+    operation: row.operation,
+    idempotencyKey: row.idempotency_key,
+    requestFingerprint: row.request_fingerprint,
+    workspaceId: row.workspace_id as WorkspaceId | null,
+    projectId: row.project_id as ProjectId | null,
+    targetType: row.target_type,
+    targetId: row.target_id,
+    responseJson: row.response_json,
     createdAt: row.created_at,
   };
 }
@@ -1515,6 +1534,55 @@ export function createKyselyRepositories(
       return row?.project_id ? (row.project_id as ProjectId) : null;
     },
 
+    async findProjectIdsByWorkspacesAndPrefix(
+      workspaceIds: readonly WorkspaceId[],
+      prefix: string,
+    ): Promise<Array<{ workspaceId: WorkspaceId; projectId: ProjectId }>> {
+      const uniqueWorkspaceIds = Array.from(new Set(workspaceIds));
+      if (uniqueWorkspaceIds.length === 0) {
+        return [];
+      }
+      const results: Array<{ workspaceId: WorkspaceId; projectId: ProjectId }> =
+        [];
+      for (let i = 0; i < uniqueWorkspaceIds.length; i += IN_CLAUSE_BATCH_SIZE) {
+        const chunk = uniqueWorkspaceIds.slice(i, i + IN_CLAUSE_BATCH_SIZE);
+        const rows = await runQuery(
+          () =>
+            executor
+              .selectFrom("issue_key_prefixes")
+              .innerJoin(
+                "issue_key_namespaces",
+                "issue_key_namespaces.id",
+                "issue_key_prefixes.namespace_id",
+              )
+              .innerJoin(
+                "projects",
+                "projects.id",
+                "issue_key_namespaces.project_id",
+              )
+              .select([
+                "issue_key_prefixes.workspace_id",
+                "issue_key_namespaces.project_id",
+              ])
+              .where("issue_key_prefixes.workspace_id", "in", chunk)
+              .where("issue_key_prefixes.prefix", "=", prefix)
+              .where("projects.archived_at", "is", null)
+              .execute(),
+          mapError,
+          assertActive,
+        );
+        for (const row of rows) {
+          if (row.project_id) {
+            results.push({
+              workspaceId: row.workspace_id as WorkspaceId,
+              projectId: row.project_id as ProjectId,
+            });
+          }
+        }
+      }
+      return results;
+    },
+
     async findTaskIdByWorkspaceKey(
       workspaceId: WorkspaceId,
       prefix: string,
@@ -1828,6 +1896,60 @@ export function createKyselyRepositories(
     },
   };
 
+  const idempotency: IdempotencyRepository = {
+    async findByKey(
+      actorUserId: UserId,
+      operation: string,
+      idempotencyKey: string,
+    ): Promise<IdempotencyRecord | null> {
+      const row = await runQuery(
+        () =>
+          executor
+            .selectFrom("idempotency_records")
+            .selectAll()
+            .where("actor_user_id", "=", actorUserId)
+            .where("operation", "=", operation)
+            .where("idempotency_key", "=", idempotencyKey)
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return row ? toIdempotencyRecord(row) : null;
+    },
+
+    async createIfAbsent(
+      input: CreateIdempotencyRecordInput,
+    ): Promise<IdempotencyRecord | null> {
+      const row = await runQuery(
+        () =>
+          executor
+            .insertInto("idempotency_records")
+            .values({
+              actor_user_id: input.actorUserId,
+              operation: input.operation,
+              idempotency_key: input.idempotencyKey,
+              request_fingerprint: input.requestFingerprint,
+              workspace_id: input.workspaceId,
+              project_id: input.projectId,
+              target_type: input.targetType,
+              target_id: input.targetId,
+              response_json: input.responseJson,
+              created_at: input.createdAt,
+            })
+            .onConflict((oc) =>
+              oc
+                .columns(["actor_user_id", "operation", "idempotency_key"])
+                .doNothing(),
+            )
+            .returningAll()
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return row ? toIdempotencyRecord(row) : null;
+    },
+  };
+
   return {
     driver,
     workspaces,
@@ -1839,5 +1961,6 @@ export function createKyselyRepositories(
     tasks,
     issueKeys,
     outbox,
+    idempotency,
   };
 }

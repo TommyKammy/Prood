@@ -182,6 +182,7 @@ describe("@prood/server Web-Standard app", () => {
             listPrefixesByNamespaceIds: async () => [],
             findPrefixOwner: async () => null,
             findProjectIdByWorkspacePrefix: async () => null,
+            findProjectIdsByWorkspacesAndPrefix: async () => [],
             findTaskIdByWorkspaceKey: async () => null,
             findTaskIdsByWorkspacesAndKey: async () => [],
             reservePrefix: async () => null,
@@ -197,6 +198,10 @@ describe("@prood/server Web-Standard app", () => {
             },
             listByWorkspace: async () => [],
             listAll: async () => [],
+          },
+          idempotency: {
+            findByKey: async () => null,
+            createIfAbsent: async () => null,
           },
         }),
     };

@@ -134,13 +134,13 @@ describe(`DB migrations, UnitOfWork, error mapping & concurrency (${targetDb})`,
 
     const first = await db.migrate();
     expect(first).toEqual({
-      appliedVersions: [1, 2, 3, 4, 5, 6],
-      currentVersion: 6,
+      appliedVersions: [1, 2, 3, 4, 5, 6, 7],
+      currentVersion: 7,
     });
-    expect(await db.getAppliedMigrationVersions()).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(await db.getAppliedMigrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7]);
 
     const second = await db.migrate();
-    expect(second).toEqual({ appliedVersions: [], currentVersion: 6 });
+    expect(second).toEqual({ appliedVersions: [], currentVersion: 7 });
   });
 
   it("serializes concurrent migrate() calls on a fresh DB without duplicate application", async () => {
@@ -155,11 +155,11 @@ describe(`DB migrations, UnitOfWork, error mapping & concurrency (${targetDb})`,
       (a, b) => a - b,
     );
 
-    expect(allApplied).toEqual([1, 2, 3, 4, 5, 6]);
-    expect(resA.currentVersion).toBe(6);
-    expect(resB.currentVersion).toBe(6);
-    expect(await clientA.getAppliedMigrationVersions()).toEqual([1, 2, 3, 4, 5, 6]);
-    expect(await clientB.getAppliedMigrationVersions()).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(allApplied).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(resA.currentVersion).toBe(7);
+    expect(resB.currentVersion).toBe(7);
+    expect(await clientA.getAppliedMigrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(await clientB.getAppliedMigrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7]);
   });
 
   it("upgrades from v1 with existing workspace rows and backfills workspace_settings", async () => {
@@ -183,8 +183,8 @@ describe(`DB migrations, UnitOfWork, error mapping & concurrency (${targetDb})`,
 
     const v2Result = await db.migrate();
     expect(v2Result).toEqual({
-      appliedVersions: [2, 3, 4, 5, 6],
-      currentVersion: 6,
+      appliedVersions: [2, 3, 4, 5, 6, 7],
+      currentVersion: 7,
     });
 
     const verify = await db.uow.run(async (repos) => ({

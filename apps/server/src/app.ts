@@ -341,6 +341,17 @@ export function createApp(deps: AppDeps): Hono {
       if (!body) {
         return c.json(errorBody("VALIDATION_ERROR", "error.validation"), 400);
       }
+      const headerIdempotencyKey = c.req.header("idempotency-key");
+      if (headerIdempotencyKey !== undefined) {
+        if (
+          body.idempotencyKey !== undefined &&
+          (typeof body.idempotencyKey !== "string" ||
+            body.idempotencyKey.trim() !== headerIdempotencyKey.trim())
+        ) {
+          return c.json(errorBody("VALIDATION_ERROR", "error.validation"), 400);
+        }
+        body.idempotencyKey = headerIdempotencyKey;
+      }
       const actorResult = await resolveActorOrRespond(c, session);
       if (!actorResult.ok) {
         return actorResult.response;
@@ -349,7 +360,7 @@ export function createApp(deps: AppDeps): Hono {
       if (!result.ok) {
         return c.json(errorBody(result.code, result.messageKey), result.status);
       }
-      return c.json(result.data, 201);
+      return c.json(result.data, result.data.idempotentReplay ? 200 : 201);
     });
 
     app.get("/api/v1/projects/:projectId/tasks", async (c) => {

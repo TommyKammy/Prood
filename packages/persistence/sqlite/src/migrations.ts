@@ -376,4 +376,24 @@ export const SQLITE_MIGRATIONS: readonly MigrationDefinition[] = [
       )`,
     ],
   },
+  {
+    version: 7,
+    name: "0007_init_idempotency_records",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS idempotency_records (
+        actor_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        operation TEXT NOT NULL CHECK (length(trim(operation)) > 0),
+        idempotency_key TEXT NOT NULL CHECK (length(trim(idempotency_key)) BETWEEN 1 AND 128),
+        request_fingerprint TEXT NOT NULL CHECK (length(request_fingerprint) > 0),
+        workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
+        project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+        target_type TEXT NOT NULL CHECK (length(trim(target_type)) > 0),
+        target_id TEXT NOT NULL CHECK (length(trim(target_id)) > 0),
+        response_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (actor_user_id, operation, idempotency_key)
+      )`,
+      `CREATE INDEX IF NOT EXISTS idempotency_records_target_idx ON idempotency_records (target_type, target_id)`,
+    ],
+  },
 ];

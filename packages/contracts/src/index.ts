@@ -80,7 +80,18 @@ export interface ApiErrorResponse {
   };
 }
 
-export const MCP_REQUIRED_WHOAMI_SCOPE = "prood:read" as const;
+export const MCP_READ_SCOPE = "prood:read" as const;
+export const MCP_WRITE_SCOPE = "prood:write" as const;
+export const MCP_REQUIRED_WHOAMI_SCOPE = MCP_READ_SCOPE;
+
+export interface McpToolErrorPayload {
+  contractVersion: typeof CONTRACT_VERSION;
+  error: {
+    code: ApiErrorCode;
+    status: number;
+    messageKey: string;
+  };
+}
 
 export interface McpWhoamiResponse {
   contractVersion: typeof CONTRACT_VERSION;
@@ -238,6 +249,7 @@ export interface TaskSearchResponse {
 export interface TaskResponse {
   contractVersion: typeof CONTRACT_VERSION;
   task: TaskDto;
+  idempotentReplay?: boolean;
 }
 
 export interface TaskListResponse {
@@ -249,10 +261,12 @@ export interface CreateTaskRequest {
   title: string;
   description?: string;
   parentTaskId?: TaskPublicId | null;
+  parentTaskRef?: string | null;
   inheritParentProject?: boolean;
   statusId?: StatusId | null;
   assigneeId?: UserId | null;
   dueOn?: string | null;
+  idempotencyKey?: string;
 }
 
 export interface UpdateTaskRequest {
