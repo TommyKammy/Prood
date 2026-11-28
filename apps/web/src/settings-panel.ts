@@ -21,8 +21,10 @@ export interface SettingsPanelOptions {
   projectError: string;
   prefixDraft: string;
   startStatusDraft: StatusId | "";
+  workspaceDevDraft: boolean | null;
   onPrefixDraftChange: (prefix: string) => void;
   onStartStatusDraftChange: (statusId: StatusId | "") => void;
+  onWorkspaceDevDraftChange: (enabled: boolean) => void;
   onSaveWorkspaceSettings: (devProjectsEnabled: boolean) => void;
   onEnableDevProject: (prefix: string, startStatusId: StatusId | null) => void;
   onUpdateDevProjectSettings: (
@@ -39,9 +41,15 @@ export function renderSettingsPanel(opts: SettingsPanelOptions): HTMLElement {
 
   const wsToggle = el("input", {
     type: "checkbox",
-    checked: opts.workspaceSettings?.devProjectsEnabled ?? false,
+    checked:
+      opts.workspaceDevDraft ??
+      opts.workspaceSettings?.devProjectsEnabled ??
+      false,
     disabled: !canEditWs,
     attrs: { "data-ws-dev-toggle": true },
+    on: {
+      change: () => opts.onWorkspaceDevDraftChange(wsToggle.checked),
+    },
   });
 
   const wsSection = el(

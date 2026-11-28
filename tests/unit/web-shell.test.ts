@@ -1663,5 +1663,117 @@ describe("@prood/web async race regressions", () => {
       doc.querySelector<HTMLSelectElement>("[data-proj-start-status-select]")!.value,
     ).toBe(statusInProgress);
   });
+
+  it("preserves unsaved workspace dev-toggle changes across background reloads and project switches (4725883525)", async () => {
+    const userId = generateEntityId("usr", 1_795_000_000_000, new Uint8Array(10).fill(1));
+    const wksA = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(2));
+    const projA = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(3));
+    const projB = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(4));
+    const statusA = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(5));
+    const statusB = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(6));
+    const projectA = makeProject(wksA, projA, statusA, "Project Alpha");
+    const projectB = makeProject(wksA, projB, statusB, "Project Beta");
+    const now = "2026-11-28T12:00:00.000Z";
+
+    let delayWsSettings = false;
+    let resolveDelayedWsSettings: ((res: Response) => void) | null = null;
+
+    const wsSettingsBody: WorkspaceSettingsDto = {
+      workspaceId: wksA,
+      defaultLocale: "en",
+      devProjectsEnabled: false,
+      updatedAt: now,
+    };
+
+    const { win, doc, shell } = await mountMockedShell(async (path) => {
+      if (path === "/api/v1/me") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          user: { id: userId, email: "alice@example.com", displayName: "Alice" },
+          memberships: [
+            {
+              membershipId: makeMembershipId(190),
+              workspaceId: wksA,
+              workspaceSlug: "ws-a",
+              workspaceName: "WS Alpha",
+              role: "admin",
+            },
+          ],
+        } satisfies MeResponse);
+      }
+      if (path === `/api/v1/workspaces/${wksA}/projects`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, projects: [projectA, projectB] });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/settings`) {
+        if (delayWsSettings) {
+          return new Promise<Response>((resolve) => {
+            resolveDelayedWsSettings = resolve;
+          });
+        }
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, settings: wsSettingsBody });
+      }
+      if (path.endsWith("/tasks")) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, tasks: [] });
+      }
+      if (path.endsWith("/dev-settings")) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          allowed: false,
+          canManage: true,
+          dev: null,
+          statuses: path.includes(projA) ? projectA.statuses : projectB.statuses,
+        } satisfies ProjectDevSettingsResponse);
+      }
+      throw new Error(`Unexpected request: GET ${path}`);
+    });
+
+    await waitForCondition(
+      () => doc.querySelector('[data-nav-view="settings"]') !== null,
+      "initial shell loaded",
+    );
+    doc.querySelector<HTMLButtonElement>('[data-nav-view="settings"]')!.click();
+    await waitForCondition(
+      () => doc.querySelector("[data-ws-dev-toggle]") !== null,
+      "initial settings loaded",
+    );
+    expect(doc.querySelector<HTMLInputElement>("[data-ws-dev-toggle]")!.checked).toBe(false);
+
+    // Return to List, then re-open Settings with a delayed background settings reload
+    doc.querySelector<HTMLButtonElement>('[data-nav-view="list"]')!.click();
+    await waitForCondition(
+      () => doc.querySelector("[data-create-task-form]") !== null,
+      "returned to list",
+    );
+
+    delayWsSettings = true;
+    doc.querySelector<HTMLButtonElement>('[data-nav-view="settings"]')!.click();
+    await waitForCondition(
+      () =>
+        doc.querySelector("[data-ws-dev-toggle]") !== null &&
+        resolveDelayedWsSettings !== null,
+      "settings rendered while background settings GET is pending",
+    );
+
+    const toggle = doc.querySelector<HTMLInputElement>("[data-ws-dev-toggle]")!;
+    toggle.checked = true;
+    toggle.dispatchEvent(new win.Event("change") as unknown as Event);
+
+    // Resolve delayed background reload returning false -> unsaved true must survive
+    delayWsSettings = false;
+    resolveDelayedWsSettings!(
+      jsonResponse({ contractVersion: CONTRACT_VERSION, settings: wsSettingsBody }),
+    );
+    await flushUiTicks(6);
+    expect(doc.querySelector<HTMLInputElement>("[data-ws-dev-toggle]")!.checked).toBe(true);
+
+    // Selecting another project re-renders Settings and loads projB -> unsaved true must survive
+    doc.querySelector<HTMLButtonElement>(`[data-project-id="${projB}"]`)!.click();
+    await waitForCondition(
+      () => shell.getActiveProjectId() === projB,
+      "switched to project B",
+    );
+    await flushUiTicks(4);
+    expect(doc.querySelector<HTMLInputElement>("[data-ws-dev-toggle]")!.checked).toBe(true);
+  });
 });
 

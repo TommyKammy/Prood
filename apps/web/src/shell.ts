@@ -119,6 +119,7 @@ export class ProodShellElement extends BaseElement {
   private savingWorkspaceSettings = false;
   private workspaceSettingsNotice = "";
   private workspaceSettingsError = "";
+  private wsDevEnabledDraft: boolean | null = null;
   private savingProjectSettings = false;
   private projectSettingsNotice = "";
   private projectSettingsError = "";
@@ -351,6 +352,7 @@ export class ProodShellElement extends BaseElement {
     this.taskTitleDraft = "";
     this.taskStatusDraft = "";
     this.highlightedTaskId = null;
+    this.wsDevEnabledDraft = null;
     this.resetDevSettingsDrafts();
     this.clearFeedback();
     this.searchPalette?.reset();
@@ -527,6 +529,7 @@ export class ProodShellElement extends BaseElement {
       this.workspaceSettingsError = "";
     } else {
       this.workspaceSettings = null;
+      this.wsDevEnabledDraft = null;
       this.workspaceSettingsError = translateApiError(
         this.i18n,
         wsSettingsRes.messageKey,
@@ -777,6 +780,7 @@ export class ProodShellElement extends BaseElement {
     if (!workspaceId || !this.workspaceSettings || this.savingWorkspaceSettings) return;
     const seq = ++this.workspaceSettingsSaveSeq;
     this.savingWorkspaceSettings = true;
+    this.wsDevEnabledDraft = devProjectsEnabled;
     this.clearFeedback();
     this.render();
 
@@ -795,6 +799,7 @@ export class ProodShellElement extends BaseElement {
     }
 
     this.workspaceSettings = res.data.settings;
+    this.wsDevEnabledDraft = null;
     this.workspaceSettingsNotice = this.i18n.t("settings.saved");
     if (this.activeProjectId) await this.loadProjectData(this.activeProjectId);
     else this.render();
@@ -1150,6 +1155,7 @@ export class ProodShellElement extends BaseElement {
               projectError: this.projectSettingsError,
               prefixDraft: this.devPrefixDraft,
               startStatusDraft: this.devStartStatusDraft,
+              workspaceDevDraft: this.wsDevEnabledDraft,
               onPrefixDraftChange: (v) => {
                 this.devPrefixDraft = v;
                 this.devPrefixDirty = true;
@@ -1157,6 +1163,9 @@ export class ProodShellElement extends BaseElement {
               onStartStatusDraftChange: (v) => {
                 this.devStartStatusDraft = v;
                 this.devStartStatusDirty = true;
+              },
+              onWorkspaceDevDraftChange: (v) => {
+                this.wsDevEnabledDraft = v;
               },
               onSaveWorkspaceSettings: (v) => void this.handleSaveWorkspaceSettings(v),
               onEnableDevProject: (p, s) =>
