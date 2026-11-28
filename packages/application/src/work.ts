@@ -1414,7 +1414,10 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
                         idempotencyKey,
                       )
                     : null;
-                if (existingReplay) {
+                if (
+                  existingReplay &&
+                  existingReplay.projectId === resolvedProject.deniedProject.id
+                ) {
                   await appendOutbox(repos, {
                     workspaceId: resolvedProject.deniedProject.workspaceId,
                     projectId: resolvedProject.deniedProject.id,
@@ -1452,6 +1455,11 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           }
 
           let resolvedParentTaskId: TaskPublicId | null = explicitParentTaskId;
+          let parentLocked: {
+            task: TaskRecord;
+            project: ProjectRecord;
+            depth: number;
+          } | null = null;
           let parentDepth = 0;
 
           if (explicitParentTaskRef !== null) {
@@ -1513,33 +1521,17 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           }
 
           if (resolvedParentTaskId) {
-            const parentLocked = await lockTaskChainInTx(
-              repos,
-              resolvedParentTaskId,
-            );
+            parentLocked = await lockTaskChainInTx(repos, resolvedParentTaskId);
             if (!parentLocked) {
               return fail(404, "NOT_FOUND", "error.notFound");
             }
-            if (parentLocked.project.id !== effectiveProject.id) {
-              return fail(400, "VALIDATION_ERROR", "error.validation");
-            }
-            effectiveProject = parentLocked.project;
             parentDepth = parentLocked.depth;
-            initialRole = await resolveActorProjectRole(
-              repos,
-              actor.userId,
-              effectiveProject,
-            );
           }
 
           const storedProjectId =
             resolvedParentTaskId && input.inheritParentProject !== false
               ? null
               : effectiveProject.id;
-
-          if (storedProjectId === null && parentDepth + 1 >= MAX_PARENT_HOPS) {
-            return fail(400, "VALIDATION_ERROR", "error.validation");
-          }
 
           const requestFingerprint =
             idempotencyKey !== null
@@ -1634,6 +1626,14 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
                 },
               };
             }
+          }
+
+          if (parentLocked && parentLocked.project.id !== effectiveProject.id) {
+            return fail(400, "VALIDATION_ERROR", "error.validation");
+          }
+
+          if (storedProjectId === null && parentDepth + 1 >= MAX_PARENT_HOPS) {
+            return fail(400, "VALIDATION_ERROR", "error.validation");
           }
 
           if (!canWriteProjectTasks(initialRole)) {

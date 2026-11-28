@@ -1194,6 +1194,63 @@ describe(`MCP read tools & idempotent task creation (${targetDb})`, () => {
     expect(subReplayById.idempotentReplay).toBe(true);
     expect(subReplayById.task.id).toBe(subCreate.task.id);
 
+    // Move parent + inherited subtask to another readable project, then replay original subtask create_task
+    const secondReadableProj = (
+      await server.webJson<{ project: ProjectDto }>(
+        `/api/v1/workspaces/${wksId}/projects`,
+        admin.jar,
+        { method: "POST", json: { name: "Secondary Readable Board", visibility: "workspace" } },
+      )
+    ).data.project;
+    const moveParentRes = await server.webJson<TaskResponse>(
+      `/api/v1/tasks/${replayRes.task.id}/move`,
+      admin.jar,
+      { method: "POST", json: { projectId: secondReadableProj.id } },
+    );
+    expect(moveParentRes.status).toBe(200);
+
+    const subReplayAfterParentMove = parseToolSuccess<TaskResponse>(
+      await memberClient.callTool({
+        name: "create_task",
+        arguments: {
+          projectRef: "NEW",
+          title: "Subtask from key",
+          parentTaskRef: "NEW-1",
+          idempotencyKey: "subtask-key-ref-1",
+        },
+      }),
+    );
+    expect(subReplayAfterParentMove.idempotentReplay).toBe(true);
+    expect(subReplayAfterParentMove.task.id).toBe(subCreate.task.id);
+    expect(subReplayAfterParentMove.task.effectiveProjectId).toBe(
+      secondReadableProj.id,
+    );
+
+    // Move parent back to pubProj so subsequent tests operate against pubProj/privProj as expected
+    expect(
+      (
+        await server.webJson<TaskResponse>(
+          `/api/v1/tasks/${replayRes.task.id}/move`,
+          admin.jar,
+          { method: "POST", json: { projectId: pubProj.id } },
+        )
+      ).status,
+    ).toBe(200);
+
+    // Calling create_task against an unreadable private project using an unrelated project's idempotencyKey
+    // must record task.create.denied against privProj (not task.read.denied against the unrelated task)
+    const crossProjDenied = parseToolError(
+      await memberClient.callTool({
+        name: "create_task",
+        arguments: {
+          projectRef: privProj.id,
+          title: "Cross project probe",
+          idempotencyKey: "subtask-key-ref-1",
+        },
+      }),
+    );
+    expect(crossProjDenied.error.status).toBe(404);
+
     // 4. Optional HTTP Idempotency-Key header returns 201 on first call and 200 on replay
     const httpFirst = await server.webJson<TaskResponse>(
       `/api/v1/projects/${pubProj.id}/tasks`,
@@ -1324,6 +1381,24 @@ describe(`MCP read tools & idempotent task creation (${targetDb})`, () => {
           e.channel === "mcp",
       ),
     ).toBe(true);
+    expect(
+      outbox.some(
+        (e) =>
+          e.eventType === "task.create.denied" &&
+          e.actorUserId === member.userId &&
+          e.targetType === "project" &&
+          e.targetId === privProj.id &&
+          e.channel === "mcp",
+      ),
+    ).toBe(true);
+    expect(
+      outbox.some(
+        (e) =>
+          e.eventType === "task.read.denied" &&
+          e.projectId === privProj.id &&
+          e.targetId === subCreate.task.id,
+      ),
+    ).toBe(false);
 
     // Header mismatch on HTTP POST returns 400 validation error
     const headerMismatch = await server.webJson<ApiErrorResponse>(
