@@ -80,6 +80,24 @@ import type {
 
 type DbExecutor = Kysely<ProodDatabase> | Transaction<ProodDatabase>;
 
+/**
+ * Returns true when a trimmed query requires JavaScript Unicode NFC/lowercase
+ * matching rather than SQL `lower()`, because SQLite's built-in `lower()` only
+ * folds ASCII A-Z while PostgreSQL depends on collation.
+ */
+function needsUnicodeJsFilter(query: string): boolean {
+  const nfc = query.normalize("NFC");
+  if (nfc !== query) {
+    return true;
+  }
+  for (const ch of nfc) {
+    if (ch.charCodeAt(0) > 0x7f && ch.toLowerCase() !== ch.toUpperCase()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function toWorkspaceRecord(row: WorkspaceTable): WorkspaceRecord {
   return {
     id: row.id as WorkspaceId,
@@ -918,6 +936,42 @@ export function createKyselyRepositories(
       return row ? toTaskRecord(row) : null;
     },
 
+    async lockByIdsForUpdate(
+      ids: readonly TaskPublicId[],
+    ): Promise<TaskRecord[]> {
+      // Sort ascending to acquire row locks in a canonical order and prevent deadlocks.
+      const sortedUniqueIds = Array.from(new Set(ids)).sort((a, b) =>
+        a < b ? -1 : a > b ? 1 : 0,
+      );
+      if (sortedUniqueIds.length === 0) {
+        return [];
+      }
+
+      const results: TaskRecord[] = [];
+      for (let i = 0; i < sortedUniqueIds.length; i += IN_CLAUSE_BATCH_SIZE) {
+        const chunk = sortedUniqueIds.slice(i, i + IN_CLAUSE_BATCH_SIZE);
+        const rows = await runQuery(
+          () => {
+            let query = executor
+              .selectFrom("tasks")
+              .selectAll()
+              .where("id", "in", chunk)
+              .orderBy("id", "asc");
+            if (driver === "postgres") {
+              query = query.forUpdate();
+            }
+            return query.execute();
+          },
+          mapError,
+          assertActive,
+        );
+        for (const row of rows) {
+          results.push(toTaskRecord(row));
+        }
+      }
+      return results;
+    },
+
     async listByProject(projectId: ProjectId): Promise<TaskRecord[]> {
       const rows = await runQuery(
         () =>
@@ -1016,82 +1070,124 @@ export function createKyselyRepositories(
         return [];
       }
 
-      const normalizedQuery = input.query.trim().toLowerCase();
-      const hasQuery = normalizedQuery.length > 0;
-      const escapedPattern = hasQuery
-        ? `%${normalizedQuery.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`
-        : "";
-      const byId = new Map<TaskPublicId, TaskRecord>();
-      let chunkCount = 0;
+      const fetchPage = async (
+        beforeCursor: { updatedAt: string; id: TaskPublicId } | undefined,
+        pageLimit: number,
+        sqlLowerPattern: string | null,
+      ): Promise<TaskRecord[]> => {
+        const byId = new Map<TaskPublicId, TaskRecord>();
+        let chunkCount = 0;
 
-      for (let i = 0; i < uniqueProjectIds.length; i += IN_CLAUSE_BATCH_SIZE) {
-        const chunk = uniqueProjectIds.slice(i, i + IN_CLAUSE_BATCH_SIZE);
-        const includeInheritedNulls = i === 0;
-        chunkCount += 1;
-        const rows = await runQuery(
-          () => {
-            let queryBuilder = executor
-              .selectFrom("tasks")
-              .selectAll()
-              .where("workspace_id", "=", input.workspaceId)
-              .where((eb) =>
-                includeInheritedNulls
-                  ? eb.or([
-                      eb("project_id", "in", chunk),
-                      eb("project_id", "is", null),
-                    ])
-                  : eb("project_id", "in", chunk),
-              );
-            if (hasQuery) {
-              queryBuilder = queryBuilder.where((eb) =>
-                eb.or([
-                  sql<boolean>`lower(${eb.ref("title")}) LIKE ${escapedPattern} ESCAPE '\\'`,
-                  sql<boolean>`lower(${eb.ref("description")}) LIKE ${escapedPattern} ESCAPE '\\'`,
-                ]),
-              );
-            }
-            if (input.before) {
-              const { updatedAt, id } = input.before;
-              queryBuilder = queryBuilder.where((eb) =>
-                eb.or([
-                  eb("updated_at", "<", updatedAt),
-                  eb.and([
-                    eb("updated_at", "=", updatedAt),
-                    eb("id", "<", id),
+        for (let i = 0; i < uniqueProjectIds.length; i += IN_CLAUSE_BATCH_SIZE) {
+          const chunk = uniqueProjectIds.slice(i, i + IN_CLAUSE_BATCH_SIZE);
+          const includeInheritedNulls = i === 0;
+          chunkCount += 1;
+          const rows = await runQuery(
+            () => {
+              let queryBuilder = executor
+                .selectFrom("tasks")
+                .selectAll()
+                .where("workspace_id", "=", input.workspaceId)
+                .where((eb) =>
+                  includeInheritedNulls
+                    ? eb.or([
+                        eb("project_id", "in", chunk),
+                        eb("project_id", "is", null),
+                      ])
+                    : eb("project_id", "in", chunk),
+                );
+              if (sqlLowerPattern !== null) {
+                queryBuilder = queryBuilder.where((eb) =>
+                  eb.or([
+                    sql<boolean>`lower(${eb.ref("title")}) LIKE ${sqlLowerPattern} ESCAPE '\\'`,
+                    sql<boolean>`lower(${eb.ref("description")}) LIKE ${sqlLowerPattern} ESCAPE '\\'`,
                   ]),
-                ]),
-              );
+                );
+              }
+              if (beforeCursor) {
+                const { updatedAt, id } = beforeCursor;
+                queryBuilder = queryBuilder.where((eb) =>
+                  eb.or([
+                    eb("updated_at", "<", updatedAt),
+                    eb.and([
+                      eb("updated_at", "=", updatedAt),
+                      eb("id", "<", id),
+                    ]),
+                  ]),
+                );
+              }
+              return queryBuilder
+                .orderBy("updated_at", "desc")
+                .orderBy("id", "desc")
+                .limit(pageLimit)
+                .execute();
+            },
+            mapError,
+            assertActive,
+          );
+          for (const row of rows) {
+            const rec = toTaskRecord(row);
+            if (!byId.has(rec.id)) {
+              byId.set(rec.id, rec);
             }
-            return queryBuilder
-              .orderBy("updated_at", "desc")
-              .orderBy("id", "desc")
-              .limit(input.limit)
-              .execute();
-          },
-          mapError,
-          assertActive,
-        );
-        for (const row of rows) {
-          const rec = toTaskRecord(row);
-          if (!byId.has(rec.id)) {
-            byId.set(rec.id, rec);
           }
         }
+
+        const results = Array.from(byId.values());
+        if (chunkCount > 1) {
+          results.sort((a, b) => {
+            if (a.updatedAt !== b.updatedAt) {
+              return a.updatedAt > b.updatedAt ? -1 : 1;
+            }
+            if (a.id !== b.id) {
+              return a.id > b.id ? -1 : 1;
+            }
+            return 0;
+          });
+        }
+        return results.slice(0, pageLimit);
+      };
+
+      const trimmedQuery = input.query.trim();
+      if (trimmedQuery.length === 0) {
+        return fetchPage(input.before, input.limit, null);
       }
 
-      const results = Array.from(byId.values());
-      if (chunkCount > 1) {
-        results.sort((a, b) => {
-          if (a.updatedAt !== b.updatedAt) {
-            return a.updatedAt > b.updatedAt ? -1 : 1;
-          }
-          if (a.id !== b.id) {
-            return a.id > b.id ? -1 : 1;
-          }
-          return 0;
-        });
+      if (!needsUnicodeJsFilter(trimmedQuery)) {
+        const folded = trimmedQuery.toLowerCase();
+        const escapedPattern = `%${folded.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
+        return fetchPage(input.before, input.limit, escapedPattern);
       }
-      return results.slice(0, input.limit);
+
+      const needle = trimmedQuery.normalize("NFC").toLowerCase();
+      const matched: TaskRecord[] = [];
+      let scanBefore = input.before;
+      const scanBatchSize = Math.min(Math.max(input.limit * 4, 200), 500);
+
+      while (matched.length < input.limit) {
+        const rawRows = await fetchPage(scanBefore, scanBatchSize, null);
+        if (rawRows.length === 0) {
+          break;
+        }
+        for (const row of rawRows) {
+          if (
+            row.title.normalize("NFC").toLowerCase().includes(needle) ||
+            row.description.normalize("NFC").toLowerCase().includes(needle)
+          ) {
+            matched.push(row);
+            if (matched.length >= input.limit) {
+              break;
+            }
+          }
+        }
+        if (matched.length >= input.limit || rawRows.length < scanBatchSize) {
+          break;
+        }
+        const lastRaw = rawRows[rawRows.length - 1]!;
+        scanBefore = { updatedAt: lastRaw.updatedAt, id: lastRaw.id };
+      }
+
+      return matched;
     },
 
     async update(

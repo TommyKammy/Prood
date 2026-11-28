@@ -330,6 +330,88 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
     return null;
   }
 
+  /**
+   * Lock a task and its inherited-project ancestor chain FOR UPDATE (on PostgreSQL)
+   * and re-verify the chain under those locks so concurrent project moves serialize
+   * cleanly with authorization and mutation.
+   */
+  async function lockTaskChainInTx(
+    repos: TransactionRepositories,
+    taskId: TaskPublicId,
+  ): Promise<{ task: TaskRecord; project: ProjectRecord; depth: number } | null> {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const discoveredIds: TaskPublicId[] = [];
+      const discoverSeen = new Set<TaskPublicId>();
+      let cursorId: TaskPublicId | null = taskId;
+
+      for (let hop = 0; hop < MAX_PARENT_HOPS && cursorId; hop += 1) {
+        if (discoverSeen.has(cursorId)) {
+          return null;
+        }
+        discoverSeen.add(cursorId);
+        discoveredIds.push(cursorId);
+        const row = await repos.tasks.findById(cursorId);
+        if (!row) {
+          return null;
+        }
+        if (row.projectId !== null) {
+          break;
+        }
+        cursorId = row.parentTaskId;
+      }
+
+      const lockedRows = await repos.tasks.lockByIdsForUpdate(discoveredIds);
+      const lockedById = new Map<TaskPublicId, TaskRecord>(
+        lockedRows.map((row) => [row.id, row]),
+      );
+      const lockedTask = lockedById.get(taskId);
+      if (!lockedTask) {
+        return null;
+      }
+
+      let current: TaskRecord = lockedTask;
+      const walkSeen = new Set<TaskPublicId>();
+      let depth = 0;
+      let stable = true;
+
+      for (let hop = 0; hop < MAX_PARENT_HOPS; hop += 1) {
+        if (current.projectId) {
+          depth = hop;
+          break;
+        }
+        if (!current.parentTaskId || walkSeen.has(current.parentTaskId)) {
+          return null;
+        }
+        walkSeen.add(current.id);
+        const lockedParent = lockedById.get(current.parentTaskId);
+        if (!lockedParent) {
+          stable = false;
+          break;
+        }
+        if (lockedParent.workspaceId !== lockedTask.workspaceId) {
+          return null;
+        }
+        current = lockedParent;
+        if (hop + 1 >= MAX_PARENT_HOPS) {
+          return null;
+        }
+      }
+
+      if (!stable) {
+        continue;
+      }
+      if (!current.projectId) {
+        return null;
+      }
+      const project = await repos.projects.findById(current.projectId);
+      if (!project || project.workspaceId !== lockedTask.workspaceId) {
+        return null;
+      }
+      return { task: lockedTask, project, depth };
+    }
+    return null;
+  }
+
   async function collectDescendantsInTx(
     repos: TransactionRepositories,
     initialFrontier: readonly TaskPublicId[],
@@ -417,7 +499,28 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
     actor: AuditActorContext,
     taskId: TaskPublicId,
     workspaceFilter?: WorkspaceId,
+    options?: { lockForWrite?: boolean },
   ): Promise<ResolvedTaskContext | null> {
+    if (options?.lockForWrite) {
+      const locked = await lockTaskChainInTx(repos, taskId);
+      if (!locked) {
+        return null;
+      }
+      if (workspaceFilter && locked.task.workspaceId !== workspaceFilter) {
+        return null;
+      }
+      const role = await resolveActorProjectRole(
+        repos,
+        actor.userId,
+        locked.project,
+      );
+      return {
+        task: locked.task,
+        effectiveProject: locked.project,
+        role,
+      };
+    }
+
     const task = await repos.tasks.findById(taskId);
     if (!task) {
       return null;
@@ -441,7 +544,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
     repos: TransactionRepositories,
     actor: AuditActorContext,
     taskRef: string,
-    options?: { workspaceId?: WorkspaceId },
+    options?: { workspaceId?: WorkspaceId; lockForWrite?: boolean },
   ): Promise<
     | { found: true; ctx: ResolvedTaskContext }
     | {
@@ -461,6 +564,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         actor,
         trimmed,
         options?.workspaceId,
+        { lockForWrite: options?.lockForWrite },
       );
       if (!ctx) {
         return {
@@ -493,6 +597,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         actor,
         taskId,
         options.workspaceId,
+        { lockForWrite: options.lockForWrite },
       );
       if (!ctx) {
         return {
@@ -535,7 +640,31 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
     }
 
     if (readable.length === 1) {
-      return { found: true, ctx: readable[0]! };
+      const chosen = readable[0]!;
+      if (options?.lockForWrite) {
+        const lockedCtx = await loadTaskContextInTx(
+          repos,
+          actor,
+          chosen.task.id,
+          chosen.task.workspaceId,
+          { lockForWrite: true },
+        );
+        if (!lockedCtx) {
+          return {
+            found: false,
+            failure: fail(404, "NOT_FOUND", "error.notFound"),
+          };
+        }
+        if (!canReadProject(lockedCtx.role)) {
+          return {
+            found: false,
+            failure: fail(404, "NOT_FOUND", "error.notFound"),
+            deniedTarget: lockedCtx,
+          };
+        }
+        return { found: true, ctx: lockedCtx };
+      }
+      return { found: true, ctx: chosen };
     }
     if (readable.length > 1) {
       return {
@@ -1118,16 +1247,15 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         const parentTaskId = input.parentTaskId ?? null;
         let parentDepth = 0;
         if (parentTaskId) {
-          const parentTask = await repos.tasks.findById(parentTaskId);
-          if (!parentTask) {
+          const parentLocked = await lockTaskChainInTx(repos, parentTaskId);
+          if (!parentLocked) {
             return fail(404, "NOT_FOUND", "error.notFound");
           }
-          const parentResolved = await resolveTaskEffectiveProject(repos, parentTask);
-          if (!parentResolved || parentResolved.project.id !== effectiveProject.id) {
+          if (parentLocked.project.id !== effectiveProject.id) {
             return fail(400, "VALIDATION_ERROR", "error.validation");
           }
-          effectiveProject = parentResolved.project;
-          parentDepth = parentResolved.depth;
+          effectiveProject = parentLocked.project;
+          parentDepth = parentLocked.depth;
         }
 
         const storedProjectId =
@@ -1394,7 +1522,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           repos,
           actor,
           taskRef,
-          options,
+          { ...options, lockForWrite: true },
         );
         if (!resolvedRef.found) {
           if (resolvedRef.deniedTarget) {
@@ -1924,7 +2052,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           repos,
           actor,
           sourceTaskRef,
-          options,
+          { ...options, lockForWrite: true },
         );
         if (!resolvedRef.found) {
           if (resolvedRef.deniedTarget) {
@@ -2018,15 +2146,14 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         const parentTaskId = input.parentTaskId ?? null;
         let parentDepth = 0;
         if (parentTaskId) {
-          const parentTask = await repos.tasks.findById(parentTaskId);
-          if (!parentTask) {
+          const parentLocked = await lockTaskChainInTx(repos, parentTaskId);
+          if (!parentLocked) {
             return fail(404, "NOT_FOUND", "error.notFound");
           }
-          const parentResolved = await resolveTaskEffectiveProject(repos, parentTask);
-          if (!parentResolved || parentResolved.project.id !== targetProject.id) {
+          if (parentLocked.project.id !== targetProject.id) {
             return fail(400, "VALIDATION_ERROR", "error.validation");
           }
-          parentDepth = parentResolved.depth;
+          parentDepth = parentLocked.depth;
         }
 
         const storedProjectId =
@@ -2081,7 +2208,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           repos,
           actor,
           taskRef,
-          options,
+          { ...options, lockForWrite: true },
         );
         if (!resolvedRef.found) {
           if (resolvedRef.deniedTarget) {

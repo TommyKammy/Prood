@@ -160,6 +160,7 @@ describe("@prood/server Web-Standard app", () => {
               throw new Error("not implemented");
             },
             findById: async () => null,
+            lockByIdsForUpdate: async () => [],
             listByProject: async () => [],
             listSubtasks: async () => [],
             listSubtasksByParentIds: async () => [],

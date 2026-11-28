@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   createSystemIdGenerator,
   createWorkUseCases,
+  type UnitOfWork,
 } from "@prood/application";
 import type {
   ApiErrorResponse,
@@ -1101,5 +1102,449 @@ describe(`Issue resolution, move visibility & search (${targetDb})`, () => {
     expect(exactKeyLimit1.items).toHaveLength(1);
     expect(exactKeyLimit1.items[0]?.matchKind).toBe("exact_key");
     expect(exactKeyLimit1.items[0]?.task.id).toBe(targetInB.id);
+  });
+
+  it("normalizes Unicode case-folding consistently across SQLite and PostgreSQL search", async () => {
+    const isolated = await createIsolatedDb();
+    const db = isolated.openClient();
+    await db.migrate();
+    const harness = createServerHarness(db);
+    const ids = createSystemIdGenerator();
+
+    const wksId = ids.next("wks");
+    const now = "2026-11-28T11:30:00.000Z";
+    await db.uow.run(async (repos) => {
+      await repos.workspaces.create({
+        id: wksId,
+        slug: "unicode-search-ws",
+        name: "Unicode Search WS",
+        createdAt: now,
+      });
+      await repos.workspaceSettings.upsert({
+        workspaceId: wksId,
+        defaultLocale: "en",
+        devProjectsEnabled: true,
+        updatedAt: now,
+      });
+    });
+
+    const admin = await harness.signUpUser("unicode-admin@example.com", "Admin");
+    const member = await harness.signUpUser("unicode-member@example.com", "Member");
+    await db.uow.run(async (repos) => {
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: admin.userId,
+        role: "admin",
+        createdAt: now,
+      });
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: member.userId,
+        role: "member",
+        createdAt: now,
+      });
+    });
+
+    const openProj = ((await (
+      await harness.request(`/api/v1/workspaces/${wksId}/projects`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { name: "Open Unicode", kind: "general", visibility: "workspace" },
+      })
+    ).json()) as ProjectResponse).project;
+    const privProj = ((await (
+      await harness.request(`/api/v1/workspaces/${wksId}/projects`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { name: "Private Unicode", kind: "general", visibility: "private" },
+      })
+    ).json()) as ProjectResponse).project;
+
+    const ecoleTask = ((await (
+      await harness.request(`/api/v1/projects/${openProj.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: {
+          title: "École supérieure architecture",
+          description: "Café résumé notes",
+        },
+      })
+    ).json()) as TaskResponse).task;
+    const uberTask = ((await (
+      await harness.request(`/api/v1/projects/${openProj.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { title: "ÜBER review" },
+      })
+    ).json()) as TaskResponse).task;
+    const jaTask = ((await (
+      await harness.request(`/api/v1/projects/${openProj.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { title: "認証フローの設計確認" },
+      })
+    ).json()) as TaskResponse).task;
+
+    // Create private parent + >50 newer inherited private subtasks matching "École"
+    const privParent = ((await (
+      await harness.request(`/api/v1/projects/${privProj.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { title: "École secrète" },
+      })
+    ).json()) as TaskResponse).task;
+
+    await db.uow.run(async (repos) => {
+      for (let i = 0; i < 55; i += 1) {
+        const ts = `2026-11-28T12:${String(Math.floor(i / 60)).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}.000Z`;
+        await repos.tasks.create({
+          id: ids.next("tsk"),
+          workspaceId: wksId,
+          projectId: null,
+          parentTaskId: privParent.id,
+          statusId: null,
+          title: `École secrète noise ${i}`,
+          description: "",
+          assigneeId: null,
+          createdBy: admin.userId,
+          dueOn: null,
+          position: i,
+          createdAt: ts,
+        });
+      }
+    });
+
+    for (const q of ["École", "école", "ÉCOLE", "E\u0301cole", "café"]) {
+      const res = await harness.request(
+        `/api/v1/workspaces/${wksId}/tasks/search?q=${encodeURIComponent(q)}&limit=1`,
+        { cookieHeader: member.jar.toHeader() },
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as TaskSearchResponse;
+      expect(body.items.map((item) => item.task.id)).toEqual([ecoleTask.id]);
+    }
+
+    for (const q of ["über", "Über"]) {
+      const res = await harness.request(
+        `/api/v1/workspaces/${wksId}/tasks/search?q=${encodeURIComponent(q)}`,
+        { cookieHeader: member.jar.toHeader() },
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as TaskSearchResponse;
+      expect(body.items.map((item) => item.task.id)).toEqual([uberTask.id]);
+    }
+
+    const jaRes = await harness.request(
+      `/api/v1/workspaces/${wksId}/tasks/search?q=${encodeURIComponent("認証フロー")}`,
+      { cookieHeader: member.jar.toHeader() },
+    );
+    expect(jaRes.status).toBe(200);
+    expect(((await jaRes.json()) as TaskSearchResponse).items.map((i) => i.task.id)).toEqual([
+      jaTask.id,
+    ]);
+  });
+
+  it("serializes task authorization with concurrent project moves to a private project", async () => {
+    const isolated = await createIsolatedDb();
+    const db = isolated.openClient();
+    await db.migrate();
+    const dbSecond = isolated.openClient();
+    const ids = createSystemIdGenerator();
+    let tick = Date.parse("2026-11-28T12:00:00.000Z");
+    const clock = {
+      now: () => {
+        tick += 1000;
+        return new Date(tick);
+      },
+    };
+
+    const wksId = ids.next("wks");
+    const adminUserId = ids.next("usr");
+    const memberUserId = ids.next("usr");
+    const now = "2026-11-28T12:00:00.000Z";
+
+    await db.uow.run(async (repos) => {
+      await repos.workspaces.create({
+        id: wksId,
+        slug: "move-race-ws",
+        name: "Move Race WS",
+        createdAt: now,
+      });
+      await repos.workspaceSettings.upsert({
+        workspaceId: wksId,
+        defaultLocale: "en",
+        devProjectsEnabled: false,
+        updatedAt: now,
+      });
+      await repos.users.create({
+        id: adminUserId,
+        email: "race-admin@example.com",
+        displayName: "Admin",
+        createdAt: now,
+      });
+      await repos.users.create({
+        id: memberUserId,
+        email: "race-member@example.com",
+        displayName: "Member",
+        createdAt: now,
+      });
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: adminUserId,
+        role: "admin",
+        createdAt: now,
+      });
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: memberUserId,
+        role: "member",
+        createdAt: now,
+      });
+    });
+
+    const adminActor = {
+      userId: adminUserId,
+      actorType: "user",
+      channel: "web",
+    } as const;
+    const memberActor = {
+      userId: memberUserId,
+      actorType: "user",
+      channel: "web",
+    } as const;
+
+    const adminWork = createWorkUseCases({ uow: db.uow, idGenerator: ids, clock });
+    const memberWork = createWorkUseCases({ uow: dbSecond.uow, idGenerator: ids, clock });
+
+    const openARes = await adminWork.createProject(adminActor, wksId, {
+      name: "Open A",
+      kind: "general",
+      visibility: "workspace",
+    });
+    expect(openARes.ok).toBe(true);
+    if (!openARes.ok) throw new Error("setup failed");
+    const openA = openARes.data.project;
+
+    const privBRes = await adminWork.createProject(adminActor, wksId, {
+      name: "Private B",
+      kind: "general",
+      visibility: "private",
+    });
+    expect(privBRes.ok).toBe(true);
+    if (!privBRes.ok) throw new Error("setup failed");
+    const privateB = privBRes.data.project;
+
+    const directT1 = await adminWork.createTask(adminActor, openA.id, {
+      title: "Original Direct T1",
+    });
+    const directT2 = await adminWork.createTask(adminActor, openA.id, {
+      title: "Original Direct T2",
+    });
+    const parentP1 = await adminWork.createTask(adminActor, openA.id, {
+      title: "Parent P1",
+    });
+    if (!directT1.ok || !directT2.ok || !parentP1.ok) {
+      throw new Error("setup failed");
+    }
+    const inheritedC1 = await adminWork.createTask(adminActor, openA.id, {
+      title: "Original Inherited C1",
+      parentTaskId: parentP1.data.task.id,
+      inheritParentProject: true,
+    });
+    const parentP2 = await adminWork.createTask(adminActor, openA.id, {
+      title: "Parent P2",
+    });
+    if (!inheritedC1.ok || !parentP2.ok) {
+      throw new Error("setup failed");
+    }
+
+    if (targetDb === "postgres") {
+      function createGatedMoveWork(): {
+        work: ReturnType<typeof createWorkUseCases>;
+        afterUpdate: Promise<void>;
+        releaseCommit: () => void;
+      } {
+        let markAfterUpdate!: () => void;
+        let markReleaseCommit!: () => void;
+        const afterUpdate = new Promise<void>((resolve) => {
+          markAfterUpdate = resolve;
+        });
+        const releaseGate = new Promise<void>((resolve) => {
+          markReleaseCommit = resolve;
+        });
+        let paused = false;
+
+        const gatedUow: UnitOfWork = {
+          run: (fn) =>
+            db.uow.run((repos) =>
+              fn({
+                ...repos,
+                tasks: {
+                  ...repos.tasks,
+                  update: async (id, patch) => {
+                    const updated = await repos.tasks.update(id, patch);
+                    if (!paused) {
+                      paused = true;
+                      markAfterUpdate();
+                      await releaseGate;
+                    }
+                    return updated;
+                  },
+                },
+              }),
+            ),
+        };
+
+        return {
+          work: createWorkUseCases({ uow: gatedUow, idGenerator: ids, clock }),
+          afterUpdate,
+          releaseCommit: markReleaseCommit,
+        };
+      }
+
+      // 1. Direct task update vs move to privateB
+      {
+        const gate = createGatedMoveWork();
+        const movePromise = gate.work.moveTask(adminActor, directT1.data.task.id, {
+          projectId: privateB.id,
+        });
+        await gate.afterUpdate;
+
+        let memberSettled = false;
+        const memberPromise = memberWork
+          .updateTask(memberActor, directT1.data.task.id, {
+            title: "Hijacked Direct T1",
+          })
+          .finally(() => {
+            memberSettled = true;
+          });
+
+        await new Promise((r) => setTimeout(r, 80));
+        expect(memberSettled).toBe(false);
+
+        gate.releaseCommit();
+        const [moveRes, memberRes] = await Promise.all([movePromise, memberPromise]);
+        expect(moveRes.ok).toBe(true);
+        expect(memberRes.ok).toBe(false);
+        if (!memberRes.ok) {
+          expect(memberRes.status).toBe(404);
+        }
+        const readAfter = await adminWork.getTask(adminActor, directT1.data.task.id);
+        expect(readAfter.ok).toBe(true);
+        if (readAfter.ok) {
+          expect(readAfter.data.task.effectiveProjectId).toBe(privateB.id);
+          expect(readAfter.data.task.title).toBe("Original Direct T1");
+        }
+      }
+
+      // 2. Direct task delete vs move to privateB
+      {
+        const gate = createGatedMoveWork();
+        const movePromise = gate.work.moveTask(adminActor, directT2.data.task.id, {
+          projectId: privateB.id,
+        });
+        await gate.afterUpdate;
+
+        const memberPromise = memberWork.deleteTask(
+          memberActor,
+          directT2.data.task.id,
+        );
+        await new Promise((r) => setTimeout(r, 60));
+        gate.releaseCommit();
+
+        const [moveRes, memberRes] = await Promise.all([movePromise, memberPromise]);
+        expect(moveRes.ok).toBe(true);
+        expect(memberRes.ok).toBe(false);
+        if (!memberRes.ok) {
+          expect(memberRes.status).toBe(404);
+        }
+        const readAfter = await adminWork.getTask(adminActor, directT2.data.task.id);
+        expect(readAfter.ok).toBe(true);
+        if (readAfter.ok) {
+          expect(readAfter.data.task.effectiveProjectId).toBe(privateB.id);
+        }
+      }
+
+      // 3. Inherited subtask update vs ancestor parent move to privateB
+      {
+        const gate = createGatedMoveWork();
+        const movePromise = gate.work.moveTask(adminActor, parentP1.data.task.id, {
+          projectId: privateB.id,
+        });
+        await gate.afterUpdate;
+
+        let memberSettled = false;
+        const memberPromise = memberWork
+          .updateTask(memberActor, inheritedC1.data.task.id, {
+            title: "Hijacked Inherited C1",
+          })
+          .finally(() => {
+            memberSettled = true;
+          });
+
+        await new Promise((r) => setTimeout(r, 80));
+        expect(memberSettled).toBe(false);
+
+        gate.releaseCommit();
+        const [moveRes, memberRes] = await Promise.all([movePromise, memberPromise]);
+        expect(moveRes.ok).toBe(true);
+        expect(memberRes.ok).toBe(false);
+        if (!memberRes.ok) {
+          expect(memberRes.status).toBe(404);
+        }
+        const readAfter = await adminWork.getTask(adminActor, inheritedC1.data.task.id);
+        expect(readAfter.ok).toBe(true);
+        if (readAfter.ok) {
+          expect(readAfter.data.task.effectiveProjectId).toBe(privateB.id);
+          expect(readAfter.data.task.title).toBe("Original Inherited C1");
+        }
+      }
+
+      // 4. Inherited subtask create under parent vs parent move to privateB
+      {
+        const gate = createGatedMoveWork();
+        const movePromise = gate.work.moveTask(adminActor, parentP2.data.task.id, {
+          projectId: privateB.id,
+        });
+        await gate.afterUpdate;
+
+        const memberPromise = memberWork.createTask(memberActor, openA.id, {
+          title: "Hijacked Subtask Under P2",
+          parentTaskId: parentP2.data.task.id,
+        });
+        await new Promise((r) => setTimeout(r, 60));
+        gate.releaseCommit();
+
+        const [moveRes, memberRes] = await Promise.all([movePromise, memberPromise]);
+        expect(moveRes.ok).toBe(true);
+        expect(memberRes.ok).toBe(false);
+        if (!memberRes.ok) {
+          expect(memberRes.status).toBe(400);
+        }
+      }
+    } else {
+      // SQLite uses BEGIN IMMEDIATE single-writer serialization; verify concurrent dispatch resolves cleanly.
+      const [moveRes, memberRes] = await Promise.all([
+        adminWork.moveTask(adminActor, directT1.data.task.id, {
+          projectId: privateB.id,
+        }),
+        memberWork.updateTask(memberActor, directT1.data.task.id, {
+          title: "SQLite Race Title",
+        }),
+      ]);
+      expect(moveRes.ok).toBe(true);
+      const readAfter = await adminWork.getTask(adminActor, directT1.data.task.id);
+      expect(readAfter.ok).toBe(true);
+      if (readAfter.ok) {
+        expect(readAfter.data.task.effectiveProjectId).toBe(privateB.id);
+        expect(readAfter.data.task.title).toBe(
+          memberRes.ok ? "SQLite Race Title" : "Original Direct T1",
+        );
+      }
+    }
   });
 });

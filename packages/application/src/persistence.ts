@@ -375,6 +375,7 @@ export interface ProjectStatusRepository {
 export interface TaskRepository {
   create(input: CreateTaskInput): Promise<TaskRecord>;
   findById(id: TaskPublicId): Promise<TaskRecord | null>;
+  lockByIdsForUpdate(ids: readonly TaskPublicId[]): Promise<TaskRecord[]>;
   listByProject(projectId: ProjectId): Promise<TaskRecord[]>;
   listSubtasks(parentTaskId: TaskPublicId): Promise<TaskRecord[]>;
   listSubtasksByParentIds(
