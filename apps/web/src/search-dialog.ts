@@ -194,6 +194,9 @@ export class SearchPaletteController {
     }
     this.searchInput.focus();
     if (this.searchInput.value.trim()) {
+      this.items = [];
+      this.activeIndex = -1;
+      this.renderResults();
       void this.executeSearch();
     } else {
       this.searchSeq += 1;
@@ -216,10 +219,23 @@ export class SearchPaletteController {
     }
   }
 
-  destroy(): void {
+  reset(): void {
     this.clearDebounce();
     this.searchSeq += 1;
-    if (this.element.open) this.close();
+    this.searchInput.value = "";
+    this.scopeCheckbox.checked = false;
+    this.items = [];
+    this.activeIndex = -1;
+    this.resultsList.innerHTML = "";
+    this.statusEl.textContent = "";
+    if (this.element.open) {
+      this.close();
+    }
+  }
+
+  destroy(): void {
+    this.reset();
+    this.element.remove();
   }
 
   private scheduleSearch(): void {

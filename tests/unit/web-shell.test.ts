@@ -752,5 +752,411 @@ describe("@prood/web async race regressions", () => {
       "Type a task ID",
     );
   });
+
+  it("cancels pending project mutations when creating and selecting a new project (4725328776)", async () => {
+    const userId = generateEntityId("usr", 1_795_000_000_000, new Uint8Array(10).fill(1));
+    const wksA = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(2));
+    const projA = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(3));
+    const projB = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(4));
+    const statusA = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(5));
+    const statusB = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(6));
+    const projectA = makeProject(wksA, projA, statusA, "Project Alpha");
+    const projectB = makeProject(wksA, projB, statusB, "Created Beta");
+    const taskA = makeTask(wksA, projA, statusA, 10, "Alpha Existing");
+    const lateTaskA = makeTask(wksA, projA, statusA, 11, "Late Alpha Task");
+
+    let createdB = false;
+    let resolveCreateTaskA!: (res: Response) => void;
+    const createTaskADeferred = new Promise<Response>((resolve) => {
+      resolveCreateTaskA = resolve;
+    });
+
+    const { win, doc, shell } = await mountMockedShell(async (path, init) => {
+      if (path === "/api/v1/me") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          user: { id: userId, email: "alice@example.com", displayName: "Alice" },
+          memberships: [
+            {
+              membershipId: makeMembershipId(110),
+              workspaceId: wksA,
+              workspaceSlug: "ws-a",
+              workspaceName: "WS A",
+              role: "admin",
+            },
+          ],
+        } satisfies MeResponse);
+      }
+      if (path === `/api/v1/workspaces/${wksA}/projects` && (init?.method ?? "GET") === "GET") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          projects: createdB ? [projectA, projectB] : [projectA],
+        });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/projects` && init?.method === "POST") {
+        createdB = true;
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, project: projectB }, 201);
+      }
+      if (path === `/api/v1/workspaces/${wksA}/settings`) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          settings: {
+            workspaceId: wksA,
+            defaultLocale: "en",
+            devProjectsEnabled: false,
+            updatedAt: "2026-11-28T12:00:00.000Z",
+          } satisfies WorkspaceSettingsDto,
+        });
+      }
+      if (path === `/api/v1/projects/${projA}/tasks` && (init?.method ?? "GET") === "GET") {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, tasks: [taskA] });
+      }
+      if (path === `/api/v1/projects/${projA}/tasks` && init?.method === "POST") {
+        return createTaskADeferred;
+      }
+      if (path === `/api/v1/projects/${projB}/tasks` && (init?.method ?? "GET") === "GET") {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, tasks: [] });
+      }
+      if (path.endsWith("/dev-settings")) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          allowed: false,
+          canManage: true,
+          dev: null,
+          statuses: path.includes(projA) ? projectA.statuses : projectB.statuses,
+        } satisfies ProjectDevSettingsResponse);
+      }
+      throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${path}`);
+    });
+
+    await waitForCondition(
+      () => doc.body.textContent?.includes("Alpha Existing") ?? false,
+      "project A loaded",
+    );
+
+    const taskInput = doc.querySelector<HTMLInputElement>("[data-task-title-input]")!;
+    taskInput.value = "Late Alpha Task";
+    taskInput.dispatchEvent(new win.Event("input") as unknown as Event);
+    doc
+      .querySelector<HTMLFormElement>("[data-create-task-form]")!
+      .dispatchEvent(new win.Event("submit", { cancelable: true }) as unknown as Event);
+
+    // Create project B while project A task creation is still in flight
+    doc.querySelector<HTMLButtonElement>("[data-toggle-new-project]")!.click();
+    const newName = doc.querySelector<HTMLInputElement>("[data-new-project-name]")!;
+    newName.value = "Created Beta";
+    newName.dispatchEvent(new win.Event("input") as unknown as Event);
+    doc
+      .querySelector<HTMLFormElement>("[data-new-project-form]")!
+      .dispatchEvent(new win.Event("submit", { cancelable: true }) as unknown as Event);
+
+    await waitForCondition(
+      () =>
+        shell.getActiveProjectId() === projB &&
+        doc.querySelector("[data-create-task-submit]") !== null,
+      "created project B active",
+    );
+    expect(doc.querySelector<HTMLButtonElement>("[data-create-task-submit]")!.disabled).toBe(
+      false,
+    );
+
+    resolveCreateTaskA(jsonResponse({ contractVersion: CONTRACT_VERSION, task: lateTaskA }, 201));
+    await flushUiTicks(6);
+
+    expect(shell.getActiveProjectId()).toBe(projB);
+    expect(doc.querySelector<HTMLButtonElement>("[data-create-task-submit]")!.disabled).toBe(
+      false,
+    );
+    expect(doc.body.textContent).not.toContain("Late Alpha Task");
+  });
+
+  it("clears previous workspace projects and settings before loading the next workspace (4725311771 / 4725328784)", async () => {
+    const userId = generateEntityId("usr", 1_795_000_000_000, new Uint8Array(10).fill(1));
+    const wksA = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(2));
+    const wksB = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(3));
+    const projA = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(4));
+    const projB = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(5));
+    const statusA = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(6));
+    const statusB = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(7));
+    const projectA = makeProject(wksA, projA, statusA, "Workspace A Project");
+    const projectB = makeProject(wksB, projB, statusB, "Workspace B Project");
+
+    let resolveWsBProjects!: (res: Response) => void;
+    const wsBProjectsDeferred = new Promise<Response>((resolve) => {
+      resolveWsBProjects = resolve;
+    });
+
+    const { win, doc, shell } = await mountMockedShell(async (path) => {
+      if (path === "/api/v1/me") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          user: { id: userId, email: "alice@example.com", displayName: "Alice" },
+          memberships: [
+            {
+              membershipId: makeMembershipId(120),
+              workspaceId: wksA,
+              workspaceSlug: "ws-a",
+              workspaceName: "WS Alpha",
+              role: "admin",
+            },
+            {
+              membershipId: makeMembershipId(121),
+              workspaceId: wksB,
+              workspaceSlug: "ws-b",
+              workspaceName: "WS Beta",
+              role: "admin",
+            },
+          ],
+        } satisfies MeResponse);
+      }
+      if (path === `/api/v1/workspaces/${wksA}/projects`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, projects: [projectA] });
+      }
+      if (path === `/api/v1/workspaces/${wksB}/projects`) {
+        return wsBProjectsDeferred;
+      }
+      if (path.endsWith("/settings")) {
+        const wsId = path.includes(wksA) ? wksA : wksB;
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          settings: {
+            workspaceId: wsId,
+            defaultLocale: "en",
+            devProjectsEnabled: false,
+            updatedAt: "2026-11-28T12:00:00.000Z",
+          } satisfies WorkspaceSettingsDto,
+        });
+      }
+      if (path.endsWith("/tasks")) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, tasks: [] });
+      }
+      if (path.endsWith("/dev-settings")) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          allowed: false,
+          canManage: true,
+          dev: null,
+          statuses: path.includes(projA) ? projectA.statuses : projectB.statuses,
+        } satisfies ProjectDevSettingsResponse);
+      }
+      throw new Error(`Unexpected request: GET ${path}`);
+    });
+
+    await waitForCondition(
+      () => doc.querySelector(`[data-project-id="${projA}"]`) !== null,
+      "workspace A project rendered",
+    );
+
+    const wsSelect = doc.querySelector<HTMLSelectElement>("[data-workspace-select]")!;
+    wsSelect.value = wksB;
+    wsSelect.dispatchEvent(new win.Event("change") as unknown as Event);
+    await flushUiTicks(2);
+
+    // While workspace B is still loading, workspace A's project buttons must already be gone
+    expect(shell.getActiveWorkspaceId()).toBe(wksB);
+    expect(doc.querySelectorAll("[data-project-id]").length).toBe(0);
+    expect(doc.querySelector(`[data-project-id="${projA}"]`)).toBeNull();
+
+    resolveWsBProjects(
+      jsonResponse({ contractVersion: CONTRACT_VERSION, projects: [projectB] }),
+    );
+    await waitForCondition(
+      () => doc.querySelector(`[data-project-id="${projB}"]`) !== null,
+      "workspace B project loaded",
+    );
+  });
+
+  it("displays task-loading failures instead of an empty project state (4725328791)", async () => {
+    const userId = generateEntityId("usr", 1_795_000_000_000, new Uint8Array(10).fill(1));
+    const wksA = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(2));
+    const projA = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(3));
+    const statusA = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(5));
+    const projectA = makeProject(wksA, projA, statusA, "Project Alpha");
+
+    const { doc } = await mountMockedShell(async (path) => {
+      if (path === "/api/v1/me") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          user: { id: userId, email: "alice@example.com", displayName: "Alice" },
+          memberships: [
+            {
+              membershipId: makeMembershipId(130),
+              workspaceId: wksA,
+              workspaceSlug: "ws-a",
+              workspaceName: "WS A",
+              role: "admin",
+            },
+          ],
+        } satisfies MeResponse);
+      }
+      if (path === `/api/v1/workspaces/${wksA}/projects`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, projects: [projectA] });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/settings`) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          settings: {
+            workspaceId: wksA,
+            defaultLocale: "en",
+            devProjectsEnabled: false,
+            updatedAt: "2026-11-28T12:00:00.000Z",
+          } satisfies WorkspaceSettingsDto,
+        });
+      }
+      if (path === `/api/v1/projects/${projA}/tasks`) {
+        return jsonResponse(
+          {
+            contractVersion: CONTRACT_VERSION,
+            error: {
+              code: "INTERNAL_ERROR",
+              messageKey: "error.generic",
+              message: "Server error",
+            },
+          },
+          500,
+        );
+      }
+      if (path.endsWith("/dev-settings")) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          allowed: false,
+          canManage: true,
+          dev: null,
+          statuses: projectA.statuses,
+        } satisfies ProjectDevSettingsResponse);
+      }
+      throw new Error(`Unexpected request: GET ${path}`);
+    });
+
+    await waitForCondition(
+      () => doc.querySelector("[data-task-load-error]") !== null,
+      "task load error alert rendered",
+    );
+    expect(doc.querySelector("[data-task-load-error]")!.textContent).toContain(
+      "Something went wrong",
+    );
+    expect(doc.querySelector("[data-task-count]")).toBeNull();
+    expect(doc.body.textContent).not.toContain("No tasks yet");
+  });
+
+  it("clears cached search query and results when signing out and signing in as another user (4725311777 / 4725328797)", async () => {
+    const userA = generateEntityId("usr", 1_795_000_000_000, new Uint8Array(10).fill(1));
+    const userB = generateEntityId("usr", 1_795_000_000_000, new Uint8Array(10).fill(9));
+    const wksA = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(2));
+    const wksB = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(3));
+    const projA = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(4));
+    const projB = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(5));
+    const statusA = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(6));
+    const statusB = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(7));
+    const projectA = makeProject(wksA, projA, statusA, "Secret Alpha");
+    const projectB = makeProject(wksB, projB, statusB, "Beta Workspace");
+    const secretTaskA = makeTask(wksA, projA, statusA, 30, "Confidential Payroll Secret");
+
+    let activeUser: "A" | "B" = "A";
+
+    const { win, doc, shell } = await mountMockedShell(async (path, init) => {
+      if (path === "/api/v1/me") {
+        if (activeUser === "A") {
+          return jsonResponse({
+            contractVersion: CONTRACT_VERSION,
+            user: { id: userA, email: "a@example.com", displayName: "User A" },
+            memberships: [
+              {
+                membershipId: makeMembershipId(140),
+                workspaceId: wksA,
+                workspaceSlug: "ws-a",
+                workspaceName: "WS A",
+                role: "admin",
+              },
+            ],
+          } satisfies MeResponse);
+        }
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          user: { id: userB, email: "b@example.com", displayName: "User B" },
+          memberships: [
+            {
+              membershipId: makeMembershipId(141),
+              workspaceId: wksB,
+              workspaceSlug: "ws-b",
+              workspaceName: "WS B",
+              role: "admin",
+            },
+          ],
+        } satisfies MeResponse);
+      }
+      if (path === "/api/auth/sign-out" && init?.method === "POST") {
+        return new Response(null, { status: 200 });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/projects`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, projects: [projectA] });
+      }
+      if (path === `/api/v1/workspaces/${wksB}/projects`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, projects: [projectB] });
+      }
+      if (path.endsWith("/settings")) {
+        const wsId = path.includes(wksA) ? wksA : wksB;
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          settings: {
+            workspaceId: wsId,
+            defaultLocale: "en",
+            devProjectsEnabled: false,
+            updatedAt: "2026-11-28T12:00:00.000Z",
+          } satisfies WorkspaceSettingsDto,
+        });
+      }
+      if (path.endsWith("/tasks")) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, tasks: [] });
+      }
+      if (path.endsWith("/dev-settings")) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          allowed: false,
+          canManage: true,
+          dev: null,
+          statuses: path.includes(projA) ? projectA.statuses : projectB.statuses,
+        } satisfies ProjectDevSettingsResponse);
+      }
+      if (path.startsWith(`/api/v1/workspaces/${wksA}/tasks/search`)) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          items: [{ matchKind: "text", task: secretTaskA }],
+          nextCursor: null,
+        });
+      }
+      throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${path}`);
+    });
+
+    await waitForCondition(
+      () => shell.getActiveProjectId() === projA,
+      "user A loaded",
+    );
+
+    await shell.openSearch();
+    const inputA = doc.querySelector<HTMLInputElement>("[data-search-input]")!;
+    inputA.value = "Confidential";
+    inputA.dispatchEvent(new win.Event("input") as unknown as Event);
+    await waitForCondition(
+      () => doc.querySelector(`[data-search-result-id="${secretTaskA.id}"]`) !== null,
+      "user A sees confidential search result",
+    );
+
+    await shell.signOut();
+    activeUser = "B";
+    await shell.refreshSession();
+    await waitForCondition(
+      () => shell.getActiveWorkspaceId() === wksB && shell.getActiveProjectId() === projB,
+      "user B loaded",
+    );
+
+    await shell.openSearch();
+    const inputB = doc.querySelector<HTMLInputElement>("[data-search-input]")!;
+    expect(inputB.value).toBe("");
+    expect(doc.querySelectorAll("[data-search-result-id]").length).toBe(0);
+    expect(doc.querySelector("[data-search-dialog]")?.textContent).not.toContain(
+      "Confidential Payroll Secret",
+    );
+  });
 });
 

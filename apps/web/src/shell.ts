@@ -39,7 +39,7 @@ import {
 } from "./login-form.js";
 import type { SearchPaletteController } from "./search-dialog.js";
 import type { renderSettingsPanel } from "./settings-panel.js";
-import { renderTaskListView } from "./task-list.js";
+import type { renderTaskListView } from "./task-list.js";
 
 const BaseElement =
   typeof HTMLElement !== "undefined" ? HTMLElement : (class {} as typeof HTMLElement);
@@ -99,6 +99,7 @@ export class ProodShellElement extends BaseElement {
   private activeDevSettings: ProjectDevSettingsResponse | null = null;
   private loadingWorkspace = false;
   private workspaceLoadError = "";
+  private taskLoadError = "";
 
   private newProjectOpen = false;
   private newProjectName = "";
@@ -129,6 +130,8 @@ export class ProodShellElement extends BaseElement {
   private searchPalettePromise: Promise<SearchPaletteController | null> | null = null;
   private renderSettingsFn: typeof renderSettingsPanel | null = null;
   private settingsLoadPromise: Promise<void> | null = null;
+  private renderTaskListFn: typeof renderTaskListView | null = null;
+  private taskListLoadPromise: Promise<void> | null = null;
 
   connectedCallback(): void {
     this.listenersController?.abort();
@@ -231,6 +234,21 @@ export class ProodShellElement extends BaseElement {
     palette?.open();
   }
 
+  private async ensureTaskList(): Promise<void> {
+    if (this.renderTaskListFn) return;
+    if (!this.taskListLoadPromise) {
+      this.taskListLoadPromise = import("./task-list.js")
+        .then((mod) => {
+          this.renderTaskListFn = mod.renderTaskListView;
+        })
+        .finally(() => {
+          this.taskListLoadPromise = null;
+        });
+    }
+    await this.taskListLoadPromise;
+    this.render();
+  }
+
   private async ensureSettingsPanel(): Promise<void> {
     if (this.renderSettingsFn) return;
     if (!this.settingsLoadPromise) {
@@ -264,6 +282,10 @@ export class ProodShellElement extends BaseElement {
               void this.selectProject(item.task.effectiveProjectId, true, true);
             },
           });
+          if (this.authState !== "authenticated" || !this.activeWorkspaceId) {
+            palette.destroy();
+            return null;
+          }
           this.searchPalette = palette;
           this.appendChild(palette.element);
           return palette;
@@ -302,29 +324,38 @@ export class ProodShellElement extends BaseElement {
     this.newProjectError = "";
   }
 
-  private resetWorkspaceState(): void {
-    this.cancelPendingWorkspaceMutations();
-    this.workspaceDataSeq += 1;
+  private clearWorkspaceScopedData(): void {
     this.projectDataSeq += 1;
-    this.activeWorkspaceId = null;
     this.activeProjectId = null;
-    this.activeView = "list";
     this.projects = [];
     this.workspaceSettings = null;
     this.tasks = [];
     this.activeDevSettings = null;
     this.loadingWorkspace = false;
     this.workspaceLoadError = "";
+    this.taskLoadError = "";
     this.newProjectOpen = false;
     this.newProjectName = "";
     this.newProjectPrefix = "";
+    this.newProjectEnableDev = false;
+    this.newProjectVisibility = "workspace";
     this.taskTitleDraft = "";
     this.taskStatusDraft = "";
     this.highlightedTaskId = null;
     this.devPrefixDraft = "";
     this.devStartStatusDraft = "";
     this.clearFeedback();
+    this.searchPalette?.reset();
+  }
+
+  private resetWorkspaceState(): void {
+    this.cancelPendingWorkspaceMutations();
+    this.workspaceDataSeq += 1;
+    this.activeWorkspaceId = null;
+    this.activeView = "list";
+    this.clearWorkspaceScopedData();
     this.searchPalette?.destroy();
+    this.searchPalette = null;
   }
 
   async refreshSession(): Promise<void> {
@@ -416,6 +447,7 @@ export class ProodShellElement extends BaseElement {
     this.activeView = route.view;
     if (targetWs !== this.activeWorkspaceId) {
       this.cancelPendingWorkspaceMutations();
+      this.clearWorkspaceScopedData();
       this.activeWorkspaceId = targetWs;
       this.activeProjectId = route.projectId;
       void this.loadWorkspaceData(targetWs);
@@ -462,7 +494,7 @@ export class ProodShellElement extends BaseElement {
     const [projRes, wsSettingsRes] = await Promise.all([
       listProjects(workspaceId),
       getWorkspaceSettings(workspaceId),
-      this.activeView === "settings" ? this.ensureSettingsPanel() : Promise.resolve(),
+      this.activeView === "settings" ? this.ensureSettingsPanel() : this.ensureTaskList(),
     ]);
     if (seq !== this.workspaceDataSeq || this.activeWorkspaceId !== workspaceId) {
       return;
@@ -474,6 +506,7 @@ export class ProodShellElement extends BaseElement {
       this.activeProjectId = null;
       this.tasks = [];
       this.activeDevSettings = null;
+      this.taskLoadError = "";
       this.workspaceLoadError = translateApiError(this.i18n, projRes.messageKey);
       this.render();
       return;
@@ -486,6 +519,7 @@ export class ProodShellElement extends BaseElement {
       this.activeProjectId = this.projects[0]?.id ?? null;
       this.tasks = [];
       this.activeDevSettings = null;
+      this.taskLoadError = "";
     }
     this.syncUrlState();
     this.render();
@@ -495,12 +529,14 @@ export class ProodShellElement extends BaseElement {
     } else {
       this.tasks = [];
       this.activeDevSettings = null;
+      this.taskLoadError = "";
       this.render();
     }
   }
 
   private async loadProjectData(projectId: ProjectId): Promise<void> {
     const seq = ++this.projectDataSeq;
+    this.taskLoadError = "";
     const project = this.projects.find((p) => p.id === projectId) ?? null;
     if (project && !project.statuses.some((s) => s.id === this.taskStatusDraft)) {
       this.taskStatusDraft = project.statuses[0]?.id ?? "";
@@ -512,7 +548,13 @@ export class ProodShellElement extends BaseElement {
     ]);
     if (seq !== this.projectDataSeq || this.activeProjectId !== projectId) return;
 
-    this.tasks = tasksRes.ok ? tasksRes.data.tasks : [];
+    if (tasksRes.ok) {
+      this.tasks = tasksRes.data.tasks;
+      this.taskLoadError = "";
+    } else {
+      this.tasks = [];
+      this.taskLoadError = translateApiError(this.i18n, tasksRes.messageKey);
+    }
     if (devRes.ok) {
       this.activeDevSettings = devRes.data;
       this.devPrefixDraft = devRes.data.dev?.prefix ?? "";
@@ -529,13 +571,8 @@ export class ProodShellElement extends BaseElement {
   private async selectWorkspace(workspaceId: WorkspaceId): Promise<void> {
     if (workspaceId === this.activeWorkspaceId) return;
     this.cancelPendingWorkspaceMutations();
+    this.clearWorkspaceScopedData();
     this.activeWorkspaceId = workspaceId;
-    this.activeProjectId = null;
-    this.tasks = [];
-    this.activeDevSettings = null;
-    this.newProjectOpen = false;
-    this.highlightedTaskId = null;
-    this.clearFeedback();
     this.syncUrlState();
     await this.loadWorkspaceData(workspaceId);
   }
@@ -549,6 +586,7 @@ export class ProodShellElement extends BaseElement {
       this.cancelPendingProjectMutations();
       this.tasks = [];
       this.activeDevSettings = null;
+      this.taskLoadError = "";
       if (!preserveHighlight) this.highlightedTaskId = null;
     }
     this.activeProjectId = projectId;
@@ -570,6 +608,8 @@ export class ProodShellElement extends BaseElement {
       if (this.activeWorkspaceId) {
         void this.loadWorkspaceData(this.activeWorkspaceId);
       }
+    } else {
+      void this.ensureTaskList();
     }
   }
 
@@ -630,6 +670,12 @@ export class ProodShellElement extends BaseElement {
         this.creatingProject = false;
         this.pendingDevProjectId = targetProjectId;
         this.pendingDevWorkspaceId = workspaceId;
+        if (targetProjectId !== this.activeProjectId) {
+          this.cancelPendingProjectMutations();
+          this.tasks = [];
+          this.activeDevSettings = null;
+          this.taskLoadError = "";
+        }
         this.activeProjectId = targetProjectId;
         this.newProjectError = translateApiError(this.i18n, enableRes.messageKey);
         this.syncUrlState();
@@ -639,6 +685,7 @@ export class ProodShellElement extends BaseElement {
     }
 
     this.creatingProject = false;
+    this.cancelPendingProjectMutations();
     this.pendingDevProjectId = null;
     this.pendingDevWorkspaceId = null;
     this.newProjectOpen = false;
@@ -650,6 +697,7 @@ export class ProodShellElement extends BaseElement {
     this.activeView = "list";
     this.tasks = [];
     this.activeDevSettings = null;
+    this.taskLoadError = "";
     this.highlightedTaskId = null;
     this.syncUrlState();
     await this.loadWorkspaceData(workspaceId);
@@ -1085,31 +1133,37 @@ export class ProodShellElement extends BaseElement {
       } else {
         const activeProj =
           this.projects.find((p) => p.id === this.activeProjectId) ?? null;
-        content.appendChild(
-          activeProj
-            ? renderTaskListView({
-                project: activeProj,
-                tasks: this.tasks,
-                i18n: this.i18n,
-                draftTitle: this.taskTitleDraft,
-                draftStatusId: this.taskStatusDraft,
-                creating: this.creatingTask,
-                createError: this.taskCreateError,
-                createNotice: this.taskCreateNotice,
-                highlightedTaskId: this.highlightedTaskId,
-                onDraftChange: (title, st) => {
-                  this.taskTitleDraft = title;
-                  this.taskStatusDraft = st;
-                },
-                onSubmitCreate: (title, st) =>
-                  void this.handleCreateTask(title, st),
-              })
-            : el(
-                "section",
-                { cls: "prood-empty" },
-                el("p", { text: t("project.selectPrompt") }),
-              ),
-        );
+        if (activeProj && !this.renderTaskListFn) {
+          void this.ensureTaskList();
+          content.appendChild(el("p", { cls: "prood-count", text: t("auth.loading") }));
+        } else {
+          content.appendChild(
+            activeProj && this.renderTaskListFn
+              ? this.renderTaskListFn({
+                  project: activeProj,
+                  tasks: this.tasks,
+                  i18n: this.i18n,
+                  draftTitle: this.taskTitleDraft,
+                  draftStatusId: this.taskStatusDraft,
+                  creating: this.creatingTask,
+                  createError: this.taskCreateError,
+                  createNotice: this.taskCreateNotice,
+                  loadError: this.taskLoadError,
+                  highlightedTaskId: this.highlightedTaskId,
+                  onDraftChange: (title, st) => {
+                    this.taskTitleDraft = title;
+                    this.taskStatusDraft = st;
+                  },
+                  onSubmitCreate: (title, st) =>
+                    void this.handleCreateTask(title, st),
+                })
+              : el(
+                  "section",
+                  { cls: "prood-empty" },
+                  el("p", { text: t("project.selectPrompt") }),
+                ),
+          );
+        }
       }
 
       main.appendChild(

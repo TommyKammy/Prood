@@ -13,6 +13,7 @@ export interface TaskListViewOptions {
   creating: boolean;
   createError: string;
   createNotice: string;
+  loadError: string;
   highlightedTaskId: TaskPublicId | null;
   onDraftChange: (title: string, statusId: StatusId | "") => void;
   onSubmitCreate: (title: string, statusId: StatusId | null) => void;
@@ -52,11 +53,13 @@ export function renderTaskListView(opts: TaskListViewOptions): HTMLElement {
       : null,
   );
 
-  const countEl = el("p", {
-    cls: "prood-count",
-    attrs: { "data-task-count": String(tasks.length) },
-    text: formatTaskCount(tasks.length),
-  });
+  const countEl = opts.loadError
+    ? null
+    : el("p", {
+        cls: "prood-count",
+        attrs: { "data-task-count": String(tasks.length) },
+        text: formatTaskCount(tasks.length),
+      });
 
   const container = el(
     "section",
@@ -145,6 +148,17 @@ export function renderTaskListView(opts: TaskListViewOptions): HTMLElement {
 
   const notice = alertBanner(opts.createError, opts.createNotice);
   if (notice) container.appendChild(notice);
+
+  if (opts.loadError) {
+    container.appendChild(
+      el("p", {
+        cls: "prood-auth-feedback",
+        attrs: { role: "alert", "data-task-load-error": true },
+        text: opts.loadError,
+      }),
+    );
+    return container;
+  }
 
   if (tasks.length === 0) {
     container.appendChild(
