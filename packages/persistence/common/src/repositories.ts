@@ -2466,36 +2466,36 @@ export function createKyselyRepositories(
       return toRealtimeEventRecord(row);
     },
 
-    async readSnapshotState(workspaceId: WorkspaceId): Promise<RealtimeSnapshotState> {
-      const retentionRow = await runQuery(
-        () =>
-          executor
-            .selectFrom("realtime_retention_state")
-            .select(["pruned_through_txid", "pruned_through_seq"])
-            .where("id", "=", 1)
-            .executeTakeFirst(),
-        mapError,
-        assertActive,
-      );
-      const retention = {
-        prunedThroughTxid: String(retentionRow?.pruned_through_txid ?? "0"),
-        prunedThroughSeq: Number(retentionRow?.pruned_through_seq ?? 0),
-      };
-
-      const maxSeqRes = await runQuery(
-        () =>
-          sql<{ max_seq: number | string }>`
-            SELECT COALESCE(MAX(seq), 0) AS max_seq FROM realtime_events
-          `.execute(executor),
-        mapError,
-        assertActive,
-      );
-      const maxSeq = Math.max(
-        Number(maxSeqRes.rows[0]?.max_seq ?? 0),
-        retention.prunedThroughSeq,
-      );
-
+    async readSnapshotState(_workspaceId: WorkspaceId): Promise<RealtimeSnapshotState> {
       if (driver !== "postgres") {
+        const retentionRow = await runQuery(
+          () =>
+            executor
+              .selectFrom("realtime_retention_state")
+              .select(["pruned_through_txid", "pruned_through_seq"])
+              .where("id", "=", 1)
+              .executeTakeFirst(),
+          mapError,
+          assertActive,
+        );
+        const retention = {
+          prunedThroughTxid: String(retentionRow?.pruned_through_txid ?? "0"),
+          prunedThroughSeq: Number(retentionRow?.pruned_through_seq ?? 0),
+        };
+
+        const maxSeqRes = await runQuery(
+          () =>
+            sql<{ max_seq: number | string }>`
+              SELECT COALESCE(MAX(seq), 0) AS max_seq FROM realtime_events
+            `.execute(executor),
+          mapError,
+          assertActive,
+        );
+        const maxSeq = Math.max(
+          Number(maxSeqRes.rows[0]?.max_seq ?? 0),
+          retention.prunedThroughSeq,
+        );
+
         return {
           driver,
           xmin: "0",
@@ -2506,11 +2506,26 @@ export function createKyselyRepositories(
         };
       }
 
+      // Single-statement CTE reads pg_current_snapshot(), MAX(seq), and
+      // realtime_retention_state under one PostgreSQL MVCC snapshot so a
+      // concurrent prune cannot race ahead of the snapshot bounds.
       const snapRes = await runQuery(
         () =>
-          sql<{ xmin: string; xmax: string; active_xips: string[] | null }>`
+          sql<{
+            xmin: string;
+            xmax: string;
+            active_xips: string[] | null;
+            max_seq: number | string;
+            pruned_through_txid: string;
+            pruned_through_seq: number | string;
+          }>`
             WITH snap AS (
               SELECT pg_current_snapshot() AS s
+            ),
+            ret AS (
+              SELECT pruned_through_txid, pruned_through_seq
+              FROM realtime_retention_state
+              WHERE id = 1
             )
             SELECT
               pg_snapshot_xmin(s)::text AS xmin,
@@ -2518,23 +2533,28 @@ export function createKyselyRepositories(
               COALESCE(
                 (SELECT array_agg(x::text ORDER BY x) FROM pg_snapshot_xip(s) AS x),
                 ARRAY[]::text[]
-              ) AS active_xips
+              ) AS active_xips,
+              COALESCE((SELECT MAX(seq) FROM realtime_events), 0) AS max_seq,
+              COALESCE((SELECT pruned_through_txid::text FROM ret), '0') AS pruned_through_txid,
+              COALESCE((SELECT pruned_through_seq FROM ret), 0) AS pruned_through_seq
             FROM snap
           `.execute(executor),
         mapError,
         assertActive,
       );
-      const xmin = snapRes.rows[0]!.xmin;
-      const xmax = snapRes.rows[0]!.xmax;
-      const rawXips = snapRes.rows[0]?.active_xips;
-      const activeXips = Array.isArray(rawXips) ? rawXips.map(String) : [];
+      const first = snapRes.rows[0]!;
+      const rawXips = first.active_xips;
+      const retention = {
+        prunedThroughTxid: String(first.pruned_through_txid ?? "0"),
+        prunedThroughSeq: Number(first.pruned_through_seq ?? 0),
+      };
 
       return {
         driver,
-        xmin,
-        xmax,
-        maxSeq,
-        activeXips,
+        xmin: String(first.xmin),
+        xmax: String(first.xmax),
+        maxSeq: Math.max(Number(first.max_seq ?? 0), retention.prunedThroughSeq),
+        activeXips: Array.isArray(rawXips) ? rawXips.map(String) : [],
         retention,
       };
     },
@@ -2575,21 +2595,6 @@ export function createKyselyRepositories(
         return { snapshot, events: res.map(toRealtimeEventRecord) };
       }
 
-      const retentionRow = await runQuery(
-        () =>
-          executor
-            .selectFrom("realtime_retention_state")
-            .select(["pruned_through_txid", "pruned_through_seq"])
-            .where("id", "=", 1)
-            .executeTakeFirst(),
-        mapError,
-        assertActive,
-      );
-      const retention = {
-        prunedThroughTxid: String(retentionRow?.pruned_through_txid ?? "0"),
-        prunedThroughSeq: Number(retentionRow?.pruned_through_seq ?? 0),
-      };
-
       const pendingClauses = input.pendingTxids.map(
         (entry) =>
           sql`(e.txid = CAST(${entry.txid} AS xid8) AND e.seq > ${Math.max(0, Math.trunc(entry.afterSeq))})`,
@@ -2606,8 +2611,8 @@ export function createKyselyRepositories(
               OR (e.txid = CAST(${input.watermarkTxid} AS xid8) AND e.seq > ${Math.max(0, Math.trunc(input.watermarkSeq))})
             )`;
 
-      // Single-statement CTE guarantees `pg_current_snapshot()` (xmin, xmax, active_xips)
-      // and the visibility of `realtime_events` rows are evaluated on the same MVCC snapshot.
+      // Single-statement CTE guarantees `pg_current_snapshot()` (xmin, xmax, active_xips),
+      // `realtime_retention_state`, and `realtime_events` visibility share one MVCC snapshot.
       const res = await runQuery(
         () =>
           sql<{
@@ -2615,6 +2620,8 @@ export function createKyselyRepositories(
             xmax: string;
             active_xips: string[] | null;
             max_seq: number | string;
+            pruned_through_txid: string;
+            pruned_through_seq: number | string;
             seq: number | string | null;
             txid: string | null;
             workspace_id: string | null;
@@ -2630,6 +2637,11 @@ export function createKyselyRepositories(
             WITH snap AS (
               SELECT pg_current_snapshot() AS s
             ),
+            ret AS (
+              SELECT pruned_through_txid, pruned_through_seq
+              FROM realtime_retention_state
+              WHERE id = 1
+            ),
             meta AS (
               SELECT
                 pg_snapshot_xmin(s)::text AS xmin,
@@ -2638,7 +2650,9 @@ export function createKyselyRepositories(
                   (SELECT array_agg(x::text ORDER BY x) FROM pg_snapshot_xip(s) AS x),
                   ARRAY[]::text[]
                 ) AS active_xips,
-                COALESCE((SELECT MAX(seq) FROM realtime_events), 0) AS max_seq
+                COALESCE((SELECT MAX(seq) FROM realtime_events), 0) AS max_seq,
+                COALESCE((SELECT pruned_through_txid::text FROM ret), '0') AS pruned_through_txid,
+                COALESCE((SELECT pruned_through_seq FROM ret), 0) AS pruned_through_seq
               FROM snap
             ),
             matched AS (
@@ -2665,6 +2679,8 @@ export function createKyselyRepositories(
               meta.xmax,
               meta.active_xips,
               meta.max_seq,
+              meta.pruned_through_txid,
+              meta.pruned_through_seq,
               matched.seq,
               matched.txid,
               matched.workspace_id,
@@ -2686,6 +2702,10 @@ export function createKyselyRepositories(
 
       const first = res.rows[0]!;
       const rawXips = first.active_xips;
+      const retention = {
+        prunedThroughTxid: String(first.pruned_through_txid ?? "0"),
+        prunedThroughSeq: Number(first.pruned_through_seq ?? 0),
+      };
       const snapshot: RealtimeSnapshotState = {
         driver,
         xmin: String(first.xmin),

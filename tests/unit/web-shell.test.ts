@@ -2106,5 +2106,351 @@ describe("@prood/web async race regressions", () => {
     expect(row.querySelector("[data-task-assignee]")?.textContent?.trim()).toBe("Alice");
     shell.remove();
   });
+
+  it("reconciles changes missed before initial SSE ready without reloading on subsequent ready frames", async () => {
+    const userId = generateEntityId("usr", 1_795_000_000_000, new Uint8Array(10).fill(21));
+    const wksA = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(22));
+    const projA = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(23));
+    const statusTodo = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(24));
+    const statusProg = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(25));
+
+    const projectA: ProjectDto = {
+      ...makeProject(wksA, projA, statusTodo, "Alpha"),
+      statuses: [
+        { id: statusTodo, projectId: projA, name: "To Do", category: "todo", position: 0 },
+        {
+          id: statusProg,
+          projectId: projA,
+          name: "In Progress",
+          category: "in_progress",
+          position: 1,
+        },
+      ],
+    };
+    const beforeTask = makeTask(wksA, projA, statusTodo, 30, "Gap Target");
+    const afterTask: TaskDto = {
+      ...beforeTask,
+      statusId: statusProg,
+      assigneeId: userId,
+      assigneeDisplayName: "Alice",
+      updatedAt: "2026-11-28T12:02:00.000Z",
+    };
+
+    const NativeEventTarget = globalThis.EventTarget;
+    const NativeMessageEvent = globalThis.MessageEvent;
+    const esInstances: Array<{
+      emit(eventName: string, payload: unknown): void;
+      close(): void;
+    }> = [];
+    class MockEventSource extends NativeEventTarget {
+      readyState = 1;
+      constructor(public url: string) {
+        super();
+        esInstances.push(this);
+      }
+      emit(eventName: string, payload: unknown) {
+        this.dispatchEvent(
+          new NativeMessageEvent(eventName, { data: JSON.stringify(payload) }),
+        );
+      }
+      close() {
+        this.readyState = 2;
+      }
+    }
+
+    let taskFetchCount = 0;
+
+    vi.resetModules();
+    const win = new Window({ url: "http://127.0.0.1:3000/" });
+    const doc = win.document as unknown as Document;
+    vi.stubGlobal("window", win);
+    vi.stubGlobal("document", doc);
+    vi.stubGlobal("HTMLElement", win.HTMLElement);
+    vi.stubGlobal("HTMLInputElement", win.HTMLInputElement);
+    vi.stubGlobal("HTMLTextAreaElement", win.HTMLTextAreaElement);
+    vi.stubGlobal("HTMLSelectElement", win.HTMLSelectElement);
+    vi.stubGlobal("HTMLDialogElement", win.HTMLDialogElement);
+    vi.stubGlobal("Element", win.Element);
+    vi.stubGlobal("Node", win.Node);
+    vi.stubGlobal("Event", win.Event);
+    vi.stubGlobal("KeyboardEvent", win.KeyboardEvent);
+    vi.stubGlobal("CustomEvent", win.CustomEvent);
+    vi.stubGlobal("customElements", win.customElements);
+    vi.stubGlobal("EventSource", MockEventSource);
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      cb(0);
+      return 1;
+    });
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const raw = typeof input === "string" ? input : input.toString();
+      const parsed = new URL(raw, "http://127.0.0.1:3000");
+      const path = parsed.pathname + parsed.search;
+      if (path === "/api/v1/me") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          user: { id: userId, email: "alice@example.com", displayName: "Alice" },
+          memberships: [
+            {
+              membershipId: makeMembershipId(102),
+              workspaceId: wksA,
+              workspaceSlug: "alpha",
+              workspaceName: "Alpha",
+              role: "admin",
+            },
+          ],
+        });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/projects`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, projects: [projectA] });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/settings`) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          settings: {
+            workspaceId: wksA,
+            defaultLocale: "en",
+            devProjectsEnabled: false,
+            updatedAt: "2026-11-28T12:00:00.000Z",
+          },
+        });
+      }
+      if (path === `/api/v1/projects/${projA}/tasks`) {
+        taskFetchCount += 1;
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          tasks: [taskFetchCount === 1 ? beforeTask : afterTask],
+        });
+      }
+      if (path.endsWith("/dev-settings")) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          allowed: false,
+          canManage: true,
+          dev: null,
+          statuses: projectA.statuses,
+        } satisfies ProjectDevSettingsResponse);
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    });
+
+    const web = await import("@prood/web");
+    const shell = doc.createElement("prood-shell") as unknown as InstanceType<
+      typeof web.ProodShellElement
+    >;
+    doc.body.appendChild(shell as unknown as Node);
+
+    await waitForCondition(
+      () =>
+        doc.querySelector(`[data-task-row="${beforeTask.id}"]`) !== null &&
+        esInstances.length === 1,
+      "initial snapshot rendered before ready",
+    );
+    expect(taskFetchCount).toBe(1);
+    expect(
+      doc
+        .querySelector(`[data-task-row="${beforeTask.id}"] [data-task-status]`)
+        ?.getAttribute("data-task-status"),
+    ).toBe(statusTodo);
+
+    // Emit initial ready -> reconciles post-cursor state (e.g. task started before cursor)
+    esInstances[0]!.emit("ready", {
+      contractVersion: CONTRACT_VERSION,
+      type: "ready",
+      workspaceId: wksA,
+      projectId: null,
+      cursor: `v1:sq:${wksA}:1`,
+    });
+
+    await waitForCondition(
+      () =>
+        taskFetchCount === 2 &&
+        doc
+          .querySelector(`[data-task-row="${beforeTask.id}"] [data-task-status]`)
+          ?.getAttribute("data-task-status") === statusProg,
+      "initial ready reconciles missed mutation",
+    );
+
+    // Subsequent non-initial ready frame must not trigger redundant full reloads
+    esInstances[0]!.emit("ready", {
+      contractVersion: CONTRACT_VERSION,
+      type: "ready",
+      workspaceId: wksA,
+      projectId: null,
+      cursor: `v1:sq:${wksA}:2`,
+    });
+    await flushUiTicks(4);
+    expect(taskFetchCount).toBe(2);
+    shell.remove();
+  });
+
+  it("preserves input focus and caret selection across SSE-triggered renders", async () => {
+    const userId = generateEntityId("usr", 1_795_000_000_000, new Uint8Array(10).fill(31));
+    const wksA = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(32));
+    const projA = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(33));
+    const statusTodo = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(34));
+    const statusProg = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(35));
+    const evtId = generateEntityId("evt", 1_795_000_000_000, new Uint8Array(10).fill(36));
+
+    const projectA: ProjectDto = {
+      ...makeProject(wksA, projA, statusTodo, "Alpha"),
+      statuses: [
+        { id: statusTodo, projectId: projA, name: "To Do", category: "todo", position: 0 },
+        {
+          id: statusProg,
+          projectId: projA,
+          name: "In Progress",
+          category: "in_progress",
+          position: 1,
+        },
+      ],
+    };
+    const existingTask = makeTask(wksA, projA, statusTodo, 40, "Existing Task");
+
+    const NativeEventTarget = globalThis.EventTarget;
+    const NativeMessageEvent = globalThis.MessageEvent;
+    const esInstances: Array<{
+      emit(eventName: string, payload: unknown): void;
+      close(): void;
+    }> = [];
+    class MockEventSource extends NativeEventTarget {
+      readyState = 1;
+      constructor(public url: string) {
+        super();
+        esInstances.push(this);
+      }
+      emit(eventName: string, payload: unknown) {
+        this.dispatchEvent(
+          new NativeMessageEvent(eventName, { data: JSON.stringify(payload) }),
+        );
+      }
+      close() {
+        this.readyState = 2;
+      }
+    }
+
+    vi.resetModules();
+    const win = new Window({ url: "http://127.0.0.1:3000/" });
+    const doc = win.document as unknown as Document;
+    vi.stubGlobal("window", win);
+    vi.stubGlobal("document", doc);
+    vi.stubGlobal("HTMLElement", win.HTMLElement);
+    vi.stubGlobal("HTMLInputElement", win.HTMLInputElement);
+    vi.stubGlobal("HTMLTextAreaElement", win.HTMLTextAreaElement);
+    vi.stubGlobal("HTMLSelectElement", win.HTMLSelectElement);
+    vi.stubGlobal("HTMLDialogElement", win.HTMLDialogElement);
+    vi.stubGlobal("Element", win.Element);
+    vi.stubGlobal("Node", win.Node);
+    vi.stubGlobal("Event", win.Event);
+    vi.stubGlobal("KeyboardEvent", win.KeyboardEvent);
+    vi.stubGlobal("CustomEvent", win.CustomEvent);
+    vi.stubGlobal("customElements", win.customElements);
+    vi.stubGlobal("EventSource", MockEventSource);
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      cb(0);
+      return 1;
+    });
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const raw = typeof input === "string" ? input : input.toString();
+      const parsed = new URL(raw, "http://127.0.0.1:3000");
+      const path = parsed.pathname + parsed.search;
+      if (path === "/api/v1/me") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          user: { id: userId, email: "alice@example.com", displayName: "Alice" },
+          memberships: [
+            {
+              membershipId: makeMembershipId(103),
+              workspaceId: wksA,
+              workspaceSlug: "alpha",
+              workspaceName: "Alpha",
+              role: "admin",
+            },
+          ],
+        });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/projects`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, projects: [projectA] });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/settings`) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          settings: {
+            workspaceId: wksA,
+            defaultLocale: "en",
+            devProjectsEnabled: false,
+            updatedAt: "2026-11-28T12:00:00.000Z",
+          },
+        });
+      }
+      if (path === `/api/v1/projects/${projA}/tasks`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, tasks: [existingTask] });
+      }
+      if (path.endsWith("/dev-settings")) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          allowed: false,
+          canManage: true,
+          dev: null,
+          statuses: projectA.statuses,
+        } satisfies ProjectDevSettingsResponse);
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    });
+
+    const web = await import("@prood/web");
+    const shell = doc.createElement("prood-shell") as unknown as InstanceType<
+      typeof web.ProodShellElement
+    >;
+    doc.body.appendChild(shell as unknown as Node);
+
+    await waitForCondition(
+      () =>
+        doc.querySelector("[data-task-title-input]") !== null &&
+        esInstances.length === 1,
+      "create-task input and SSE controller ready",
+    );
+
+    const originalInput = doc.querySelector<HTMLInputElement>("[data-task-title-input]")!;
+    originalInput.focus();
+    originalInput.value = "Draft typing title";
+    originalInput.dispatchEvent(new win.Event("input") as unknown as Event);
+    originalInput.setSelectionRange(5, 11);
+    expect(doc.activeElement).toBe(originalInput);
+
+    esInstances[0]!.emit("change", {
+      contractVersion: CONTRACT_VERSION,
+      type: "change",
+      eventId: evtId,
+      eventType: "task.started",
+      workspaceId: wksA,
+      projectId: projA,
+      taskId: existingTask.id,
+      task: {
+        ...existingTask,
+        statusId: statusProg,
+        assigneeId: userId,
+        assigneeDisplayName: "Alice",
+        updatedAt: "2026-11-28T12:05:00.000Z",
+      },
+      occurredAt: "2026-11-28T12:05:00.000Z",
+      cursor: `v1:sq:${wksA}:2`,
+    });
+
+    await waitForCondition(
+      () =>
+        doc
+          .querySelector(`[data-task-row="${existingTask.id}"] [data-task-status]`)
+          ?.getAttribute("data-task-status") === statusProg,
+      "SSE task.started reflected in list",
+    );
+
+    const recreatedInput = doc.querySelector<HTMLInputElement>("[data-task-title-input]")!;
+    expect(recreatedInput).not.toBe(originalInput);
+    expect(doc.activeElement).toBe(recreatedInput);
+    expect(recreatedInput.value).toBe("Draft typing title");
+    expect(recreatedInput.selectionStart).toBe(5);
+    expect(recreatedInput.selectionEnd).toBe(11);
+    shell.remove();
+  });
 });
 

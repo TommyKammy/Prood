@@ -46,6 +46,8 @@ export interface RealtimeAppOptions {
   retryMs?: number;
   retentionMs?: number;
   maxEvents?: number;
+  maxBufferedBytes?: number;
+  maxBackpressureMs?: number;
   shutdownSignal?: AbortSignal;
 }
 
@@ -1068,6 +1070,14 @@ export function createApp(deps: AppDeps): Hono {
         Math.trunc(deps.realtime?.heartbeatIntervalMs ?? 15_000),
       );
       const retryMs = Math.max(250, Math.trunc(deps.realtime?.retryMs ?? 1_500));
+      const maxBufferedBytes = Math.max(
+        64,
+        Math.trunc(deps.realtime?.maxBufferedBytes ?? 65_536),
+      );
+      const maxBackpressureMs = Math.max(
+        50,
+        Math.trunc(deps.realtime?.maxBackpressureMs ?? 30_000),
+      );
 
       const abortSignals = [c.req.raw.signal];
       if (deps.realtime?.shutdownSignal) {
@@ -1083,17 +1093,357 @@ export function createApp(deps: AppDeps): Hono {
       let closed = false;
       let pumping = false;
       let dirty = false;
+      let pausedForBackpressure = false;
+      let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
       let pollTimer: ReturnType<typeof setTimeout> | undefined;
       let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+      let backpressureTimer: ReturnType<typeof setTimeout> | undefined;
       let unsubscribeHub: (() => void) | undefined;
       let onAbort: (() => void) | undefined;
+      let schedulePollFn: (() => void) | undefined;
+      let drainPendingFn: (() => Promise<void>) | undefined;
+      let cleanupFn: (() => void) | undefined;
 
-      const stream = new ReadableStream<Uint8Array>({
-        start(controller) {
-          const cleanup = () => {
-            if (closed) {
+      const isBackpressured = (): boolean =>
+        streamController !== null &&
+        streamController.desiredSize !== null &&
+        streamController.desiredSize <= 0;
+
+      const clearBackpressureTimeout = () => {
+        if (backpressureTimer !== undefined) {
+          clearTimeout(backpressureTimer);
+          backpressureTimer = undefined;
+        }
+      };
+
+      const armBackpressureTimeout = () => {
+        if (closed || streamSignal.aborted || backpressureTimer !== undefined) {
+          return;
+        }
+        backpressureTimer = setTimeout(() => {
+          backpressureTimer = undefined;
+          if (!closed && isBackpressured()) {
+            cleanupFn?.();
+          }
+        }, maxBackpressureMs);
+      };
+
+      const stream = new ReadableStream<Uint8Array>(
+        {
+          start(controller) {
+            streamController = controller;
+            const cleanup = () => {
+              if (closed) {
+                return;
+              }
+              closed = true;
+              if (pollTimer !== undefined) {
+                clearTimeout(pollTimer);
+                pollTimer = undefined;
+              }
+              if (heartbeatTimer !== undefined) {
+                clearInterval(heartbeatTimer);
+                heartbeatTimer = undefined;
+              }
+              clearBackpressureTimeout();
+              unsubscribeHub?.();
+              unsubscribeHub = undefined;
+              if (onAbort) {
+                streamSignal.removeEventListener("abort", onAbort);
+                onAbort = undefined;
+              }
+              try {
+                controller.close();
+              } catch {
+                // Stream controller may already be closed
+              }
+            };
+            cleanupFn = cleanup;
+
+            const enqueueFrame = (frame: string): boolean => {
+              if (closed || streamSignal.aborted) {
+                cleanup();
+                return false;
+              }
+              try {
+                controller.enqueue(encoder.encode(frame));
+                if (isBackpressured()) {
+                  pausedForBackpressure = true;
+                  armBackpressureTimeout();
+                }
+                return true;
+              } catch {
+                cleanup();
+                return false;
+              }
+            };
+
+            const enqueueSseEvent = (
+              eventName: string,
+              data: unknown,
+              id?: string,
+            ): boolean => {
+              const lines: string[] = [];
+              if (id !== undefined) {
+                lines.push(`id: ${id}`);
+              }
+              lines.push(`event: ${eventName}`);
+              lines.push(`data: ${JSON.stringify(data)}`);
+              return enqueueFrame(`${lines.join("\n")}\n\n`);
+            };
+
+            const emitRevokedAndClose = () => {
+              enqueueSseEvent("revoked", {
+                contractVersion: CONTRACT_VERSION,
+                type: "revoked",
+                workspaceId,
+                projectId,
+              });
+              cleanup();
+            };
+
+            const schedulePollTimer = () => {
+              if (
+                closed ||
+                streamSignal.aborted ||
+                pausedForBackpressure ||
+                isBackpressured()
+              ) {
+                return;
+              }
+              if (pollTimer !== undefined) {
+                clearTimeout(pollTimer);
+              }
+              pollTimer = setTimeout(() => {
+                pollTimer = undefined;
+                void drainPending();
+              }, pollIntervalMs);
+            };
+            schedulePollFn = schedulePollTimer;
+
+            const drainPending = async () => {
+              if (closed || streamSignal.aborted) {
+                cleanup();
+                return;
+              }
+              if (isBackpressured()) {
+                pausedForBackpressure = true;
+                dirty = true;
+                armBackpressureTimeout();
+                return;
+              }
+              if (pumping) {
+                dirty = true;
+                return;
+              }
+              pumping = true;
+              try {
+                do {
+                  dirty = false;
+                  if (closed || streamSignal.aborted) {
+                    cleanup();
+                    return;
+                  }
+                  if (isBackpressured()) {
+                    pausedForBackpressure = true;
+                    dirty = true;
+                    armBackpressureTimeout();
+                    return;
+                  }
+                  const liveSession = await auth.getSession(authHeaders);
+                  if (!liveSession) {
+                    emitRevokedAndClose();
+                    return;
+                  }
+                  const polled = await realtimeUseCases.pollSubscription(
+                    actorResult.actor,
+                    workspaceId,
+                    currentCursor,
+                    { projectId },
+                  );
+                  if (closed || streamSignal.aborted) {
+                    cleanup();
+                    return;
+                  }
+                  if (polled.status === "revoked") {
+                    emitRevokedAndClose();
+                    return;
+                  }
+                  if (polled.status === "resync") {
+                    currentCursor = polled.parsedCursor;
+                    if (
+                      !enqueueSseEvent(
+                        "resync",
+                        {
+                          contractVersion: CONTRACT_VERSION,
+                          type: "resync",
+                          workspaceId,
+                          projectId,
+                          reason: polled.reason,
+                          cursor: polled.cursor,
+                        },
+                        polled.cursor,
+                      )
+                    ) {
+                      return;
+                    }
+                    if (isBackpressured()) {
+                      pausedForBackpressure = true;
+                      armBackpressureTimeout();
+                      return;
+                    }
+                    continue;
+                  }
+
+                  let pausedMidBatch = false;
+                  for (let i = 0; i < polled.items.length; i++) {
+                    if (i > 0 && isBackpressured()) {
+                      currentCursor = polled.itemCursors[i - 1]!;
+                      pausedForBackpressure = true;
+                      dirty = true;
+                      armBackpressureTimeout();
+                      pausedMidBatch = true;
+                      break;
+                    }
+                    const item = polled.items[i]!;
+                    if (!enqueueSseEvent("change", item, item.cursor)) {
+                      return;
+                    }
+                  }
+                  if (pausedMidBatch) {
+                    return;
+                  }
+                  currentCursor = polled.nextCursor;
+                  if (polled.hasMore) {
+                    dirty = true;
+                    if (isBackpressured()) {
+                      pausedForBackpressure = true;
+                      armBackpressureTimeout();
+                      return;
+                    }
+                  }
+                } while (dirty && !closed && !streamSignal.aborted);
+              } catch {
+                cleanup();
+                return;
+              } finally {
+                pumping = false;
+                if (!closed && !streamSignal.aborted) {
+                  if (pausedForBackpressure || isBackpressured()) {
+                    pausedForBackpressure = true;
+                    armBackpressureTimeout();
+                  } else {
+                    clearBackpressureTimeout();
+                    if (dirty) {
+                      void drainPending();
+                    } else {
+                      schedulePollTimer();
+                    }
+                  }
+                }
+              }
+            };
+            drainPendingFn = drainPending;
+
+            onAbort = () => cleanup();
+            streamSignal.addEventListener("abort", onAbort, { once: true });
+            if (streamSignal.aborted) {
+              cleanup();
               return;
             }
+
+            if (!enqueueFrame(`retry: ${retryMs}\n\n`)) {
+              return;
+            }
+            if (open.mode === "resync") {
+              if (
+                !enqueueSseEvent(
+                  "resync",
+                  {
+                    contractVersion: CONTRACT_VERSION,
+                    type: "resync",
+                    workspaceId,
+                    projectId,
+                    reason: open.reason,
+                    cursor: open.cursor,
+                  },
+                  open.cursor,
+                )
+              ) {
+                return;
+              }
+            } else {
+              if (
+                !enqueueSseEvent(
+                  "ready",
+                  {
+                    contractVersion: CONTRACT_VERSION,
+                    type: "ready",
+                    workspaceId,
+                    projectId,
+                    cursor: open.cursor,
+                  },
+                  open.cursor,
+                )
+              ) {
+                return;
+              }
+            }
+
+            unsubscribeHub = deps.realtimeHub?.subscribe(workspaceId, () => {
+              if (isBackpressured()) {
+                pausedForBackpressure = true;
+                dirty = true;
+                armBackpressureTimeout();
+                return;
+              }
+              if (pollTimer !== undefined) {
+                clearTimeout(pollTimer);
+                pollTimer = undefined;
+              }
+              void drainPending();
+            });
+
+            heartbeatTimer = setInterval(() => {
+              if (isBackpressured()) {
+                pausedForBackpressure = true;
+                armBackpressureTimeout();
+                return;
+              }
+              enqueueFrame(": keepalive\n\n");
+            }, heartbeatIntervalMs);
+
+            if (!closed && !streamSignal.aborted) {
+              if (isBackpressured()) {
+                pausedForBackpressure = true;
+                if (open.mode === "resume") {
+                  dirty = true;
+                }
+                armBackpressureTimeout();
+              } else if (open.mode === "resume") {
+                void drainPending();
+              } else {
+                schedulePollTimer();
+              }
+            }
+          },
+
+          pull() {
+            if (closed || streamSignal.aborted) {
+              return;
+            }
+            if (!isBackpressured()) {
+              clearBackpressureTimeout();
+              if (pausedForBackpressure) {
+                pausedForBackpressure = false;
+                void drainPendingFn?.();
+              } else {
+                schedulePollFn?.();
+              }
+            }
+          },
+
+          cancel() {
             closed = true;
             if (pollTimer !== undefined) {
               clearTimeout(pollTimer);
@@ -1103,230 +1453,22 @@ export function createApp(deps: AppDeps): Hono {
               clearInterval(heartbeatTimer);
               heartbeatTimer = undefined;
             }
+            clearBackpressureTimeout();
             unsubscribeHub?.();
             unsubscribeHub = undefined;
             if (onAbort) {
               streamSignal.removeEventListener("abort", onAbort);
               onAbort = undefined;
             }
-            try {
-              controller.close();
-            } catch {
-              // Stream controller may already be closed
-            }
-          };
-
-          const enqueueFrame = (frame: string): boolean => {
-            if (closed || streamSignal.aborted) {
-              cleanup();
-              return false;
-            }
-            try {
-              controller.enqueue(encoder.encode(frame));
-              return true;
-            } catch {
-              cleanup();
-              return false;
-            }
-          };
-
-          const enqueueSseEvent = (
-            eventName: string,
-            data: unknown,
-            id?: string,
-          ): boolean => {
-            const lines: string[] = [];
-            if (id !== undefined) {
-              lines.push(`id: ${id}`);
-            }
-            lines.push(`event: ${eventName}`);
-            lines.push(`data: ${JSON.stringify(data)}`);
-            return enqueueFrame(`${lines.join("\n")}\n\n`);
-          };
-
-          const emitRevokedAndClose = () => {
-            enqueueSseEvent("revoked", {
-              contractVersion: CONTRACT_VERSION,
-              type: "revoked",
-              workspaceId,
-              projectId,
-            });
-            cleanup();
-          };
-
-          const schedulePollTimer = () => {
-            if (closed || streamSignal.aborted) {
-              return;
-            }
-            if (pollTimer !== undefined) {
-              clearTimeout(pollTimer);
-            }
-            pollTimer = setTimeout(() => {
-              pollTimer = undefined;
-              void drainPending();
-            }, pollIntervalMs);
-          };
-
-          const drainPending = async () => {
-            if (closed || streamSignal.aborted) {
-              cleanup();
-              return;
-            }
-            if (pumping) {
-              dirty = true;
-              return;
-            }
-            pumping = true;
-            try {
-              do {
-                dirty = false;
-                if (closed || streamSignal.aborted) {
-                  cleanup();
-                  return;
-                }
-                const liveSession = await auth.getSession(authHeaders);
-                if (!liveSession) {
-                  emitRevokedAndClose();
-                  return;
-                }
-                const polled = await realtimeUseCases.pollSubscription(
-                  actorResult.actor,
-                  workspaceId,
-                  currentCursor,
-                  { projectId },
-                );
-                if (closed || streamSignal.aborted) {
-                  cleanup();
-                  return;
-                }
-                if (polled.status === "revoked") {
-                  emitRevokedAndClose();
-                  return;
-                }
-                if (polled.status === "resync") {
-                  currentCursor = polled.parsedCursor;
-                  if (
-                    !enqueueSseEvent(
-                      "resync",
-                      {
-                        contractVersion: CONTRACT_VERSION,
-                        type: "resync",
-                        workspaceId,
-                        projectId,
-                        reason: polled.reason,
-                        cursor: polled.cursor,
-                      },
-                      polled.cursor,
-                    )
-                  ) {
-                    return;
-                  }
-                  continue;
-                }
-
-                for (const item of polled.items) {
-                  if (!enqueueSseEvent("change", item, item.cursor)) {
-                    return;
-                  }
-                }
-                currentCursor = polled.nextCursor;
-                if (polled.hasMore) {
-                  dirty = true;
-                }
-              } while (dirty && !closed && !streamSignal.aborted);
-            } catch {
-              cleanup();
-              return;
-            } finally {
-              pumping = false;
-              if (!closed && !streamSignal.aborted) {
-                schedulePollTimer();
-              }
-            }
-          };
-
-          onAbort = () => cleanup();
-          streamSignal.addEventListener("abort", onAbort, { once: true });
-          if (streamSignal.aborted) {
-            cleanup();
-            return;
-          }
-
-          if (!enqueueFrame(`retry: ${retryMs}\n\n`)) {
-            return;
-          }
-          if (open.mode === "resync") {
-            if (
-              !enqueueSseEvent(
-                "resync",
-                {
-                  contractVersion: CONTRACT_VERSION,
-                  type: "resync",
-                  workspaceId,
-                  projectId,
-                  reason: open.reason,
-                  cursor: open.cursor,
-                },
-                open.cursor,
-              )
-            ) {
-              return;
-            }
-          } else {
-            if (
-              !enqueueSseEvent(
-                "ready",
-                {
-                  contractVersion: CONTRACT_VERSION,
-                  type: "ready",
-                  workspaceId,
-                  projectId,
-                  cursor: open.cursor,
-                },
-                open.cursor,
-              )
-            ) {
-              return;
-            }
-          }
-
-          unsubscribeHub = deps.realtimeHub?.subscribe(workspaceId, () => {
-            if (pollTimer !== undefined) {
-              clearTimeout(pollTimer);
-              pollTimer = undefined;
-            }
-            void drainPending();
-          });
-
-          heartbeatTimer = setInterval(() => {
-            enqueueFrame(": keepalive\n\n");
-          }, heartbeatIntervalMs);
-
-          if (open.mode === "resume") {
-            void drainPending();
-          } else {
-            schedulePollTimer();
-          }
+          },
         },
-
-        cancel() {
-          closed = true;
-          if (pollTimer !== undefined) {
-            clearTimeout(pollTimer);
-            pollTimer = undefined;
-          }
-          if (heartbeatTimer !== undefined) {
-            clearInterval(heartbeatTimer);
-            heartbeatTimer = undefined;
-          }
-          unsubscribeHub?.();
-          unsubscribeHub = undefined;
-          if (onAbort) {
-            streamSignal.removeEventListener("abort", onAbort);
-            onAbort = undefined;
-          }
+        {
+          highWaterMark: maxBufferedBytes,
+          size(chunk) {
+            return chunk.byteLength;
+          },
         },
-      });
+      );
 
       return new Response(stream, {
         status: 200,

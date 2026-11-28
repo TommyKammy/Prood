@@ -262,40 +262,28 @@ export class ProodShellElement extends BaseElement {
       this.realtimeLoadPromise = import("./realtime.js")
         .then((mod) => {
           this.rtMod = mod;
-          this.realtime = mod.createRealtimeController({
-            onChange: (ev) => {
+          this.realtime = mod.createShellRealtimeController({
+            getActiveWorkspaceId: () => this.activeWorkspaceId,
+            getActiveProjectId: () => this.activeProjectId,
+            getTasks: () => this.tasks,
+            setTasks: (tasks, highlightedTaskId, liveNotice) => {
+              this.tasks = tasks;
+              if (highlightedTaskId !== undefined) {
+                this.highlightedTaskId = highlightedTaskId;
+              }
+              if (liveNotice !== undefined) {
+                this.liveNotice = liveNotice;
+              }
+              this.render();
+            },
+            pushPendingEvent: (ev) => {
               this.pendingRtEvents?.push(ev);
-              const applied = mod.applyRealtimeChangeToTasks(
-                this.tasks,
-                this.activeProjectId,
-                ev,
-              );
-              if (applied.changed) {
-                this.tasks = applied.tasks;
-                if (applied.highlightedTaskId !== undefined) {
-                  this.highlightedTaskId = applied.highlightedTaskId;
-                }
-                if (ev.task) {
-                  this.liveNotice = this.i18n.t("realtime.taskUpdated", {
-                    title: ev.task.title,
-                  });
-                }
-                this.render();
-              } else if (ev.eventType.indexOf("task.") !== 0 && this.activeWorkspaceId) {
-                void this.loadWorkspaceData(this.activeWorkspaceId, true);
-              }
-              if (applied.needsReload && this.activeProjectId) {
-                void this.loadProjectData(this.activeProjectId);
-              }
             },
-            onResync: () => {
-              if (this.activeWorkspaceId) {
-                void this.loadWorkspaceData(this.activeWorkspaceId, true);
-              }
-            },
-            onRevoked: () => {
-              void this.refreshSession();
-            },
+            reloadWorkspace: (id) => void this.loadWorkspaceData(id, true),
+            reloadProject: (id) => void this.loadProjectData(id),
+            refreshSession: () => void this.refreshSession(),
+            formatTaskNotice: (title) =>
+              this.i18n.t("realtime.taskUpdated", { title }),
           });
           if (this.authState === "authenticated" && this.activeWorkspaceId) {
             this.realtime.connect(this.activeWorkspaceId);
@@ -572,11 +560,13 @@ export class ProodShellElement extends BaseElement {
     silent = false,
   ): Promise<void> {
     const seq = ++this.workspaceDataSeq;
+    const projectSeqBefore = this.projectDataSeq;
     if (!silent) {
       this.loadingWorkspace = true;
       this.workspaceLoadError = "";
       this.render();
     }
+    this.syncRealtime();
 
     const [projRes, wsSettingsRes] = await Promise.all([
       listProjects(workspaceId),
@@ -621,9 +611,11 @@ export class ProodShellElement extends BaseElement {
       this.resetDevSettingsDrafts();
     }
     this.syncUrlState();
-    this.syncRealtime();
     this.render();
 
+    if (silent && this.projectDataSeq !== projectSeqBefore) {
+      return;
+    }
     if (this.activeProjectId) {
       await this.loadProjectData(this.activeProjectId);
     } else {
@@ -1052,6 +1044,7 @@ export class ProodShellElement extends BaseElement {
     const root = this.ensureMountNodes();
     if (!root) return;
 
+    const savedFocus = this.rtMod?.captureFocusState(root) ?? null;
     const { t, formatTaskCount } = this.i18n;
     const isConsent = this.isConsentRoute();
     const memberships = this.sessionProfile?.memberships ?? [];
@@ -1348,6 +1341,7 @@ export class ProodShellElement extends BaseElement {
     }
 
     root.append(header, main);
+    this.rtMod?.restoreFocusState(root, savedFocus);
   }
 
   private renderSidebar(wsRole: WorkspaceRole | null): HTMLElement {

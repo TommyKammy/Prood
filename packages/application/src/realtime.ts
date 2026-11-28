@@ -143,6 +143,7 @@ export type PollSubscriptionResult =
   | {
       status: "ok";
       items: RealtimeChangeEventDto[];
+      itemCursors: ParsedRealtimeCursor[];
       nextCursor: ParsedRealtimeCursor;
       nextCursorEncoded: string;
       hasMore: boolean;
@@ -388,6 +389,14 @@ export function createRealtimeUseCases(deps: RealtimeUseCaseDeps) {
         }
 
         const items: RealtimeChangeEventDto[] = [];
+        const itemCursors: ParsedRealtimeCursor[] = [];
+        const emitItem = (
+          item: RealtimeChangeEventDto,
+          cursorState: ParsedRealtimeCursor,
+        ) => {
+          items.push(item);
+          itemCursors.push(cursorState);
+        };
         let runningCursor = parsedCursor;
 
         for (const ev of events) {
@@ -404,16 +413,19 @@ export function createRealtimeUseCases(deps: RealtimeUseCaseDeps) {
           const itemCursor = encodeRealtimeCursor(runningCursor);
 
           if (ev.eventType === "workspace.settings.updated") {
-            items.push({
-              contractVersion: CONTRACT_VERSION,
-              type: "change",
-              eventId: ev.eventId,
-              eventType: "workspace.settings.updated",
-              workspaceId,
-              projectId: null,
-              occurredAt: ev.occurredAt,
-              cursor: itemCursor,
-            });
+            emitItem(
+              {
+                contractVersion: CONTRACT_VERSION,
+                type: "change",
+                eventId: ev.eventId,
+                eventType: "workspace.settings.updated",
+                workspaceId,
+                projectId: null,
+                occurredAt: ev.occurredAt,
+                cursor: itemCursor,
+              },
+              runningCursor,
+            );
             continue;
           }
 
@@ -431,16 +443,19 @@ export function createRealtimeUseCases(deps: RealtimeUseCaseDeps) {
             if (requestedProjectId && access.project.id !== requestedProjectId) {
               continue;
             }
-            items.push({
-              contractVersion: CONTRACT_VERSION,
-              type: "change",
-              eventId: ev.eventId,
-              eventType: ev.eventType as RealtimeChangeKind,
-              workspaceId,
-              projectId: access.project.id,
-              occurredAt: ev.occurredAt,
-              cursor: itemCursor,
-            });
+            emitItem(
+              {
+                contractVersion: CONTRACT_VERSION,
+                type: "change",
+                eventId: ev.eventId,
+                eventType: ev.eventType as RealtimeChangeKind,
+                workspaceId,
+                projectId: access.project.id,
+                occurredAt: ev.occurredAt,
+                cursor: itemCursor,
+              },
+              runningCursor,
+            );
             continue;
           }
 
@@ -456,17 +471,20 @@ export function createRealtimeUseCases(deps: RealtimeUseCaseDeps) {
             if (requestedProjectId && access.project.id !== requestedProjectId) {
               continue;
             }
-            items.push({
-              contractVersion: CONTRACT_VERSION,
-              type: "change",
-              eventId: ev.eventId,
-              eventType: "task.deleted",
-              workspaceId,
-              projectId: access.project.id,
-              ...(taskId ? { taskId } : {}),
-              occurredAt: ev.occurredAt,
-              cursor: itemCursor,
-            });
+            emitItem(
+              {
+                contractVersion: CONTRACT_VERSION,
+                type: "change",
+                eventId: ev.eventId,
+                eventType: "task.deleted",
+                workspaceId,
+                projectId: access.project.id,
+                ...(taskId ? { taskId } : {}),
+                occurredAt: ev.occurredAt,
+                cursor: itemCursor,
+              },
+              runningCursor,
+            );
             continue;
           }
 
@@ -499,17 +517,20 @@ export function createRealtimeUseCases(deps: RealtimeUseCaseDeps) {
                   fromAccess.project &&
                   (!requestedProjectId || fromAccess.project.id === requestedProjectId)
                 ) {
-                  items.push({
-                    contractVersion: CONTRACT_VERSION,
-                    type: "change",
-                    eventId: ev.eventId,
-                    eventType: "task.removed",
-                    workspaceId,
-                    projectId: fromAccess.project.id,
-                    taskId,
-                    occurredAt: ev.occurredAt,
-                    cursor: itemCursor,
-                  });
+                  emitItem(
+                    {
+                      contractVersion: CONTRACT_VERSION,
+                      type: "change",
+                      eventId: ev.eventId,
+                      eventType: "task.removed",
+                      workspaceId,
+                      projectId: fromAccess.project.id,
+                      taskId,
+                      occurredAt: ev.occurredAt,
+                      cursor: itemCursor,
+                    },
+                    runningCursor,
+                  );
                 }
               }
               continue;
@@ -535,17 +556,20 @@ export function createRealtimeUseCases(deps: RealtimeUseCaseDeps) {
                 fromAccess.project &&
                 (!requestedProjectId || fromAccess.project.id === requestedProjectId)
               ) {
-                items.push({
-                  contractVersion: CONTRACT_VERSION,
-                  type: "change",
-                  eventId: ev.eventId,
-                  eventType: "task.removed",
-                  workspaceId,
-                  projectId: fromAccess.project.id,
-                  taskId: task.id,
-                  occurredAt: ev.occurredAt,
-                  cursor: itemCursor,
-                });
+                emitItem(
+                  {
+                    contractVersion: CONTRACT_VERSION,
+                    type: "change",
+                    eventId: ev.eventId,
+                    eventType: "task.removed",
+                    workspaceId,
+                    projectId: fromAccess.project.id,
+                    taskId: task.id,
+                    occurredAt: ev.occurredAt,
+                    cursor: itemCursor,
+                  },
+                  runningCursor,
+                );
               }
               continue;
             }
@@ -571,21 +595,24 @@ export function createRealtimeUseCases(deps: RealtimeUseCaseDeps) {
               task.assigneeId ? (assigneeNames.get(task.assigneeId) ?? null) : null,
             );
 
-            items.push({
-              contractVersion: CONTRACT_VERSION,
-              type: "change",
-              eventId: ev.eventId,
-              eventType: ev.eventType as RealtimeChangeKind,
-              workspaceId,
-              projectId: effective.project.id,
-              ...(ev.eventType === "task.moved" && fromAccess.readable && rawFromProjectId
-                ? { fromProjectId: rawFromProjectId }
-                : {}),
-              taskId: task.id,
-              task: taskDto,
-              occurredAt: ev.occurredAt,
-              cursor: itemCursor,
-            });
+            emitItem(
+              {
+                contractVersion: CONTRACT_VERSION,
+                type: "change",
+                eventId: ev.eventId,
+                eventType: ev.eventType as RealtimeChangeKind,
+                workspaceId,
+                projectId: effective.project.id,
+                ...(ev.eventType === "task.moved" && fromAccess.readable && rawFromProjectId
+                  ? { fromProjectId: rawFromProjectId }
+                  : {}),
+                taskId: task.id,
+                task: taskDto,
+                occurredAt: ev.occurredAt,
+                cursor: itemCursor,
+              },
+              runningCursor,
+            );
           }
         }
 
@@ -602,6 +629,7 @@ export function createRealtimeUseCases(deps: RealtimeUseCaseDeps) {
         return {
           status: "ok",
           items,
+          itemCursors,
           nextCursor: advanced.cursor,
           nextCursorEncoded: encodeRealtimeCursor(advanced.cursor),
           hasMore: events.length === limit,

@@ -163,9 +163,171 @@ export function replayRealtimeEventsOnSnapshot(
 }
 
 export interface RealtimeControllerOptions {
+  onReady?: (event: RealtimeReadyEventDto, initial: boolean) => void;
   onChange: (event: RealtimeChangeEventDto) => void;
   onResync: (event: RealtimeResyncEventDto) => void;
   onRevoked: () => void;
+}
+
+export interface SavedFocusState {
+  selector: string;
+  selectionStart: number | null;
+  selectionEnd: number | null;
+  selectionDirection: "forward" | "backward" | "none" | null;
+}
+
+function escapeAttrValue(value: string): string {
+  return value.replace(/["\\]/g, "\\$&");
+}
+
+/**
+ * Captures the currently focused descendant control inside `root` together with its
+ * text selection range so full DOM re-renders triggered by SSE do not interrupt typing.
+ */
+export function captureFocusState(root: HTMLElement): SavedFocusState | null {
+  if (typeof document === "undefined") {
+    return null;
+  }
+  const active = document.activeElement;
+  if (!active || !(active instanceof Element) || !root.contains(active)) {
+    return null;
+  }
+  let selector = "";
+  if (active.id) {
+    selector = `[id="${escapeAttrValue(active.id)}"]`;
+  } else {
+    const dataParts: string[] = [];
+    for (const attr of Array.from(active.attributes)) {
+      if (attr.name.indexOf("data-") === 0) {
+        dataParts.push(
+          attr.value
+            ? `[${attr.name}="${escapeAttrValue(attr.value)}"]`
+            : `[${attr.name}]`,
+        );
+      }
+    }
+    if (dataParts.length > 0) {
+      selector = dataParts.join("");
+    }
+  }
+  if (!selector) {
+    return null;
+  }
+
+  let selectionStart: number | null = null;
+  let selectionEnd: number | null = null;
+  let selectionDirection: "forward" | "backward" | "none" | null = null;
+  const tag = active.tagName.toUpperCase();
+  if (tag === "INPUT" || tag === "TEXTAREA") {
+    try {
+      const inputEl = active as HTMLInputElement | HTMLTextAreaElement;
+      selectionStart = inputEl.selectionStart;
+      selectionEnd = inputEl.selectionEnd;
+      selectionDirection =
+        inputEl.selectionDirection === "forward" ||
+        inputEl.selectionDirection === "backward" ||
+        inputEl.selectionDirection === "none"
+          ? inputEl.selectionDirection
+          : null;
+    } catch {
+      // Non-text inputs such as checkboxes do not expose selection offsets
+    }
+  }
+
+  return { selector, selectionStart, selectionEnd, selectionDirection };
+}
+
+/**
+ * Restores focus and text selection onto the matching recreated descendant inside `root`.
+ */
+export function restoreFocusState(
+  root: HTMLElement,
+  state: SavedFocusState | null,
+): void {
+  if (!state) {
+    return;
+  }
+  const target = root.querySelector<HTMLElement>(state.selector);
+  if (!target || typeof target.focus !== "function") {
+    return;
+  }
+  try {
+    target.focus({ preventScroll: true });
+  } catch {
+    target.focus();
+  }
+  if (state.selectionStart !== null && state.selectionEnd !== null) {
+    const maybeInput = target as HTMLInputElement;
+    if (typeof maybeInput.setSelectionRange === "function") {
+      try {
+        maybeInput.setSelectionRange(
+          state.selectionStart,
+          state.selectionEnd,
+          state.selectionDirection ?? undefined,
+        );
+      } catch {
+        // Ignore controls whose type does not support selection ranges
+      }
+    }
+  }
+}
+
+export interface ShellRealtimeBridgeHost {
+  getActiveWorkspaceId(): WorkspaceId | null;
+  getActiveProjectId(): ProjectId | null;
+  getTasks(): readonly TaskDto[];
+  setTasks(tasks: TaskDto[], highlightedTaskId?: TaskPublicId | null, liveNotice?: string): void;
+  pushPendingEvent(event: RealtimeChangeEventDto): void;
+  reloadWorkspace(workspaceId: WorkspaceId): void;
+  reloadProject(projectId: ProjectId): void;
+  refreshSession(): void;
+  formatTaskNotice(title: string): string;
+}
+
+/**
+ * Creates a controller wired directly to shell state transitions so eager `shell.ts`
+ * stays lightweight while still handling initial ready reconciliation, event patching,
+ * resyncs, and session revocation.
+ */
+export function createShellRealtimeController(
+  host: ShellRealtimeBridgeHost,
+): RealtimeController {
+  return createRealtimeController({
+    onReady: (ev, initial) => {
+      if (initial && host.getActiveWorkspaceId() === ev.workspaceId) {
+        host.reloadWorkspace(ev.workspaceId);
+      }
+    },
+    onChange: (ev) => {
+      host.pushPendingEvent(ev);
+      const activeProjectId = host.getActiveProjectId();
+      const applied = applyRealtimeChangeToTasks(host.getTasks(), activeProjectId, ev);
+      if (applied.changed) {
+        host.setTasks(
+          applied.tasks,
+          applied.highlightedTaskId,
+          ev.task ? host.formatTaskNotice(ev.task.title) : undefined,
+        );
+      } else if (ev.eventType.indexOf("task.") !== 0) {
+        const wsId = host.getActiveWorkspaceId();
+        if (wsId) {
+          host.reloadWorkspace(wsId);
+        }
+      }
+      if (applied.needsReload && activeProjectId) {
+        host.reloadProject(activeProjectId);
+      }
+    },
+    onResync: () => {
+      const wsId = host.getActiveWorkspaceId();
+      if (wsId) {
+        host.reloadWorkspace(wsId);
+      }
+    },
+    onRevoked: () => {
+      host.refreshSession();
+    },
+  });
 }
 
 export interface RealtimeController {
@@ -184,6 +346,7 @@ export function createRealtimeController(
   let activeWorkspaceId: WorkspaceId | null = null;
   let source: EventSource | null = null;
   let lastCursor: string | null = null;
+  let awaitingInitialReady = false;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectDelayMs = 1000;
   let closedManually = false;
@@ -216,6 +379,8 @@ export function createRealtimeController(
     es.addEventListener("ready", (rawEvent) => {
       if (source !== es) return;
       reconnectDelayMs = 1000;
+      const initial = awaitingInitialReady;
+      awaitingInitialReady = false;
       const msg = rawEvent as MessageEvent<string>;
       try {
         const payload = JSON.parse(msg.data) as RealtimeReadyEventDto;
@@ -223,6 +388,7 @@ export function createRealtimeController(
         if (cursor) {
           lastCursor = cursor;
         }
+        options.onReady?.(payload, initial);
       } catch {
         // Ignore malformed frame data
       }
@@ -247,6 +413,7 @@ export function createRealtimeController(
     es.addEventListener("resync", (rawEvent) => {
       if (source !== es) return;
       reconnectDelayMs = 1000;
+      awaitingInitialReady = false;
       const msg = rawEvent as MessageEvent<string>;
       try {
         const payload = JSON.parse(msg.data) as RealtimeResyncEventDto;
@@ -263,6 +430,7 @@ export function createRealtimeController(
     es.addEventListener("revoked", () => {
       if (source !== es) return;
       closedManually = true;
+      awaitingInitialReady = false;
       clearTimer();
       closeSource();
       options.onRevoked();
@@ -293,6 +461,7 @@ export function createRealtimeController(
       closedManually = false;
       activeWorkspaceId = workspaceId;
       lastCursor = null;
+      awaitingInitialReady = true;
       reconnectDelayMs = 1000;
       clearTimer();
       openStream(workspaceId);
@@ -302,6 +471,7 @@ export function createRealtimeController(
       closedManually = true;
       activeWorkspaceId = null;
       lastCursor = null;
+      awaitingInitialReady = false;
       clearTimer();
       closeSource();
     },

@@ -538,6 +538,8 @@ async function startRealtimeTestServer(
       retryMs: options.realtime?.retryMs ?? 500,
       retentionMs: options.realtime?.retentionMs,
       maxEvents: options.realtime?.maxEvents,
+      maxBufferedBytes: options.realtime?.maxBufferedBytes,
+      maxBackpressureMs: options.realtime?.maxBackpressureMs,
       shutdownSignal: realtimeShutdown.signal,
     },
   });
@@ -751,6 +753,7 @@ async function startRealtimeTestServer(
   }
 
   return {
+    app,
     baseUrl,
     clock,
     httpServer,
@@ -1879,5 +1882,229 @@ describe(`PR 12: SSE Realtime Web Sync & Commit-Order Visibility (${targetDb})`,
         browser.doc.querySelector(`[data-task-row="${delChild.id}"]`) === null,
       "deleting parent removes both parent and subtask from Web List",
     );
+  }, 25_000);
+
+  it("reads retention metadata in the same snapshot and enforces SSE backpressure for slow subscribers", async () => {
+    const isolated = await createIsolatedDb();
+    const db = isolated.openClient({ maxPoolSize: 8 });
+    await db.migrate();
+    const server = await startRealtimeTestServer(db, {
+      realtime: {
+        pollIntervalMs: 25,
+        heartbeatIntervalMs: 500,
+        maxBufferedBytes: 256,
+        maxBackpressureMs: 400,
+      },
+    });
+    const ids = createSystemIdGenerator();
+    const now = server.clock.now().toISOString();
+
+    const wksId = ids.next("wks");
+    await db.uow.run(async (repos) => {
+      await repos.workspaces.create({
+        id: wksId,
+        slug: "bp-ws",
+        name: "Backpressure Workspace",
+        createdAt: now,
+      });
+    });
+    const alice = await server.signUpUser("alice-bp@example.com", "Alice");
+    await db.uow.run(async (repos) => {
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: alice.userId,
+        role: "admin",
+        createdAt: now,
+      });
+    });
+
+    const project = ((
+      await (
+        await server.apiRequest(`/api/v1/workspaces/${wksId}/projects`, {
+          method: "POST",
+          jar: alice.jar,
+          json: { name: "BP Proj", visibility: "workspace" },
+        })
+      ).json()
+    ) as ProjectResponse).project;
+
+    // 1. Single-snapshot retention consistency on prune + listAfterPosition
+    const snapBefore = await db.uow.run((repos) =>
+      repos.realtimeEvents.readSnapshotState(wksId),
+    );
+    const createdForPrune = ((
+      await (
+        await server.apiRequest(`/api/v1/projects/${project.id}/tasks`, {
+          method: "POST",
+          jar: alice.jar,
+          json: { title: "Pruned Target" },
+        })
+      ).json()
+    ) as TaskResponse).task;
+    await server.apiRequest(`/api/v1/tasks/${createdForPrune.id}/start`, {
+      method: "POST",
+      jar: alice.jar,
+    });
+    const pruneResult = await server.realtimeUseCases.pruneRealtimeEvents({
+      keepLast: 0,
+    });
+    expect(pruneResult.deletedCount).toBeGreaterThanOrEqual(2);
+    const listAfterPrune = await db.uow.run((repos) =>
+      repos.realtimeEvents.listAfterPosition({
+        workspaceId: wksId,
+        watermarkTxid: snapBefore.xmax,
+        watermarkSeq: snapBefore.maxSeq,
+        pendingTxids: [],
+        limit: 50,
+      }),
+    );
+    expect(listAfterPrune.snapshot.retention.prunedThroughSeq).toBe(
+      pruneResult.prunedThroughSeq,
+    );
+
+    // Helper to parse SSE frames from a ReadableStreamDefaultReader
+    const parseChunks = (raw: string): ParsedSseFrame[] => {
+      const parsed: ParsedSseFrame[] = [];
+      for (const block of raw.split("\n\n")) {
+        const trimmed = block.trim();
+        if (!trimmed || trimmed.startsWith(":")) continue;
+        let id: string | null = null;
+        let event = "message";
+        const dataLines: string[] = [];
+        for (const line of trimmed.split("\n")) {
+          if (line.startsWith("id:")) id = line.slice(3).trim();
+          else if (line.startsWith("event:")) event = line.slice(6).trim();
+          else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+        }
+        if (dataLines.length > 0) {
+          const rawData = dataLines.join("\n");
+          parsed.push({ id, event, data: JSON.parse(rawData), rawData });
+        }
+      }
+      return parsed;
+    };
+
+    // 2. Bounded backpressure pauses without dropping once consumer resumes reading
+    const pauseServer = await startRealtimeTestServer(db, {
+      realtime: {
+        pollIntervalMs: 25,
+        heartbeatIntervalMs: 500,
+        maxBufferedBytes: 256,
+        maxBackpressureMs: 5_000,
+      },
+    });
+    const ac1 = new AbortController();
+    cleanups.push(async () => ac1.abort());
+    const slowRes = await pauseServer.app.request(
+      `/api/v1/workspaces/${wksId}/events`,
+      {
+        headers: {
+          accept: "text/event-stream",
+          cookie: alice.jar.toHeader(),
+          origin: pauseServer.baseUrl,
+        },
+        signal: ac1.signal,
+      },
+    );
+    expect(slowRes.status).toBe(200);
+    const reader1 = slowRes.body!.getReader();
+
+    // Do NOT read yet while bursts arrive and multiple poll intervals tick
+    const expectedTitles: string[] = [];
+    for (let i = 1; i <= 8; i++) {
+      const title = `BP Resume Task ${i}`;
+      expectedTitles.push(title);
+      const res = await pauseServer.apiRequest(`/api/v1/projects/${project.id}/tasks`, {
+        method: "POST",
+        jar: alice.jar,
+        json: { title },
+      });
+      expect(res.status).toBe(201);
+    }
+    await new Promise((r) => setTimeout(r, 150));
+
+    // Consumer resumes reading -> pulls all 8 task.created events with zero loss
+    const decoder = new TextDecoder();
+    let acc1 = "";
+    const deadline1 = Date.now() + 8_000;
+    while (Date.now() < deadline1) {
+      const { value, done } = await reader1.read();
+      if (done) break;
+      acc1 += decoder.decode(value, { stream: true });
+      const titlesSeen = parseChunks(acc1)
+        .filter((f) => f.event === "change")
+        .map((f) => (f.data as RealtimeChangeEventDto).task?.title)
+        .filter((t): t is string => Boolean(t));
+      if (expectedTitles.every((t) => titlesSeen.includes(t))) {
+        break;
+      }
+    }
+    ac1.abort();
+    await reader1.cancel().catch(() => {});
+    const seen1 = parseChunks(acc1)
+      .filter((f) => f.event === "change")
+      .map((f) => (f.data as RealtimeChangeEventDto).task?.title);
+    expect(seen1).toEqual(expectedTitles);
+
+    // 3. Stalled slow subscriber exceeds maxBackpressureMs -> closes cleanly with bounded buffer & resumes via Last-Event-ID
+    const ac2 = new AbortController();
+    cleanups.push(async () => ac2.abort());
+    const stalledRes = await server.app.request(
+      `/api/v1/workspaces/${wksId}/events`,
+      {
+        headers: {
+          accept: "text/event-stream",
+          cookie: alice.jar.toHeader(),
+          origin: server.baseUrl,
+        },
+        signal: ac2.signal,
+      },
+    );
+    expect(stalledRes.status).toBe(200);
+    const reader2 = stalledRes.body!.getReader();
+
+    const stalledTitles: string[] = [];
+    for (let i = 1; i <= 10; i++) {
+      const title = `Stalled Task ${i}`;
+      stalledTitles.push(title);
+      const res = await server.apiRequest(`/api/v1/projects/${project.id}/tasks`, {
+        method: "POST",
+        jar: alice.jar,
+        json: { title },
+      });
+      expect(res.status).toBe(201);
+      if (i === 1) {
+        // Give poll loop one tick to enqueue first change and fill maxBufferedBytes (256 B)
+        await new Promise((r) => setTimeout(r, 80));
+      }
+    }
+    // Leave reader2 unread past maxBackpressureMs (400ms) so server closes stalled stream
+    await new Promise((r) => setTimeout(r, 600));
+
+    let acc2 = "";
+    while (true) {
+      const { value, done } = await reader2.read();
+      if (done) break;
+      acc2 += decoder.decode(value, { stream: true });
+    }
+    const frames2 = parseChunks(acc2);
+    const bufferedChanges = frames2.filter((f) => f.event === "change");
+    expect(bufferedChanges.length).toBeLessThan(stalledTitles.length);
+    const lastCursor2 = frames2[frames2.length - 1]!.id!;
+    expect(lastCursor2).toBeTruthy();
+
+    // Reconnecting with Last-Event-ID recovers remaining stalled tasks cleanly
+    const resumedSse = await connectSseClient(
+      `${server.baseUrl}/api/v1/workspaces/${wksId}/events`,
+      { jar: alice.jar, lastEventId: lastCursor2 },
+    );
+    await resumedSse.stream.waitForFrame(
+      (f) =>
+        f.event === "change" &&
+        (f.data as RealtimeChangeEventDto).task?.title === "Stalled Task 10",
+      "recovered stalled backlog through Stalled Task 10",
+    );
+    resumedSse.stream.close();
   }, 25_000);
 });
