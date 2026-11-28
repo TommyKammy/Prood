@@ -1,4 +1,8 @@
-import { automationMigration, type MigrationDefinition } from "@prood/persistence-common";
+import {
+  effectMigration,
+  automationMigration,
+  type MigrationDefinition,
+} from "@prood/persistence-common";
 
 export const SQLITE_MIGRATIONS: readonly MigrationDefinition[] = [
   {
@@ -377,4 +381,5 @@ export const SQLITE_MIGRATIONS: readonly MigrationDefinition[] = [
     ],
   },
   automationMigration,
+  effectMigration,
 ];

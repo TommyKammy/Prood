@@ -40,3 +40,17 @@ copyFileSync(
   resolve(__dirname, "public/automation.html"),
   resolve(distDir, "automation.html"),
 );
+
+await esbuild.build({
+  entryPoints: [resolve(__dirname, "src/automation-studio.ts")],
+  bundle: true,
+  format: "esm",
+  platform: "browser",
+  target: "es2022",
+  minify: true,
+  outfile: resolve(distDir, "studio.js"),
+});
+copyFileSync(
+  resolve(__dirname, "public/automation-studio.html"),
+  resolve(distDir, "studio.html"),
+);

@@ -107,6 +107,18 @@ export function mountWebShellAssets(rootApp: Hono, customWebDistDir?: string): v
     contentType: string;
     isHtml: boolean;
   }> = [
+    ...["/automation", "/projects/:projectId/automation"].map((route) => ({
+      route,
+      file: "studio.html",
+      contentType: "text/html; charset=utf-8",
+      isHtml: true,
+    })),
+    {
+      route: "/automation/studio.js",
+      file: "studio.js",
+      contentType: "text/javascript; charset=utf-8",
+      isHtml: false,
+    },
     {
       route: "/automation/review",
       file: "automation.html",
@@ -270,7 +282,17 @@ export async function startNodeServer(): Promise<void> {
       }),
   });
 
+  const operatorBase = process.env.PROOD_DRAFLOW_OPERATOR_URL;
+  const operatorConsole = operatorBase ? new URL("/operator/", operatorBase) : undefined;
+  if (
+    operatorConsole &&
+    (!["https:", "http:"].includes(operatorConsole.protocol) ||
+      operatorConsole.username ||
+      operatorConsole.password)
+  )
+    throw Error("Invalid Draflow operator URL");
   const apiApp = createApp({
+    operatorConsole:operatorConsole?.href,
     clock,
     dbHealth: db,
     auth,

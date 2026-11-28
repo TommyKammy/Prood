@@ -65,6 +65,15 @@ describe("@prood/server Web-Standard app", () => {
       run: async (fn) =>
         fn({
           automation: {
+            lockOperation: async () => {},
+            routed: async () => [],
+            members: async () => [],
+            events: async () => [],
+            confirmed: async () => null,
+            operationRun: async () => null,
+            receipt: async () => null,
+            record: async () => {},
+            decide: async () => false,
             rules: async () => [],
             save: async () => false,
             enqueue: async () => {},

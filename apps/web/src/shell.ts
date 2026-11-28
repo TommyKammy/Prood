@@ -461,6 +461,11 @@ export class ProodShellElement extends BaseElement {
             slug: membership.workspaceSlug,
             role: t(ROLE_LABEL_KEYS[membership.role]),
           });
+          const automation = document.createElement("a");
+          automation.href =
+            "/automation?workspace=" + encodeURIComponent(membership.workspaceId);
+          automation.textContent = "Automation";
+          li.append(" · ", automation);
           list.appendChild(li);
         }
         wsSection.appendChild(list);

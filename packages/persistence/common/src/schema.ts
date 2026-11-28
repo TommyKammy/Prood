@@ -190,6 +190,14 @@ export interface OutboxEventTable {
 }
 
 export interface ProodDatabase {
+  automation_receipts: {
+    workspace: string;
+    run: string;
+    event: string;
+    rule: string;
+    result: string;
+    decision: "undo" | "keep" | null;
+  };
   automation_checks: { event: string; rule: string; run: string; status: string };
   automation_rules: {
     project: string;
