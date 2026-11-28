@@ -356,6 +356,7 @@ export interface WorkspaceSettingsRepository {
 
 export interface UserRepository {
   findById(id: UserId): Promise<UserRecord | null>;
+  findByIds(ids: readonly UserId[]): Promise<Map<UserId, UserRecord>>;
   findByEmail(email: string): Promise<UserRecord | null>;
   findByAuthIdentity(
     authProvider: string,
@@ -519,6 +520,70 @@ export interface IdempotencyRepository {
   ): Promise<IdempotencyRecord | null>;
 }
 
+export interface RealtimeEventRecord {
+  seq: number;
+  txid: string;
+  workspaceId: WorkspaceId;
+  projectId: ProjectId | null;
+  eventId: EventId;
+  eventType: string;
+  targetType: string;
+  targetId: string | null;
+  payload: Record<string, unknown>;
+  occurredAt: string;
+  createdAt: string;
+}
+
+export interface AppendRealtimeEventInput {
+  workspaceId: WorkspaceId;
+  projectId: ProjectId | null;
+  eventId: EventId;
+  eventType: string;
+  targetType: string;
+  targetId: string | null;
+  payload: Record<string, unknown>;
+  occurredAt: string;
+  createdAt: string;
+}
+
+export interface RealtimeRetentionState {
+  prunedThroughTxid: string;
+  prunedThroughSeq: number;
+}
+
+export interface RealtimeSnapshotState {
+  driver: DbDriverKind;
+  xmin: string;
+  xmax: string;
+  maxSeq: number;
+  activeXips: string[];
+  retention: RealtimeRetentionState;
+}
+
+export interface RealtimeEventsRepository {
+  append(input: AppendRealtimeEventInput): Promise<RealtimeEventRecord>;
+  readSnapshotState(workspaceId: WorkspaceId): Promise<RealtimeSnapshotState>;
+  listAfterPosition(input: {
+    workspaceId: WorkspaceId;
+    watermarkTxid: string;
+    watermarkSeq: number;
+    pendingTxids: ReadonlyArray<{ txid: string; afterSeq: number }>;
+    limit: number;
+  }): Promise<{
+    snapshot: RealtimeSnapshotState;
+    events: RealtimeEventRecord[];
+  }>;
+  prune(input: {
+    beforeCreatedAt?: string;
+    keepLast?: number;
+    nowIso: string;
+  }): Promise<{
+    deletedCount: number;
+    prunedThroughTxid: string;
+    prunedThroughSeq: number;
+  }>;
+}
+
 export interface TransactionRepositories {
   readonly automation: import("./automation.js").AutomationRepository;
   readonly driver?: DbDriverKind;
@@ -532,6 +597,7 @@ export interface TransactionRepositories {
   readonly issueKeys: IssueKeyRepository;
   readonly outbox: OutboxRepository;
   readonly idempotency: IdempotencyRepository;
+  readonly realtimeEvents: RealtimeEventsRepository;
 }
 
 /**

@@ -42,13 +42,12 @@ import {
   type WorkspaceSettingsResponse,
 } from "@prood/contracts";
 import {
-  canonicalizeIdempotencyPayload,
   canManageProject,
   canReadProject,
   canWriteProjectTasks,
+  canonicalizeIdempotencyPayload,
   DEFAULT_LOCALE,
   DEV_PROJECT_ENABLE_MAX_TASKS,
-  formatBranchName,
   formatIssueKey,
   isValidEntityId,
   isValidProjectKind,
@@ -58,7 +57,6 @@ import {
   OUTBOX_SCHEMA_VERSION,
   parseIssueKey,
   planTaskStartTransition,
-  resolveEffectiveProjectRole,
   type AuditActorContext,
   type EventChannel,
   type LocaleCode,
@@ -84,6 +82,14 @@ import type {
   UnitOfWork,
   WorkspaceSettingsRecord,
 } from "./persistence.js";
+import { REALTIME_EVENT_TYPES, type RealtimeHub } from "./realtime.js";
+import {
+  MAX_PARENT_HOPS,
+  resolveActorProjectRole,
+  resolveAssigneeDisplayNames,
+  resolveTaskEffectiveProject,
+  toTaskDto,
+} from "./work-helpers.js";
 
 export type WorkUseCaseResult<T> =
   | { ok: true; data: T }
@@ -98,9 +104,9 @@ export interface WorkUseCaseDeps {
   uow: UnitOfWork;
   idGenerator: IdGenerator;
   clock: Clock;
+  realtimeHub?: RealtimeHub;
 }
 
-const MAX_PARENT_HOPS = 16;
 const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 const TASK_CREATE_OPERATION = "task.create" as const;
 const MAX_IDEMPOTENCY_RACE_RETRIES = 3;
@@ -212,38 +218,6 @@ function toProjectDto(
   };
 }
 
-function toTaskDto(
-  task: TaskRecord,
-  effectiveProjectId: ProjectId,
-  issueKeyView: TaskIssueKeyView | null = null,
-  showIssueKey = true,
-): TaskDto {
-  const visibleKey = showIssueKey ? issueKeyView : null;
-  return {
-    id: task.id,
-    workspaceId: task.workspaceId,
-    projectId: task.projectId,
-    effectiveProjectId,
-    parentTaskId: task.parentTaskId,
-    statusId: task.statusId,
-    issueKey: visibleKey
-      ? formatIssueKey(visibleKey.currentPrefix, visibleKey.issueNumber)
-      : null,
-    branchName: visibleKey
-      ? formatBranchName(visibleKey.branchPrefix, visibleKey.issueNumber)
-      : null,
-    title: task.title,
-    description: task.description,
-    assigneeId: task.assigneeId,
-    createdBy: task.createdBy,
-    dueOn: task.dueOn,
-    completedAt: task.completedAt,
-    position: task.position,
-    createdAt: task.createdAt,
-    updatedAt: task.updatedAt,
-  };
-}
-
 export function toOutboxEventDto(record: OutboxEventRecord): OutboxEventDto {
   return {
     id: record.id,
@@ -271,6 +245,34 @@ export function toOutboxEventDto(record: OutboxEventRecord): OutboxEventDto {
  * and versioned transactional outbox recording (including entry-level denials & auth failures).
  */
 export function createWorkUseCases(deps: WorkUseCaseDeps) {
+  const pendingRealtimeWorkspaces = new WeakMap<
+    TransactionRepositories,
+    Set<WorkspaceId>
+  >();
+  const rawUow = deps.uow;
+  const trackedUow: UnitOfWork = {
+    async run<T>(fn: (repos: TransactionRepositories) => Promise<T>): Promise<T> {
+      let notifyWorkspaces: WorkspaceId[] = [];
+      const result = await rawUow.run(async (repos) => {
+        pendingRealtimeWorkspaces.set(repos, new Set());
+        try {
+          const out = await fn(repos);
+          notifyWorkspaces = Array.from(pendingRealtimeWorkspaces.get(repos) ?? []);
+          return out;
+        } catch (error) {
+          pendingRealtimeWorkspaces.delete(repos);
+          throw error;
+        }
+      });
+      if (deps.realtimeHub && notifyWorkspaces.length > 0) {
+        for (const wsId of notifyWorkspaces) {
+          deps.realtimeHub.notify(wsId);
+        }
+      }
+      return result;
+    },
+  };
+
   async function appendOutbox(
     repos: TransactionRepositories,
     params: {
@@ -314,61 +316,26 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       },
       occurredAt: nowIso,
     });
+    if (
+      params.outcome === "succeeded" &&
+      params.workspaceId !== null &&
+      REALTIME_EVENT_TYPES.has(params.eventType)
+    ) {
+      await repos.realtimeEvents.append({
+        workspaceId: params.workspaceId,
+        projectId: params.projectId,
+        eventId: event.eventId,
+        eventType: params.eventType,
+        targetType: params.targetType,
+        targetId: params.targetId,
+        payload: event.payload,
+        occurredAt: event.occurredAt,
+        createdAt: event.createdAt,
+      });
+      pendingRealtimeWorkspaces.get(repos)?.add(params.workspaceId);
+    }
     await routeTaskEvent(repos, event, manualSubscription, cause);
     return event;
-  }
-
-  async function resolveActorProjectRole(
-    repos: TransactionRepositories,
-    userId: UserId | null,
-    project: ProjectRecord,
-  ): Promise<ProjectRole | null> {
-    if (!userId) {
-      return null;
-    }
-    const workspaceMembership = await repos.memberships.findByWorkspaceAndUser(
-      project.workspaceId,
-      userId,
-    );
-    if (!workspaceMembership) {
-      return null;
-    }
-    const projectMembership = await repos.projects.findMembership(
-      project.id,
-      userId,
-    );
-    return resolveEffectiveProjectRole({
-      workspaceRole: workspaceMembership.role,
-      projectVisibility: project.visibility,
-      projectMembershipRole: projectMembership?.role ?? null,
-    });
-  }
-
-  async function resolveTaskEffectiveProject(
-    repos: TransactionRepositories,
-    task: TaskRecord,
-  ): Promise<{ project: ProjectRecord; depth: number } | null> {
-    let current: TaskRecord | null = task;
-    const visited = new Set<string>();
-    for (let hop = 0; hop < MAX_PARENT_HOPS && current; hop += 1) {
-      if (current.projectId) {
-        const project = await repos.projects.findById(current.projectId);
-        if (!project || project.workspaceId !== task.workspaceId) {
-          return null;
-        }
-        return { project, depth: hop };
-      }
-      if (!current.parentTaskId || visited.has(current.parentTaskId)) {
-        return null;
-      }
-      visited.add(current.id);
-      const parent = await repos.tasks.findById(current.parentTaskId);
-      if (!parent || parent.workspaceId !== task.workspaceId) {
-        return null;
-      }
-      current = parent;
-    }
-    return null;
   }
 
   async function allowedValue(
@@ -753,6 +720,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
     const issueKeysByTaskId = showKeys
       ? await repos.issueKeys.findByTaskIds(collectedTasks.map((t) => t.id))
       : new Map<TaskPublicId, TaskIssueKeyView>();
+    const assigneeNames = await resolveAssigneeDisplayNames(repos, collectedTasks);
 
     return {
       contractVersion: CONTRACT_VERSION,
@@ -762,6 +730,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           project.id,
           issueKeysByTaskId.get(t.id) ?? null,
           showKeys,
+          t.assigneeId ? (assigneeNames.get(t.assigneeId) ?? null) : undefined,
         ),
       ),
     };
@@ -1436,9 +1405,13 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       cursor = { updatedAt: last.updatedAt, id: last.id };
     }
 
-    const issueKeysByTaskId = await repos.issueKeys.findByTaskIds(
-      selected.map((s) => s.task.id),
-    );
+    const [issueKeysByTaskId, assigneeNames] = await Promise.all([
+      repos.issueKeys.findByTaskIds(selected.map((s) => s.task.id)),
+      resolveAssigneeDisplayNames(
+        repos,
+        selected.map((s) => s.task),
+      ),
+    ]);
 
     return {
       ok: true,
@@ -1449,6 +1422,9 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           entry.effectiveProjectId,
           issueKeysByTaskId.get(entry.task.id) ?? null,
           devProjectIds.has(entry.effectiveProjectId),
+          entry.task.assigneeId
+            ? (assigneeNames.get(entry.task.assigneeId) ?? null)
+            : undefined,
         ),
       })),
     };
@@ -1541,7 +1517,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
 
     for (let attempt = 0; attempt < MAX_IDEMPOTENCY_RACE_RETRIES; attempt += 1) {
       try {
-        return await deps.uow.run(async (repos) => {
+        return await trackedUow.run(async (repos) => {
           let effectiveProject: ProjectRecord;
           let initialRole: ProjectRole | null;
 
@@ -1779,11 +1755,12 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
                 return fail(404, "NOT_FOUND", "error.notFound");
               }
 
-              const [liveIssueKey, liveActiveNamespace] = await Promise.all([
+              const [liveIssueKey, liveActiveNamespace, assigneeNames] = await Promise.all([
                 repos.issueKeys.findByTaskId(liveCtx.task.id),
                 repos.issueKeys.findNamespaceByProjectId(
                   liveCtx.effectiveProject.id,
                 ),
+                resolveAssigneeDisplayNames(repos, [liveCtx.task]),
               ]);
               return {
                 ok: true,
@@ -1794,6 +1771,9 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
                     liveCtx.effectiveProject.id,
                     liveIssueKey,
                     liveActiveNamespace !== null,
+                    liveCtx.task.assigneeId
+                      ? (assigneeNames.get(liveCtx.task.assigneeId) ?? null)
+                      : undefined,
                   ),
                   idempotentReplay: true,
                 },
@@ -1864,7 +1844,14 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
             creationKind: resolvedParentTaskId ? "subtask" : "create",
           });
 
-          const taskDto = toTaskDto(task, effectiveProject.id, issueKey);
+          const assigneeNames = await resolveAssigneeDisplayNames(repos, [task]);
+          const taskDto = toTaskDto(
+            task,
+            effectiveProject.id,
+            issueKey,
+            true,
+            task.assigneeId ? (assigneeNames.get(task.assigneeId) ?? null) : undefined,
+          );
           const responsePayload: TaskResponse = {
             contractVersion: CONTRACT_VERSION,
             task: taskDto,
@@ -1929,7 +1916,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         definition: RuleDefinition;
       }>
     > {
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const project = await repos.projects.findById(projectId);
         if (
           !project ||
@@ -2026,7 +2013,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       rule: string,
       id: TaskPublicId,
     ): Promise<WorkUseCaseResult<{ event: string }>> {
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         if (!(await repos.projects.lockForTaskWrite(projectId)))
           return fail(404, "NOT_FOUND", "error.notFound");
         const task = await repos.tasks.findById(id, true);
@@ -2078,7 +2065,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       projectId: ProjectId,
       revision: number,
     ) {
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const d = await repos.automation.intent(workspace, event, rule);
         if (!d || d.project !== projectId || d.revision !== revision)
           return { status: "denied" } as const;
@@ -2121,7 +2108,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       probe = false,
       canStart: () => boolean = () => true,
     ) {
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         await repos.automation.lockOperation(workspace, run);
         const d = await repos.automation.intent(workspace, event, rule);
         if (!d || d.project !== projectId || d.revision !== revision)
@@ -2235,7 +2222,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
     },
 
     async automationOptions(actor: AuditActorContext, projectId: ProjectId) {
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const project = await repos.projects.findById(projectId);
         const role = project && (await resolveActorProjectRole(repos, actor.userId, project));
         if (!project || !canReadProject(role))
@@ -2275,7 +2262,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       id: TaskPublicId,
       input: unknown,
     ) {
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         if (!(await repos.projects.lockForTaskWrite(projectId)))
           return fail(404, "NOT_FOUND", "error.notFound");
         const task = await repos.tasks.findById(id, true),
@@ -2385,7 +2372,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       taskId?: TaskPublicId,
       rule?: string,
     ) {
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const pr = await repos.projects.findById(projectId);
         const role = pr && (await resolveActorProjectRole(repos, actor.userId, pr));
         if (!pr || !canReadProject(role)) return fail(404, "NOT_FOUND", "error.notFound");
@@ -2479,7 +2466,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       run: string,
       decision: "keep" | "undo",
     ) {
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const pr = await repos.projects.findById(project);
         if (!pr || !canManageProject(await resolveActorProjectRole(repos, actor.userId, pr)))
           return fail(404, "NOT_FOUND", "error.notFound");
@@ -2532,7 +2519,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       reasonCode: string;
       detail?: string;
     }): Promise<void> {
-      await deps.uow.run(async (repos) => {
+      await trackedUow.run(async (repos) => {
         await appendOutbox(repos, {
           workspaceId: null,
           projectId: null,
@@ -2582,7 +2569,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       const description =
         typeof input.description === "string" ? input.description.trim() : "";
 
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const workspace = await repos.workspaces.findById(workspaceId);
         if (!workspace) {
           return fail(404, "NOT_FOUND", "error.notFound");
@@ -2677,7 +2664,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       actor: AuditActorContext,
       workspaceId: WorkspaceId,
     ): Promise<WorkUseCaseResult<ProjectListResponse>> {
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const wsMembership = actor.userId
           ? await repos.memberships.findByWorkspaceAndUser(workspaceId, actor.userId)
           : null;
@@ -2728,7 +2715,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         return this.listProjects(actor, options.workspaceId);
       }
 
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const summaries = actor.userId
           ? await repos.memberships.listSummariesForUser(actor.userId)
           : [];
@@ -2782,7 +2769,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       projectRef: string,
       options?: { workspaceId?: WorkspaceId },
     ): Promise<WorkUseCaseResult<ProjectResponse>> {
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const resolved = await resolveReadableProjectRefInTx<ProjectResponse>(
           repos,
           actor,
@@ -2858,7 +2845,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       taskRef: string,
       options?: { workspaceId?: WorkspaceId },
     ): Promise<WorkUseCaseResult<TaskResponse>> {
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const resolvedRef = await resolveTaskRefInTx<TaskResponse>(
           repos,
           actor,
@@ -2903,9 +2890,10 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           return fail(404, "NOT_FOUND", "error.notFound");
         }
 
-        const [issueKey, activeNamespace] = await Promise.all([
+        const [issueKey, activeNamespace, assigneeNames] = await Promise.all([
           repos.issueKeys.findByTaskId(task.id),
           repos.issueKeys.findNamespaceByProjectId(effectiveProject.id),
+          resolveAssigneeDisplayNames(repos, [task]),
         ]);
 
         return {
@@ -2917,6 +2905,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
               effectiveProject.id,
               issueKey,
               activeNamespace !== null,
+              task.assigneeId ? (assigneeNames.get(task.assigneeId) ?? null) : undefined,
             ),
           },
         };
@@ -2927,7 +2916,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       actor: AuditActorContext,
       projectId: ProjectId,
     ): Promise<WorkUseCaseResult<TaskListResponse>> {
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const project = await repos.projects.findById(projectId);
         if (!project) {
           return fail(404, "NOT_FOUND", "error.notFound");
@@ -2962,7 +2951,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       projectRef: string,
       options?: { workspaceId?: WorkspaceId },
     ): Promise<WorkUseCaseResult<TaskListResponse>> {
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const resolved = await resolveReadableProjectRefInTx<TaskListResponse>(
           repos,
           actor,
@@ -3061,7 +3050,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         attempt += 1
       ) {
         try {
-          return await deps.uow.run(async (repos) => {
+          return await trackedUow.run(async (repos) => {
             let resolvedCtx: ResolvedTaskContext;
             if (needsStatusOrProjectLock) {
               const discovered = await resolveTaskRefInTx<TaskResponse>(
@@ -3369,9 +3358,10 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           },
         });
 
-        const [issueKey, activeNamespace] = await Promise.all([
+        const [issueKey, activeNamespace, assigneeNames] = await Promise.all([
           repos.issueKeys.findByTaskId(updated.id),
           repos.issueKeys.findNamespaceByProjectId(targetProject.id),
+          resolveAssigneeDisplayNames(repos, [updated]),
         ]);
 
         return {
@@ -3383,6 +3373,9 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
               targetProject.id,
               issueKey,
               activeNamespace !== null,
+              updated.assigneeId
+                ? (assigneeNames.get(updated.assigneeId) ?? null)
+                : undefined,
             ),
           },
         };
@@ -3452,7 +3445,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           : 20;
       const limit = Math.min(Math.max(rawLimit, 1), 100);
 
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const wsMembership = actor.userId
           ? await repos.memberships.findByWorkspaceAndUser(workspaceId, actor.userId)
           : null;
@@ -3519,7 +3512,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           : 20;
       const limit = Math.min(Math.max(rawLimit, 1), 100);
 
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         if (input.projectRef !== undefined && input.projectRef.trim() !== "") {
           const resolvedProject =
             await resolveReadableProjectRefInTx<TaskSearchResponse>(
@@ -3673,7 +3666,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
 
       for (let attempt = 0; attempt < MAX_START_LOCK_RETRIES; attempt += 1) {
         try {
-          return await deps.uow.run(async (repos) => {
+          return await trackedUow.run(async (repos) => {
             const discovered = await resolveTaskRefInTx<TaskResponse>(
               repos,
               actor,
@@ -3855,11 +3848,18 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           copiedFromTaskId: sourceTask.id,
         });
 
+        const assigneeNames = await resolveAssigneeDisplayNames(repos, [task]);
         return {
           ok: true,
           data: {
             contractVersion: CONTRACT_VERSION,
-            task: toTaskDto(task, targetProject.id, issueKey),
+            task: toTaskDto(
+              task,
+              targetProject.id,
+              issueKey,
+              true,
+              task.assigneeId ? (assigneeNames.get(task.assigneeId) ?? null) : undefined,
+            ),
           },
         };
           });
@@ -3880,7 +3880,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       options?: { workspaceId?: WorkspaceId },
     ): Promise<WorkUseCaseResult<DeleteTaskResponse>> {
       if (actor.channel === "automation") return fail(403, "FORBIDDEN", "error.forbidden");
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const resolvedRef = await resolveTaskRefInTx<DeleteTaskResponse>(
           repos,
           actor,
@@ -3979,7 +3979,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       actor: AuditActorContext,
       workspaceId: WorkspaceId,
     ): Promise<WorkUseCaseResult<WorkspaceSettingsResponse>> {
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const workspace = await repos.workspaces.findById(workspaceId);
         if (!workspace) {
           return fail(404, "NOT_FOUND", "error.notFound");
@@ -4037,7 +4037,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
 
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const workspace = await repos.workspaces.findById(workspaceId);
         if (!workspace) {
           return fail(404, "NOT_FOUND", "error.notFound");
@@ -4102,7 +4102,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       actor: AuditActorContext,
       projectId: ProjectId,
     ): Promise<WorkUseCaseResult<ProjectDevSettingsResponse>> {
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const project = await repos.projects.findById(projectId);
         if (!project) {
           return fail(404, "NOT_FOUND", "error.notFound");
@@ -4167,7 +4167,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
 
-      return runWorkTx(deps.uow, async (repos) => {
+      return runWorkTx(trackedUow, async (repos) => {
         // Lock the project row FOR UPDATE on Postgres so concurrent task creation waits and never skips keys.
         const project = await repos.projects.findByIdForUpdate(projectId);
         if (!project) {
@@ -4372,7 +4372,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
 
-      return runWorkTx(deps.uow, async (repos) => {
+      return runWorkTx(trackedUow, async (repos) => {
         const project = await repos.projects.findByIdForUpdate(projectId);
         if (!project) {
           return fail(404, "NOT_FOUND", "error.notFound");
@@ -4544,7 +4544,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
 
       for (let attempt = 0; attempt < MAX_START_LOCK_RETRIES; attempt += 1) {
         try {
-          return await deps.uow.run(async (repos) => {
+          return await trackedUow.run(async (repos) => {
             const discovered = await resolveTaskRefInTx<StartTaskResponse>(
               repos,
               actor,
@@ -4715,11 +4715,17 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
             }
 
             if (!transition.changed) {
+              const assigneeNames = await resolveAssigneeDisplayNames(repos, [
+                locked.task,
+              ]);
               const taskDto = toTaskDto(
                 locked.task,
                 locked.effectiveProject.id,
                 issueKey,
                 activeNamespace !== null,
+                locked.task.assigneeId
+                  ? (assigneeNames.get(locked.task.assigneeId) ?? null)
+                  : undefined,
               );
               return {
                 ok: true,
@@ -4743,11 +4749,15 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
               return fail(404, "NOT_FOUND", "error.notFound");
             }
 
+            const assigneeNames = await resolveAssigneeDisplayNames(repos, [updated]);
             const taskDto = toTaskDto(
               updated,
               locked.effectiveProject.id,
               issueKey,
               activeNamespace !== null,
+              updated.assigneeId
+                ? (assigneeNames.get(updated.assigneeId) ?? null)
+                : undefined,
             );
 
             await appendOutbox(repos, {
@@ -4840,7 +4850,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
 
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const project = await repos.projects.findByIdForUpdate(projectId);
         if (!project) {
           return fail(404, "NOT_FOUND", "error.notFound");
@@ -4949,7 +4959,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
 
-      return deps.uow.run(async (repos) => {
+      return trackedUow.run(async (repos) => {
         const project = await repos.projects.findByIdForUpdate(projectId);
         if (!project) {
           return fail(404, "NOT_FOUND", "error.notFound");

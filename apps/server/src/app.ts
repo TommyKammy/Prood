@@ -2,6 +2,7 @@ import { Hono, type Context } from "hono";
 import {
   createHealthCheckUseCase,
   createIdentityUseCases,
+  createRealtimeUseCases,
   createWorkUseCases,
   isEmailVerificationRequiredError,
   type AuthPort,
@@ -11,6 +12,7 @@ import {
   type IdGenerator,
   type McpHttpHandler,
   type McpTokenVerifier,
+  type RealtimeHub,
   type UnitOfWork,
   type WorkUseCaseResult,
 } from "@prood/application";
@@ -33,9 +35,21 @@ import {
   isValidEntityId,
   type AuditActorContext,
   type LocaleCode,
+  type ProjectId,
   type StatusId,
   type WorkspaceId,
 } from "@prood/domain";
+
+export interface RealtimeAppOptions {
+  pollIntervalMs?: number;
+  heartbeatIntervalMs?: number;
+  retryMs?: number;
+  retentionMs?: number;
+  maxEvents?: number;
+  maxBufferedBytes?: number;
+  maxBackpressureMs?: number;
+  shutdownSignal?: AbortSignal;
+}
 
 export interface AppDeps {
   operatorConsole?: string;
@@ -47,6 +61,8 @@ export interface AppDeps {
   idGenerator?: IdGenerator;
   mcpAuth?: McpTokenVerifier;
   mcpHandler?: McpHttpHandler;
+  realtimeHub?: RealtimeHub;
+  realtime?: RealtimeAppOptions;
 }
 
 function errorBody(
@@ -118,6 +134,16 @@ export function createApp(deps: AppDeps): Hono {
           uow: deps.uow!,
           idGenerator: deps.idGenerator!,
           clock: deps.clock,
+          realtimeHub: deps.realtimeHub,
+        })
+      : null;
+    const realtimeUseCases = hasCoreDeps
+      ? createRealtimeUseCases({
+          uow: deps.uow!,
+          idGenerator: deps.idGenerator!,
+          clock: deps.clock,
+          retentionMs: deps.realtime?.retentionMs,
+          maxEvents: deps.realtime?.maxEvents,
         })
       : null;
 
@@ -989,6 +1015,469 @@ export function createApp(deps: AppDeps): Hono {
         ...(parsedWs.workspaceId ? { workspaceId: parsedWs.workspaceId } : {}),
       });
       return sendWorkResult(c, result);
+    });
+
+    app.get("/api/v1/workspaces/:workspaceId/events", async (c) => {
+      c.header("Cache-Control", "no-store");
+      const session = await requireSessionOrRecord(c);
+      if (!session) {
+        return c.json(errorBody("UNAUTHORIZED", "error.unauthorized"), 401);
+      }
+      if (!identityUseCases || !realtimeUseCases) {
+        return c.json(errorBody("INTERNAL_ERROR", "error.generic"), 500);
+      }
+
+      const workspaceId = c.req.param("workspaceId");
+      if (!isValidEntityId("wks", workspaceId)) {
+        return c.json(errorBody("FORBIDDEN", "error.forbidden"), 403);
+      }
+
+      const rawProjectId = c.req.query("projectId");
+      let projectId: ProjectId | null = null;
+      if (rawProjectId !== undefined && rawProjectId !== "") {
+        if (!isValidEntityId("prj", rawProjectId)) {
+          return c.json(errorBody("NOT_FOUND", "error.notFound"), 404);
+        }
+        projectId = rawProjectId;
+      }
+
+      const actorResult = await resolveActorOrRespond(c, session);
+      if (!actorResult.ok) {
+        return actorResult.response;
+      }
+
+      const requestedCursor =
+        c.req.header("last-event-id") ?? c.req.query("cursor") ?? null;
+      const open = await realtimeUseCases.openSubscription(
+        actorResult.actor,
+        workspaceId,
+        {
+          projectId,
+          cursor: requestedCursor,
+        },
+      );
+      if (!open.ok) {
+        return c.json(errorBody(open.code, open.messageKey), open.status);
+      }
+
+      const authHeaders = new Headers(c.req.raw.headers);
+      const pollIntervalMs = Math.max(
+        25,
+        Math.trunc(deps.realtime?.pollIntervalMs ?? 250),
+      );
+      const heartbeatIntervalMs = Math.max(
+        500,
+        Math.trunc(deps.realtime?.heartbeatIntervalMs ?? 15_000),
+      );
+      const retryMs = Math.max(250, Math.trunc(deps.realtime?.retryMs ?? 1_500));
+      const maxBufferedBytes = Math.max(
+        64,
+        Math.trunc(deps.realtime?.maxBufferedBytes ?? 65_536),
+      );
+      const maxBackpressureMs = Math.max(
+        50,
+        Math.trunc(deps.realtime?.maxBackpressureMs ?? 30_000),
+      );
+
+      const abortSignals = [c.req.raw.signal];
+      if (deps.realtime?.shutdownSignal) {
+        abortSignals.push(deps.realtime.shutdownSignal);
+      }
+      const streamSignal =
+        abortSignals.length === 1
+          ? abortSignals[0]!
+          : AbortSignal.any(abortSignals);
+
+      const encoder = new TextEncoder();
+      let currentCursor = open.parsedCursor;
+      let closed = false;
+      let pumping = false;
+      let dirty = false;
+      let pausedForBackpressure = false;
+      let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+      let pollTimer: ReturnType<typeof setTimeout> | undefined;
+      let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+      let backpressureTimer: ReturnType<typeof setTimeout> | undefined;
+      let unsubscribeHub: (() => void) | undefined;
+      let onAbort: (() => void) | undefined;
+      let schedulePollFn: (() => void) | undefined;
+      let drainPendingFn: (() => Promise<void>) | undefined;
+      let cleanupFn: (() => void) | undefined;
+
+      const isBackpressured = (): boolean =>
+        streamController !== null &&
+        streamController.desiredSize !== null &&
+        streamController.desiredSize <= 0;
+
+      const clearBackpressureTimeout = () => {
+        if (backpressureTimer !== undefined) {
+          clearTimeout(backpressureTimer);
+          backpressureTimer = undefined;
+        }
+      };
+
+      const armBackpressureTimeout = () => {
+        if (closed || streamSignal.aborted || backpressureTimer !== undefined) {
+          return;
+        }
+        backpressureTimer = setTimeout(() => {
+          backpressureTimer = undefined;
+          if (!closed && isBackpressured()) {
+            cleanupFn?.();
+          }
+        }, maxBackpressureMs);
+      };
+
+      const stream = new ReadableStream<Uint8Array>(
+        {
+          start(controller) {
+            streamController = controller;
+            const cleanup = () => {
+              if (closed) {
+                return;
+              }
+              closed = true;
+              if (pollTimer !== undefined) {
+                clearTimeout(pollTimer);
+                pollTimer = undefined;
+              }
+              if (heartbeatTimer !== undefined) {
+                clearInterval(heartbeatTimer);
+                heartbeatTimer = undefined;
+              }
+              clearBackpressureTimeout();
+              unsubscribeHub?.();
+              unsubscribeHub = undefined;
+              if (onAbort) {
+                streamSignal.removeEventListener("abort", onAbort);
+                onAbort = undefined;
+              }
+              try {
+                controller.close();
+              } catch {
+                // Stream controller may already be closed
+              }
+            };
+            cleanupFn = cleanup;
+
+            const enqueueFrame = (frame: string): boolean => {
+              if (closed || streamSignal.aborted) {
+                cleanup();
+                return false;
+              }
+              try {
+                controller.enqueue(encoder.encode(frame));
+                if (isBackpressured()) {
+                  pausedForBackpressure = true;
+                  armBackpressureTimeout();
+                }
+                return true;
+              } catch {
+                cleanup();
+                return false;
+              }
+            };
+
+            const enqueueSseEvent = (
+              eventName: string,
+              data: unknown,
+              id?: string,
+            ): boolean => {
+              const lines: string[] = [];
+              if (id !== undefined) {
+                lines.push(`id: ${id}`);
+              }
+              lines.push(`event: ${eventName}`);
+              lines.push(`data: ${JSON.stringify(data)}`);
+              return enqueueFrame(`${lines.join("\n")}\n\n`);
+            };
+
+            const emitRevokedAndClose = () => {
+              enqueueSseEvent("revoked", {
+                contractVersion: CONTRACT_VERSION,
+                type: "revoked",
+                workspaceId,
+                projectId,
+              });
+              cleanup();
+            };
+
+            const schedulePollTimer = () => {
+              if (
+                closed ||
+                streamSignal.aborted ||
+                pausedForBackpressure ||
+                isBackpressured()
+              ) {
+                return;
+              }
+              if (pollTimer !== undefined) {
+                clearTimeout(pollTimer);
+              }
+              pollTimer = setTimeout(() => {
+                pollTimer = undefined;
+                void drainPending();
+              }, pollIntervalMs);
+            };
+            schedulePollFn = schedulePollTimer;
+
+            const drainPending = async () => {
+              if (closed || streamSignal.aborted) {
+                cleanup();
+                return;
+              }
+              if (isBackpressured()) {
+                pausedForBackpressure = true;
+                dirty = true;
+                armBackpressureTimeout();
+                return;
+              }
+              if (pumping) {
+                dirty = true;
+                return;
+              }
+              pumping = true;
+              try {
+                do {
+                  dirty = false;
+                  if (closed || streamSignal.aborted) {
+                    cleanup();
+                    return;
+                  }
+                  if (isBackpressured()) {
+                    pausedForBackpressure = true;
+                    dirty = true;
+                    armBackpressureTimeout();
+                    return;
+                  }
+                  const liveSession = await auth.getSession(authHeaders);
+                  if (!liveSession) {
+                    emitRevokedAndClose();
+                    return;
+                  }
+                  const polled = await realtimeUseCases.pollSubscription(
+                    actorResult.actor,
+                    workspaceId,
+                    currentCursor,
+                    { projectId },
+                  );
+                  if (closed || streamSignal.aborted) {
+                    cleanup();
+                    return;
+                  }
+                  if (polled.status === "revoked") {
+                    emitRevokedAndClose();
+                    return;
+                  }
+                  if (polled.status === "resync") {
+                    currentCursor = polled.parsedCursor;
+                    if (
+                      !enqueueSseEvent(
+                        "resync",
+                        {
+                          contractVersion: CONTRACT_VERSION,
+                          type: "resync",
+                          workspaceId,
+                          projectId,
+                          reason: polled.reason,
+                          cursor: polled.cursor,
+                        },
+                        polled.cursor,
+                      )
+                    ) {
+                      return;
+                    }
+                    if (isBackpressured()) {
+                      pausedForBackpressure = true;
+                      armBackpressureTimeout();
+                      return;
+                    }
+                    continue;
+                  }
+
+                  let pausedMidBatch = false;
+                  for (let i = 0; i < polled.items.length; i++) {
+                    if (i > 0 && isBackpressured()) {
+                      currentCursor = polled.itemCursors[i - 1]!;
+                      pausedForBackpressure = true;
+                      dirty = true;
+                      armBackpressureTimeout();
+                      pausedMidBatch = true;
+                      break;
+                    }
+                    const item = polled.items[i]!;
+                    if (!enqueueSseEvent("change", item, item.cursor)) {
+                      return;
+                    }
+                  }
+                  if (pausedMidBatch) {
+                    return;
+                  }
+                  currentCursor = polled.nextCursor;
+                  if (polled.hasMore) {
+                    dirty = true;
+                    if (isBackpressured()) {
+                      pausedForBackpressure = true;
+                      armBackpressureTimeout();
+                      return;
+                    }
+                  }
+                } while (dirty && !closed && !streamSignal.aborted);
+              } catch {
+                cleanup();
+                return;
+              } finally {
+                pumping = false;
+                if (!closed && !streamSignal.aborted) {
+                  if (pausedForBackpressure || isBackpressured()) {
+                    pausedForBackpressure = true;
+                    armBackpressureTimeout();
+                  } else {
+                    clearBackpressureTimeout();
+                    if (dirty) {
+                      void drainPending();
+                    } else {
+                      schedulePollTimer();
+                    }
+                  }
+                }
+              }
+            };
+            drainPendingFn = drainPending;
+
+            onAbort = () => cleanup();
+            streamSignal.addEventListener("abort", onAbort, { once: true });
+            if (streamSignal.aborted) {
+              cleanup();
+              return;
+            }
+
+            if (!enqueueFrame(`retry: ${retryMs}\n\n`)) {
+              return;
+            }
+            if (open.mode === "resync") {
+              if (
+                !enqueueSseEvent(
+                  "resync",
+                  {
+                    contractVersion: CONTRACT_VERSION,
+                    type: "resync",
+                    workspaceId,
+                    projectId,
+                    reason: open.reason,
+                    cursor: open.cursor,
+                  },
+                  open.cursor,
+                )
+              ) {
+                return;
+              }
+            } else {
+              if (
+                !enqueueSseEvent(
+                  "ready",
+                  {
+                    contractVersion: CONTRACT_VERSION,
+                    type: "ready",
+                    workspaceId,
+                    projectId,
+                    cursor: open.cursor,
+                  },
+                  open.cursor,
+                )
+              ) {
+                return;
+              }
+            }
+
+            unsubscribeHub = deps.realtimeHub?.subscribe(workspaceId, () => {
+              if (isBackpressured()) {
+                pausedForBackpressure = true;
+                dirty = true;
+                armBackpressureTimeout();
+                return;
+              }
+              if (pollTimer !== undefined) {
+                clearTimeout(pollTimer);
+                pollTimer = undefined;
+              }
+              void drainPending();
+            });
+
+            heartbeatTimer = setInterval(() => {
+              if (isBackpressured()) {
+                pausedForBackpressure = true;
+                armBackpressureTimeout();
+                return;
+              }
+              enqueueFrame(": keepalive\n\n");
+            }, heartbeatIntervalMs);
+
+            if (!closed && !streamSignal.aborted) {
+              if (isBackpressured()) {
+                pausedForBackpressure = true;
+                if (open.mode === "resume") {
+                  dirty = true;
+                }
+                armBackpressureTimeout();
+              } else if (open.mode === "resume") {
+                void drainPending();
+              } else {
+                schedulePollTimer();
+              }
+            }
+          },
+
+          pull() {
+            if (closed || streamSignal.aborted) {
+              return;
+            }
+            if (!isBackpressured()) {
+              clearBackpressureTimeout();
+              if (pausedForBackpressure) {
+                pausedForBackpressure = false;
+                void drainPendingFn?.();
+              } else {
+                schedulePollFn?.();
+              }
+            }
+          },
+
+          cancel() {
+            closed = true;
+            if (pollTimer !== undefined) {
+              clearTimeout(pollTimer);
+              pollTimer = undefined;
+            }
+            if (heartbeatTimer !== undefined) {
+              clearInterval(heartbeatTimer);
+              heartbeatTimer = undefined;
+            }
+            clearBackpressureTimeout();
+            unsubscribeHub?.();
+            unsubscribeHub = undefined;
+            if (onAbort) {
+              streamSignal.removeEventListener("abort", onAbort);
+              onAbort = undefined;
+            }
+          },
+        },
+        {
+          highWaterMark: maxBufferedBytes,
+          size(chunk) {
+            return chunk.byteLength;
+          },
+        },
+      );
+
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache, no-store, no-transform",
+          "X-Accel-Buffering": "no",
+        },
+      });
     });
   }
 

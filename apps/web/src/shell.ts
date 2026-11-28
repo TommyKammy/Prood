@@ -2,6 +2,7 @@ import type {
   MeResponse,
   ProjectDevSettingsResponse,
   ProjectDto,
+  RealtimeChangeEventDto,
   TaskDto,
   WorkspaceSettingsDto,
 } from "@prood/contracts";
@@ -37,6 +38,7 @@ import {
   isSafeRedirectUrl,
   ProodLoginFormElement,
 } from "./login-form.js";
+import type { RealtimeController } from "./realtime.js";
 import type { SearchPaletteController } from "./search-dialog.js";
 import type { renderSettingsPanel } from "./settings-panel.js";
 import type { renderTaskListView } from "./task-list.js";
@@ -135,6 +137,11 @@ export class ProodShellElement extends BaseElement {
   private settingsLoadPromise: Promise<void> | null = null;
   private renderTaskListFn: typeof renderTaskListView | null = null;
   private taskListLoadPromise: Promise<void> | null = null;
+  private realtime: RealtimeController | null = null;
+  private rtMod: typeof import("./realtime.js") | null = null;
+  private realtimeLoadPromise: Promise<void> | null = null;
+  private pendingRtEvents: RealtimeChangeEventDto[] | null = null;
+  private liveNotice = "";
 
   connectedCallback(): void {
     this.listenersController?.abort();
@@ -191,6 +198,7 @@ export class ProodShellElement extends BaseElement {
   disconnectedCallback(): void {
     this.listenersController?.abort();
     this.listenersController = null;
+    this.realtime?.close();
     this.searchPalette?.destroy();
     this.searchPalette = null;
     this.shellRoot = null;
@@ -235,6 +243,56 @@ export class ProodShellElement extends BaseElement {
     this.ensureMountNodes();
     const palette = await this.ensureSearchPalette();
     palette?.open();
+  }
+
+  private syncRealtime(): void {
+    const wsId =
+      this.authState === "authenticated" && !this.isConsentRoute()
+        ? this.activeWorkspaceId
+        : null;
+    if (!wsId) {
+      this.realtime?.close();
+      return;
+    }
+    if (this.realtime) {
+      this.realtime.connect(wsId);
+      return;
+    }
+    if (!this.realtimeLoadPromise && typeof EventSource === "function") {
+      this.realtimeLoadPromise = import("./realtime.js")
+        .then((mod) => {
+          this.rtMod = mod;
+          this.realtime = mod.createShellRealtimeController({
+            getActiveWorkspaceId: () => this.activeWorkspaceId,
+            getActiveProjectId: () => this.activeProjectId,
+            getTasks: () => this.tasks,
+            setTasks: (tasks, highlightedTaskId, liveNotice) => {
+              this.tasks = tasks;
+              if (highlightedTaskId !== undefined) {
+                this.highlightedTaskId = highlightedTaskId;
+              }
+              if (liveNotice !== undefined) {
+                this.liveNotice = liveNotice;
+              }
+              this.render();
+            },
+            pushPendingEvent: (ev) => {
+              this.pendingRtEvents?.push(ev);
+            },
+            reloadWorkspace: (id) => void this.loadWorkspaceData(id, true),
+            reloadProject: (id) => void this.loadProjectData(id),
+            refreshSession: () => void this.refreshSession(),
+            formatTaskNotice: (title) =>
+              this.i18n.t("realtime.taskUpdated", { title }),
+          });
+          if (this.authState === "authenticated" && this.activeWorkspaceId) {
+            this.realtime.connect(this.activeWorkspaceId);
+          }
+        })
+        .finally(() => {
+          this.realtimeLoadPromise = null;
+        });
+    }
   }
 
   private async ensureTaskList(): Promise<void> {
@@ -336,6 +394,7 @@ export class ProodShellElement extends BaseElement {
 
   private clearWorkspaceScopedData(): void {
     this.projectDataSeq += 1;
+    this.pendingRtEvents = null;
     this.activeProjectId = null;
     this.projects = [];
     this.workspaceSettings = null;
@@ -360,6 +419,7 @@ export class ProodShellElement extends BaseElement {
 
   private resetWorkspaceState(): void {
     this.cancelPendingWorkspaceMutations();
+    this.realtime?.close();
     this.workspaceDataSeq += 1;
     this.activeWorkspaceId = null;
     this.activeView = "list";
@@ -413,6 +473,9 @@ export class ProodShellElement extends BaseElement {
       return;
     }
 
+    if (this.activeWorkspaceId) {
+      this.resetWorkspaceState();
+    }
     this.render();
   }
 
@@ -495,11 +558,18 @@ export class ProodShellElement extends BaseElement {
     }
   }
 
-  private async loadWorkspaceData(workspaceId: WorkspaceId): Promise<void> {
+  private async loadWorkspaceData(
+    workspaceId: WorkspaceId,
+    silent = false,
+  ): Promise<void> {
     const seq = ++this.workspaceDataSeq;
-    this.loadingWorkspace = true;
-    this.workspaceLoadError = "";
-    this.render();
+    const projectSeqBefore = this.projectDataSeq;
+    if (!silent) {
+      this.loadingWorkspace = true;
+      this.workspaceLoadError = "";
+      this.render();
+    }
+    this.syncRealtime();
 
     const [projRes, wsSettingsRes] = await Promise.all([
       listProjects(workspaceId),
@@ -546,6 +616,9 @@ export class ProodShellElement extends BaseElement {
     this.syncUrlState();
     this.render();
 
+    if (silent && this.projectDataSeq !== projectSeqBefore) {
+      return;
+    }
     if (this.activeProjectId) {
       await this.loadProjectData(this.activeProjectId);
     } else {
@@ -559,6 +632,7 @@ export class ProodShellElement extends BaseElement {
 
   private async loadProjectData(projectId: ProjectId): Promise<void> {
     const seq = ++this.projectDataSeq;
+    this.pendingRtEvents = [];
     this.taskLoadError = "";
     const project = this.projects.find((p) => p.id === projectId) ?? null;
     if (project && !project.statuses.some((s) => s.id === this.taskStatusDraft)) {
@@ -571,8 +645,25 @@ export class ProodShellElement extends BaseElement {
     ]);
     if (seq !== this.projectDataSeq || this.activeProjectId !== projectId) return;
 
+    const buffered = this.pendingRtEvents;
+    this.pendingRtEvents = null;
+    let shouldReload = false;
+
     if (tasksRes.ok) {
-      this.tasks = tasksRes.data.tasks;
+      if (this.rtMod && buffered && buffered.length > 0) {
+        const replayed = this.rtMod.replayRealtimeEventsOnSnapshot(
+          tasksRes.data.tasks,
+          projectId,
+          buffered,
+        );
+        this.tasks = replayed.tasks;
+        if (replayed.highlightedTaskId !== undefined) {
+          this.highlightedTaskId = replayed.highlightedTaskId;
+        }
+        shouldReload = replayed.needsReload;
+      } else {
+        this.tasks = tasksRes.data.tasks;
+      }
       this.taskLoadError = "";
     } else {
       this.tasks = [];
@@ -595,6 +686,9 @@ export class ProodShellElement extends BaseElement {
     }
     this.searchPalette?.syncLabels();
     this.render();
+    if (shouldReload) {
+      void this.loadProjectData(projectId);
+    }
   }
 
   private async selectWorkspace(workspaceId: WorkspaceId): Promise<void> {
@@ -623,6 +717,7 @@ export class ProodShellElement extends BaseElement {
     if (switchToList) this.activeView = "list";
     this.clearFeedback();
     this.syncUrlState();
+    this.syncRealtime();
     this.render();
     await this.loadProjectData(projectId);
   }
@@ -632,6 +727,7 @@ export class ProodShellElement extends BaseElement {
     this.activeView = view;
     this.clearFeedback();
     this.syncUrlState();
+    this.syncRealtime();
     this.render();
     if (view === "settings") {
       void this.ensureSettingsPanel();
@@ -951,6 +1047,7 @@ export class ProodShellElement extends BaseElement {
     const root = this.ensureMountNodes();
     if (!root) return;
 
+    const savedFocus = this.rtMod?.captureFocusState(root) ?? null;
     const { t, formatTaskCount } = this.i18n;
     const isConsent = this.isConsentRoute();
     const memberships = this.sessionProfile?.memberships ?? [];
@@ -1233,9 +1330,21 @@ export class ProodShellElement extends BaseElement {
           content,
         ),
       );
+      main.appendChild(
+        el("div", {
+          cls: "prood-sr-only",
+          attrs: {
+            "aria-live": "polite",
+            "aria-atomic": "true",
+            "data-live-region": true,
+          },
+          text: this.liveNotice,
+        }),
+      );
     }
 
     root.append(header, main);
+    this.rtMod?.restoreFocusState(root, savedFocus);
   }
 
   private renderSidebar(wsRole: WorkspaceRole | null): HTMLElement {

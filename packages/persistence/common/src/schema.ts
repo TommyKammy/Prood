@@ -202,6 +202,27 @@ export interface IdempotencyRecordTable {
   created_at: string;
 }
 
+export interface RealtimeEventTable {
+  seq: import("kysely").Generated<number | string>;
+  txid: import("kysely").Generated<string>;
+  workspace_id: string;
+  project_id: string | null;
+  event_id: string;
+  event_type: string;
+  target_type: string;
+  target_id: string | null;
+  payload_json: string;
+  occurred_at: string;
+  created_at: string;
+}
+
+export interface RealtimeRetentionStateTable {
+  id: number;
+  pruned_through_txid: string;
+  pruned_through_seq: number | string;
+  updated_at: string;
+}
+
 export interface ProodDatabase {
   automation_receipts: {
     workspace: string;
@@ -252,4 +273,6 @@ export interface ProodDatabase {
   task_issue_keys: TaskIssueKeyTable;
   outbox_events: OutboxEventTable;
   idempotency_records: IdempotencyRecordTable;
+  realtime_events: RealtimeEventTable;
+  realtime_retention_state: RealtimeRetentionStateTable;
 }

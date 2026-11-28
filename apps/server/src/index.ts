@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  createRealtimeHub,
   createSystemIdGenerator,
   createWorkUseCases,
 } from "@prood/application";
@@ -14,7 +15,7 @@ import { createPostgresDatabase } from "@prood/persistence-postgres";
 import { createSqliteDatabase } from "@prood/persistence-sqlite";
 import { createApp } from "./app.js";
 
-export { createApp, type AppDeps } from "./app.js";
+export { createApp, type AppDeps, type RealtimeAppOptions } from "./app.js";
 
 const DEV_FALLBACK_AUTH_SECRET = "prood-dev-secret-change-in-production-32";
 
@@ -212,13 +213,15 @@ export interface ShutdownServerOptions {
     closeAllConnections?: () => void;
   };
   closeMcp?: () => Promise<void>;
+  closeRealtime?: () => void;
   closeDb: () => Promise<void>;
   timeoutMs?: number;
 }
 
 /**
- * Initiates HTTP closure, terminates active MCP SSE streams so server.close()
- * can drain cleanly, enforces a bounded fallback timeout, and closes the DB.
+ * Initiates HTTP closure, terminates active MCP and realtime SSE streams so
+ * server.close() can drain cleanly, enforces a bounded fallback timeout, and
+ * closes the DB.
  */
 export async function shutdownServerResources(
   options: ShutdownServerOptions,
@@ -228,6 +231,7 @@ export async function shutdownServerResources(
     options.server.close(() => resolveClose());
   });
 
+  options.closeRealtime?.();
   if (options.closeMcp) {
     await Promise.allSettled([options.closeMcp()]);
   }
@@ -280,10 +284,13 @@ export async function startNodeServer(): Promise<void> {
 
   const clock = { now: () => new Date() };
   const idGenerator = createSystemIdGenerator();
+  const realtimeHub = createRealtimeHub();
+  const realtimeShutdown = new AbortController();
   const workUseCases = createWorkUseCases({
     uow: db.uow,
     idGenerator,
     clock,
+    realtimeHub,
   });
 
   const mcpHandler = createProodMcpServer({
@@ -292,6 +299,7 @@ export async function startNodeServer(): Promise<void> {
     uow: db.uow,
     idGenerator,
     clock,
+    realtimeHub,
     trustedOrigins: [origin],
     onAuthFailure: (info) =>
       workUseCases.recordEntryAuthFailure({
@@ -320,6 +328,10 @@ export async function startNodeServer(): Promise<void> {
     idGenerator,
     mcpAuth: auth,
     mcpHandler,
+    realtimeHub,
+    realtime: {
+      shutdownSignal: realtimeShutdown.signal,
+    },
   });
 
   const rootApp = new Hono();
@@ -342,6 +354,7 @@ export async function startNodeServer(): Promise<void> {
     await shutdownServerResources({
       server,
       closeMcp: mcpHandler.close,
+      closeRealtime: () => realtimeShutdown.abort(),
       closeDb: () => db.close(),
     });
   };

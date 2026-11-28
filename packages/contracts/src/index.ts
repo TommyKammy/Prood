@@ -208,6 +208,7 @@ export interface TaskDto {
   title: string;
   description: string;
   assigneeId: UserId | null;
+  assigneeDisplayName?: string | null;
   createdBy: UserId | null;
   dueOn: string | null;
   completedAt: string | null;
@@ -330,3 +331,61 @@ export interface OutboxEventDto {
   occurredAt: string;
   deliveryStatus: "pending" | "leased" | "delivered" | "failed";
 }
+
+export type RealtimeChangeKind =
+  | "task.created"
+  | "task.updated"
+  | "task.started"
+  | "task.moved"
+  | "task.deleted"
+  | "task.removed"
+  | "project.created"
+  | "project.dev_enabled"
+  | "project.dev_settings.updated"
+  | "project.status.updated"
+  | "project.status.deleted"
+  | "workspace.settings.updated";
+
+export interface RealtimeReadyEventDto {
+  contractVersion: typeof CONTRACT_VERSION;
+  type: "ready";
+  workspaceId: WorkspaceId;
+  projectId: ProjectId | null;
+  cursor: string;
+}
+
+export interface RealtimeChangeEventDto {
+  contractVersion: typeof CONTRACT_VERSION;
+  type: "change";
+  eventId: EventId;
+  eventType: RealtimeChangeKind;
+  workspaceId: WorkspaceId;
+  projectId: ProjectId | null;
+  fromProjectId?: ProjectId | null;
+  taskId?: TaskPublicId;
+  task?: TaskDto;
+  occurredAt: string;
+  cursor: string;
+}
+
+export interface RealtimeResyncEventDto {
+  contractVersion: typeof CONTRACT_VERSION;
+  type: "resync";
+  workspaceId: WorkspaceId;
+  projectId: ProjectId | null;
+  reason: "cursor_expired" | "cursor_invalid";
+  cursor: string;
+}
+
+export interface RealtimeRevokedEventDto {
+  contractVersion: typeof CONTRACT_VERSION;
+  type: "revoked";
+  workspaceId: WorkspaceId;
+  projectId: ProjectId | null;
+}
+
+export type RealtimeStreamEventDto =
+  | RealtimeReadyEventDto
+  | RealtimeChangeEventDto
+  | RealtimeResyncEventDto
+  | RealtimeRevokedEventDto;

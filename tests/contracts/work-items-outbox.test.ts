@@ -259,7 +259,7 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
     });
 
     const v5 = await db.migrate();
-    expect(v5).toEqual({ appliedVersions: [5, 6, 7, 8, 9], currentVersion: 9 });
+    expect(v5).toEqual({ appliedVersions: [5, 6, 7, 8, 9, 10], currentVersion: 10 });
 
     const loaded = await db.uow.run(async (repos) => ({
       ws: await repos.workspaces.findById(wksId),
@@ -1430,6 +1430,10 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
       workspace = ids.next("wks");
     const actor = { userId: owner.userId, actorType: "user", channel: "web" } as const;
     const deps = { uow: db.uow, idGenerator: ids, clock: { now: () => new Date() } };
+    const w = h.workUseCases;
+    const projectId = ids.next("prj");
+    const statusId = ids.next("sts");
+    const taskId = ids.next("tsk");
     await db.uow.run(async (r) => {
       const createdAt = new Date().toISOString();
       await r.workspaces.create({
@@ -1445,24 +1449,47 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
         role: "admin",
         createdAt,
       });
+      await r.projects.create({
+        id: projectId,
+        workspaceId: workspace,
+        kind: "general",
+        visibility: "private",
+        name: "Board",
+        description: "",
+        createdAt,
+      });
+      await r.statuses.create({
+        id: statusId,
+        workspaceId: workspace,
+        projectId,
+        name: "Todo",
+        category: "todo",
+        position: 0,
+        createdAt,
+      });
+      await r.tasks.create({
+        id: taskId,
+        workspaceId: workspace,
+        projectId,
+        parentTaskId: null,
+        statusId,
+        title: "Review",
+        description: "",
+        assigneeId: null,
+        createdBy: owner.userId,
+        dueOn: null,
+        position: 0,
+        createdAt,
+      });
     });
-    const w = h.workUseCases;
-    const projectResult = await w.createProject(actor, workspace, {
-      name: "Board",
-      kind: "general",
-      visibility: "private",
-    });
-    if (!projectResult.ok) throw Error("project");
-    const project = projectResult.data.project;
-    const made = await w.createTask(actor, project.id, { title: "Review" });
-    if (!made.ok) throw Error("task");
-    const task = made.data.task;
+    const project = { id: projectId };
+    const task = { id: taskId };
     const legacy = await w.manageAutomation(actor,project.id,"legacy",{op:"publish",revision:0,delegate:owner.userId,
       definition:{when:"manual",action:{field:"assigneeId",value:owner.userId}}});
     expect(legacy.ok).toBe(true);
     const pending=await w.manualAutomation(actor,project.id,"legacy",task.id);
     if(!pending.ok) throw Error("legacy start");
-    expect((await db.migrate()).appliedVersions).toEqual([9]);
+    expect((await db.migrate()).appliedVersions).toEqual([9, 10]);
     expect(await deliverNext(deps,workspace,()=>"legacy-run")).toBe(true);
     expect((await w.prepareAutomation(workspace,pending.data.event,"legacy","legacy-run",project.id,1)).status).toBe("prepared");
     expect((await w.executeAutomation(workspace,pending.data.event,"legacy","legacy-run",project.id,1)).status).toBe("prepared");
@@ -1780,8 +1807,8 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
     });
 
     expect(await db.migrate()).toEqual({
-      appliedVersions: [8, 9],
-      currentVersion: 9,
+      appliedVersions: [8, 9, 10],
+      currentVersion: 10,
     });
 
     const loaded = await db.uow.run(async (repos) => ({

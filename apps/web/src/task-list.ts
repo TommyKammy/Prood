@@ -182,9 +182,15 @@ export function renderTaskListView(opts: TaskListViewOptions): HTMLElement {
         t("task.col.key"),
         t("task.col.title"),
         t("task.col.status"),
+        t("task.col.assignee"),
         t("task.col.publicId"),
       ]
-    : [t("task.col.title"), t("task.col.status"), t("task.col.publicId")];
+    : [
+        t("task.col.title"),
+        t("task.col.status"),
+        t("task.col.assignee"),
+        t("task.col.publicId"),
+      ];
 
   const rows = tasks.map((task) => {
     const keyCell = showKeyColumn
@@ -221,8 +227,18 @@ export function renderTaskListView(opts: TaskListViewOptions): HTMLElement {
       keyCell,
       el("th", { attrs: { scope: "row" }, text: task.title }),
       el("td", {
-        attrs: { "data-label": t("task.col.status") },
+        attrs: {
+          "data-label": t("task.col.status"),
+          "data-task-status": task.statusId ?? "",
+        },
         text: (task.statusId && statusById.get(task.statusId)) || "—",
+      }),
+      el("td", {
+        attrs: {
+          "data-label": t("task.col.assignee"),
+          "data-task-assignee": task.assigneeId ?? "",
+        },
+        text: task.assigneeDisplayName ?? task.assigneeId ?? "—",
       }),
       el(
         "td",
