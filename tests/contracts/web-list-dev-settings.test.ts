@@ -806,11 +806,17 @@ describe(`PR 09: Web List, Dev Settings & ⌘K Search (${targetDb})`, () => {
     // 1. Finding 4725269046: duplicate prefix failure retains project and reuses it on retry
     const browser = await harness.setupBrowserSession(admin.jar);
     await waitFor(
-      () => browser.doc.querySelector("[data-toggle-new-project]") !== null,
-      "authenticated workspace ready",
+      () =>
+        browser.doc.querySelector("[data-toggle-new-project]") !== null &&
+        browser.doc.querySelector(`[data-project-id="${seedProjId}"]`) !== null,
+      "authenticated workspace and settings ready",
     );
 
     browser.doc.querySelector<HTMLButtonElement>("[data-toggle-new-project]")!.click();
+    await waitFor(
+      () => browser.doc.querySelector("[data-new-project-dev-toggle]") !== null,
+      "new project dev toggle rendered",
+    );
     const nameInput = browser.doc.querySelector<HTMLInputElement>("[data-new-project-name]")!;
     nameInput.value = "Retry Target";
     nameInput.dispatchEvent(new browser.win.Event("input") as unknown as Event);
