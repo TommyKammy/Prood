@@ -1158,5 +1158,88 @@ describe("@prood/web async race regressions", () => {
       "Confidential Payroll Secret",
     );
   });
+
+  it("disables workspace settings edits and surfaces an error when loading workspace settings fails (4725545625)", async () => {
+    const userId = generateEntityId("usr", 1_795_000_000_000, new Uint8Array(10).fill(1));
+    const wksA = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(2));
+    const projA = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(3));
+    const statusA = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(4));
+    const projectA = makeProject(wksA, projA, statusA, "Project Alpha");
+    let patchCalls = 0;
+
+    const { win, doc } = await mountMockedShell(async (path, init) => {
+      if (path === "/api/v1/me") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          user: { id: userId, email: "alice@example.com", displayName: "Alice" },
+          memberships: [
+            {
+              membershipId: makeMembershipId(150),
+              workspaceId: wksA,
+              workspaceSlug: "ws-a",
+              workspaceName: "WS Alpha",
+              role: "admin",
+            },
+          ],
+        } satisfies MeResponse);
+      }
+      if (path === `/api/v1/workspaces/${wksA}/projects`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, projects: [projectA] });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/settings` && (init?.method ?? "GET") === "GET") {
+        return jsonResponse(
+          {
+            contractVersion: CONTRACT_VERSION,
+            error: {
+              code: "INTERNAL_ERROR",
+              messageKey: "error.generic",
+              message: "Failed to load settings",
+            },
+          },
+          500,
+        );
+      }
+      if (path === `/api/v1/workspaces/${wksA}/settings` && init?.method === "PATCH") {
+        patchCalls += 1;
+        return jsonResponse({ contractVersion: CONTRACT_VERSION }, 200);
+      }
+      if (path.endsWith("/tasks")) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, tasks: [] });
+      }
+      if (path.endsWith("/dev-settings")) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          allowed: false,
+          canManage: true,
+          dev: null,
+          statuses: projectA.statuses,
+        } satisfies ProjectDevSettingsResponse);
+      }
+      throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${path}`);
+    });
+
+    await waitForCondition(
+      () => doc.querySelector('[data-nav-view="settings"]') !== null,
+      "settings nav ready",
+    );
+    doc.querySelector<HTMLButtonElement>('[data-nav-view="settings"]')!.click();
+    await waitForCondition(
+      () =>
+        doc.querySelector("[data-ws-dev-toggle]") !== null &&
+        doc.querySelector('[role="alert"]') !== null,
+      "workspace settings error alert rendered",
+    );
+
+    expect(doc.querySelector<HTMLInputElement>("[data-ws-dev-toggle]")!.disabled).toBe(true);
+    expect(doc.querySelector<HTMLButtonElement>("[data-ws-dev-save]")!.disabled).toBe(true);
+    expect(doc.querySelector('[role="alert"]')!.textContent).toContain("Something went wrong");
+
+    doc
+      .querySelector<HTMLFormElement>("[data-workspace-settings-form]")!
+      .dispatchEvent(new win.Event("submit", { cancelable: true }) as unknown as Event);
+    await flushUiTicks(4);
+
+    expect(patchCalls).toBe(0);
+  });
 });
 

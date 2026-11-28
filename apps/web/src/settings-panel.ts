@@ -34,11 +34,13 @@ export interface SettingsPanelOptions {
 export function renderSettingsPanel(opts: SettingsPanelOptions): HTMLElement {
   const { t } = opts.i18n;
   const isWsAdmin = opts.workspaceRole === "admin";
+  const canEditWs =
+    isWsAdmin && opts.workspaceSettings !== null && !opts.savingWorkspace;
 
   const wsToggle = el("input", {
     type: "checkbox",
     checked: opts.workspaceSettings?.devProjectsEnabled ?? false,
-    disabled: !isWsAdmin || opts.savingWorkspace,
+    disabled: !canEditWs,
     attrs: { "data-ws-dev-toggle": true },
   });
 
@@ -54,7 +56,7 @@ export function renderSettingsPanel(opts: SettingsPanelOptions): HTMLElement {
         on: {
           submit: (e) => {
             e.preventDefault();
-            if (isWsAdmin) opts.onSaveWorkspaceSettings(wsToggle.checked);
+            if (canEditWs) opts.onSaveWorkspaceSettings(wsToggle.checked);
           },
         },
       },
@@ -68,7 +70,7 @@ export function renderSettingsPanel(opts: SettingsPanelOptions): HTMLElement {
       el("button", {
         type: "submit",
         cls: "prood-btn-primary",
-        disabled: !isWsAdmin || opts.savingWorkspace,
+        disabled: !canEditWs,
         attrs: { "data-ws-dev-save": true },
         text: opts.savingWorkspace ? t("settings.saving") : t("action.save"),
       }),
@@ -90,12 +92,16 @@ export function renderSettingsPanel(opts: SettingsPanelOptions): HTMLElement {
   );
 
   if (!opts.project || !opts.devSettings) {
-    projSection.appendChild(
-      el("p", {
-        cls: "prood-count",
-        text: opts.project ? t("auth.loading") : t("settings.projectSelectPrompt"),
-      }),
-    );
+    if (opts.project && opts.projectError) {
+      projSection.appendChild(alertBanner(opts.projectError)!);
+    } else {
+      projSection.appendChild(
+        el("p", {
+          cls: "prood-count",
+          text: opts.project ? t("auth.loading") : t("settings.projectSelectPrompt"),
+        }),
+      );
+    }
     return el(
       "section",
       { cls: "prood-settings-stack", attrs: { "aria-label": t("nav.settings") } },

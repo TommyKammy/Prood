@@ -513,7 +513,16 @@ export class ProodShellElement extends BaseElement {
     }
 
     this.projects = projRes.data.projects;
-    this.workspaceSettings = wsSettingsRes.ok ? wsSettingsRes.data.settings : null;
+    if (wsSettingsRes.ok) {
+      this.workspaceSettings = wsSettingsRes.data.settings;
+      this.workspaceSettingsError = "";
+    } else {
+      this.workspaceSettings = null;
+      this.workspaceSettingsError = translateApiError(
+        this.i18n,
+        wsSettingsRes.messageKey,
+      );
+    }
     if (!this.projects.some((p) => p.id === this.activeProjectId)) {
       this.cancelPendingProjectMutations();
       this.activeProjectId = this.projects[0]?.id ?? null;
@@ -559,10 +568,12 @@ export class ProodShellElement extends BaseElement {
       this.activeDevSettings = devRes.data;
       this.devPrefixDraft = devRes.data.dev?.prefix ?? "";
       this.devStartStatusDraft = devRes.data.dev?.startStatusId ?? "";
+      this.projectSettingsError = "";
     } else {
       this.activeDevSettings = null;
       this.devPrefixDraft = "";
       this.devStartStatusDraft = "";
+      this.projectSettingsError = translateApiError(this.i18n, devRes.messageKey);
     }
     this.searchPalette?.syncLabels();
     this.render();
@@ -742,7 +753,7 @@ export class ProodShellElement extends BaseElement {
 
   private async handleSaveWorkspaceSettings(devProjectsEnabled: boolean): Promise<void> {
     const workspaceId = this.activeWorkspaceId;
-    if (!workspaceId || this.savingWorkspaceSettings) return;
+    if (!workspaceId || !this.workspaceSettings || this.savingWorkspaceSettings) return;
     const seq = ++this.workspaceSettingsSaveSeq;
     this.savingWorkspaceSettings = true;
     this.clearFeedback();
