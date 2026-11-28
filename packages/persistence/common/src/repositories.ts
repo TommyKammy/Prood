@@ -30,6 +30,7 @@ import type {
   TaskRepository,
   TransactionRepositories,
   UpdateIssueKeyNamespaceInput,
+  UpdateProjectStatusInput,
   UpdateTaskInput,
   UpsertProjectMembershipInput,
   UpsertWorkspaceSettingsInput,
@@ -909,6 +910,47 @@ export function createKyselyRepositories(
       );
       return rows.map(toProjectStatusRecord);
     },
+
+    async update(
+      id: StatusId,
+      input: UpdateProjectStatusInput,
+    ): Promise<ProjectStatusRecord | null> {
+      const patch: Record<string, unknown> = {
+        updated_at: input.updatedAt,
+      };
+      if (input.name !== undefined) {
+        patch.name = input.name;
+      }
+      if (input.position !== undefined) {
+        patch.position = input.position;
+      }
+      const row = await runQuery(
+        () =>
+          executor
+            .updateTable("project_statuses")
+            .set(patch)
+            .where("id", "=", id)
+            .returningAll()
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return row ? toProjectStatusRecord(row) : null;
+    },
+
+    async deleteById(id: StatusId): Promise<boolean> {
+      const row = await runQuery(
+        () =>
+          executor
+            .deleteFrom("project_statuses")
+            .where("id", "=", id)
+            .returning("id")
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return row !== undefined;
+    },
   };
 
   const tasks: TaskRepository = {
@@ -1293,6 +1335,24 @@ export function createKyselyRepositories(
           assertActive,
         );
       }
+    },
+
+    async replaceStatusInProject(
+      _projectId: ProjectId,
+      fromStatusId: StatusId,
+      toStatusId: StatusId | null,
+      updatedAt: string,
+    ): Promise<void> {
+      await runQuery(
+        () =>
+          executor
+            .updateTable("tasks")
+            .set({ status_id: toStatusId, updated_at: updatedAt })
+            .where("status_id", "=", fromStatusId)
+            .execute(),
+        mapError,
+        assertActive,
+      );
     },
 
     async deleteById(id: TaskPublicId): Promise<boolean> {

@@ -132,6 +132,9 @@ export const enMessages = {
     "This project prefix matches projects in multiple workspaces. Specify a workspace.",
   "error.idempotencyConflict":
     "This idempotency key was already used with different request parameters.",
+  "error.taskAlreadyAssigned": "This task is already assigned to another user.",
+  "error.taskCompletedReopenRequired":
+    "This task is completed. Reopen it explicitly to start.",
   "aria.mainNavigation": "Main navigation",
   "aria.taskList": "Task list",
   "aria.searchTasks": "Search tasks",

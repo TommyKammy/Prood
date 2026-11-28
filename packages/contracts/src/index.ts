@@ -279,6 +279,38 @@ export interface UpdateTaskRequest {
   completedAt?: string | null;
 }
 
+export interface StartTaskRequest {
+  reopen?: boolean;
+}
+
+export interface StartTaskResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  task: TaskDto;
+  branchName: string | null;
+  changed: boolean;
+}
+
+export interface UpdateProjectStatusRequest {
+  name?: string;
+  position?: number;
+}
+
+export interface ProjectStatusResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  status: ProjectStatusDto;
+}
+
+export interface DeleteProjectStatusRequest {
+  replacementStatusId?: StatusId | null;
+}
+
+export interface DeleteProjectStatusResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  deletedStatusId: StatusId;
+  fallbackStatusId: StatusId | null;
+  startStatusId: StatusId | null;
+}
+
 export interface OutboxEventDto {
   id: OutboxId;
   eventId: EventId;

@@ -15,6 +15,11 @@ import {
   type ProjectListResponse,
   type ProjectResponse,
   type ProjectStatusDto,
+  type ProjectStatusResponse,
+  type DeleteProjectStatusRequest,
+  type DeleteProjectStatusResponse,
+  type StartTaskRequest,
+  type StartTaskResponse,
   type TaskDto,
   type TaskListResponse,
   type TaskResponse,
@@ -22,6 +27,7 @@ import {
   type TaskSearchMatchKind,
   type TaskSearchResponse,
   type UpdateDevProjectSettingsRequest,
+  type UpdateProjectStatusRequest,
   type UpdateTaskRequest,
   type UpdateWorkspaceSettingsRequest,
   type WorkspaceSettingsDto,
@@ -43,6 +49,7 @@ import {
   normalizeIdempotencyKey,
   OUTBOX_SCHEMA_VERSION,
   parseIssueKey,
+  planTaskStartTransition,
   resolveEffectiveProjectRole,
   type AuditActorContext,
   type EventChannel,
@@ -89,6 +96,7 @@ const MAX_PARENT_HOPS = 16;
 const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 const TASK_CREATE_OPERATION = "task.create" as const;
 const MAX_IDEMPOTENCY_RACE_RETRIES = 3;
+const MAX_START_LOCK_RETRIES = 3;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -111,6 +119,12 @@ class RollbackWorkResultError<T> extends Error {
 class IdempotencyRaceRollbackError extends Error {
   constructor() {
     super("Rollback concurrent idempotent task creation to replay");
+  }
+}
+
+class StartLockOrderRetryError extends Error {
+  constructor() {
+    super("Retry task start to preserve project -> task lock order");
   }
 }
 
@@ -3592,6 +3606,542 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
             canManage: true,
             dev: toDevProjectSettingsDto(updatedNamespace, allPrefixes),
             statuses: projectStatuses.map(toStatusDto),
+          },
+        };
+      });
+    },
+
+    async startTask(
+      actor: AuditActorContext,
+      taskRef: string,
+      input: StartTaskRequest & Record<string, unknown> = {},
+      options?: { workspaceId?: WorkspaceId },
+    ): Promise<WorkUseCaseResult<StartTaskResponse>> {
+      if (!isPlainObject(input)) {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
+      if (input.reopen !== undefined && typeof input.reopen !== "boolean") {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
+      if (
+        options?.workspaceId !== undefined &&
+        !isValidEntityId("wks", options.workspaceId)
+      ) {
+        return fail(404, "NOT_FOUND", "error.notFound");
+      }
+      if (!actor.userId) {
+        return fail(403, "FORBIDDEN", "error.forbidden");
+      }
+      const actorUserId = actor.userId;
+      const reopen = input.reopen === true;
+
+      for (let attempt = 0; attempt < MAX_START_LOCK_RETRIES; attempt += 1) {
+        try {
+          return await deps.uow.run(async (repos) => {
+            const discovered = await resolveTaskRefInTx<StartTaskResponse>(
+              repos,
+              actor,
+              taskRef,
+              {
+                ...(options?.workspaceId !== undefined
+                  ? { workspaceId: options.workspaceId }
+                  : {}),
+                lockForWrite: false,
+              },
+            );
+            if (!discovered.found) {
+              if (discovered.deniedTarget) {
+                await appendOutbox(repos, {
+                  workspaceId:
+                    discovered.deniedTarget.effectiveProject.workspaceId,
+                  projectId: discovered.deniedTarget.effectiveProject.id,
+                  eventType: "task.start.denied",
+                  action: "task.start",
+                  outcome: "denied",
+                  actor,
+                  targetType: "task",
+                  targetId: discovered.deniedTarget.task.id,
+                  reasonCode: "FORBIDDEN",
+                  payload: {
+                    taskId: discovered.deniedTarget.task.id,
+                    projectId: discovered.deniedTarget.effectiveProject.id,
+                  },
+                });
+              }
+              return discovered.failure;
+            }
+            if (!canReadProject(discovered.ctx.role)) {
+              await appendOutbox(repos, {
+                workspaceId: discovered.ctx.effectiveProject.workspaceId,
+                projectId: discovered.ctx.effectiveProject.id,
+                eventType: "task.start.denied",
+                action: "task.start",
+                outcome: "denied",
+                actor,
+                targetType: "task",
+                targetId: discovered.ctx.task.id,
+                reasonCode: "FORBIDDEN",
+                payload: {
+                  taskId: discovered.ctx.task.id,
+                  projectId: discovered.ctx.effectiveProject.id,
+                },
+              });
+              return fail(404, "NOT_FOUND", "error.notFound");
+            }
+
+            // Lock the effective project BEFORE locking the task chain to maintain
+            // a global project -> task lock order matching status rename/delete.
+            await repos.projects.lockForTaskWrite(
+              discovered.ctx.effectiveProject.id,
+            );
+            const locked = await loadTaskContextInTx(
+              repos,
+              actor,
+              discovered.ctx.task.id,
+              options?.workspaceId,
+              { lockForWrite: true },
+            );
+            if (!locked) {
+              return fail(404, "NOT_FOUND", "error.notFound");
+            }
+            if (
+              locked.effectiveProject.id !== discovered.ctx.effectiveProject.id
+            ) {
+              throw new StartLockOrderRetryError();
+            }
+
+            if (!canReadProject(locked.role)) {
+              await appendOutbox(repos, {
+                workspaceId: locked.effectiveProject.workspaceId,
+                projectId: locked.effectiveProject.id,
+                eventType: "task.start.denied",
+                action: "task.start",
+                outcome: "denied",
+                actor,
+                targetType: "task",
+                targetId: locked.task.id,
+                reasonCode: "FORBIDDEN",
+                payload: {
+                  taskId: locked.task.id,
+                  projectId: locked.effectiveProject.id,
+                },
+              });
+              return fail(404, "NOT_FOUND", "error.notFound");
+            }
+            if (!canWriteProjectTasks(locked.role)) {
+              await appendOutbox(repos, {
+                workspaceId: locked.effectiveProject.workspaceId,
+                projectId: locked.effectiveProject.id,
+                eventType: "task.start.denied",
+                action: "task.start",
+                outcome: "denied",
+                actor,
+                targetType: "task",
+                targetId: locked.task.id,
+                reasonCode: "FORBIDDEN",
+                payload: {
+                  taskId: locked.task.id,
+                  projectId: locked.effectiveProject.id,
+                },
+              });
+              return fail(403, "FORBIDDEN", "error.forbidden");
+            }
+
+            const [projectStatuses, activeNamespace, issueKey] =
+              await Promise.all([
+                repos.statuses.listByProject(locked.effectiveProject.id),
+                repos.issueKeys.findNamespaceByProjectId(
+                  locked.effectiveProject.id,
+                ),
+                repos.issueKeys.findByTaskId(locked.task.id),
+              ]);
+
+            const transition = planTaskStartTransition({
+              actorUserId,
+              currentAssigneeId: locked.task.assigneeId,
+              currentStatusId: locked.task.statusId,
+              currentCompletedAt: locked.task.completedAt,
+              projectStatuses,
+              configuredStartStatusId: activeNamespace?.startStatusId ?? null,
+              reopen,
+            });
+
+            if (!transition.ok) {
+              if (transition.reason === "ALREADY_ASSIGNED") {
+                await appendOutbox(repos, {
+                  workspaceId: locked.effectiveProject.workspaceId,
+                  projectId: locked.effectiveProject.id,
+                  eventType: "task.start.denied",
+                  action: "task.start",
+                  outcome: "denied",
+                  actor,
+                  targetType: "task",
+                  targetId: locked.task.id,
+                  reasonCode: "ALREADY_ASSIGNED",
+                  payload: {
+                    taskId: locked.task.id,
+                    projectId: locked.effectiveProject.id,
+                    currentAssigneeId: locked.task.assigneeId,
+                  },
+                });
+                return fail(409, "CONFLICT", "error.taskAlreadyAssigned");
+              }
+
+              await appendOutbox(repos, {
+                workspaceId: locked.effectiveProject.workspaceId,
+                projectId: locked.effectiveProject.id,
+                eventType: "task.start.denied",
+                action: "task.start",
+                outcome: "denied",
+                actor,
+                targetType: "task",
+                targetId: locked.task.id,
+                reasonCode: "TASK_COMPLETED",
+                payload: {
+                  taskId: locked.task.id,
+                  projectId: locked.effectiveProject.id,
+                  statusId: locked.task.statusId,
+                  completedAt: locked.task.completedAt,
+                },
+              });
+              return fail(409, "CONFLICT", "error.taskCompletedReopenRequired");
+            }
+
+            if (!transition.changed) {
+              const taskDto = toTaskDto(
+                locked.task,
+                locked.effectiveProject.id,
+                issueKey,
+                activeNamespace !== null,
+              );
+              return {
+                ok: true,
+                data: {
+                  contractVersion: CONTRACT_VERSION,
+                  task: taskDto,
+                  branchName: taskDto.branchName,
+                  changed: false,
+                },
+              };
+            }
+
+            const nowIso = deps.clock.now().toISOString();
+            const updated = await repos.tasks.update(locked.task.id, {
+              assigneeId: transition.nextAssigneeId,
+              statusId: transition.nextStatusId,
+              completedAt: transition.nextCompletedAt,
+              updatedAt: nowIso,
+            });
+            if (!updated) {
+              return fail(404, "NOT_FOUND", "error.notFound");
+            }
+
+            const taskDto = toTaskDto(
+              updated,
+              locked.effectiveProject.id,
+              issueKey,
+              activeNamespace !== null,
+            );
+
+            await appendOutbox(repos, {
+              workspaceId: locked.effectiveProject.workspaceId,
+              projectId: locked.effectiveProject.id,
+              eventType: "task.started",
+              action: "task.start",
+              outcome: "succeeded",
+              actor,
+              targetType: "task",
+              targetId: updated.id,
+              reasonCode: null,
+              payload: {
+                taskId: updated.id,
+                projectId: locked.effectiveProject.id,
+                issueKey: taskDto.issueKey,
+                branchName: taskDto.branchName,
+                previousAssigneeId: locked.task.assigneeId,
+                assigneeId: updated.assigneeId,
+                previousStatusId: locked.task.statusId,
+                statusId: updated.statusId,
+                reopened: transition.reopened,
+              },
+            });
+
+            return {
+              ok: true,
+              data: {
+                contractVersion: CONTRACT_VERSION,
+                task: taskDto,
+                branchName: taskDto.branchName,
+                changed: true,
+              },
+            };
+          });
+        } catch (error) {
+          if (error instanceof StartLockOrderRetryError) {
+            continue;
+          }
+          throw error;
+        }
+      }
+
+      throw new Error("Task start lock-order retry budget exceeded");
+    },
+
+    async updateProjectStatus(
+      actor: AuditActorContext,
+      projectId: ProjectId,
+      statusId: StatusId,
+      input: UpdateProjectStatusRequest & Record<string, unknown>,
+    ): Promise<WorkUseCaseResult<ProjectStatusResponse>> {
+      if (!isPlainObject(input)) {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
+      const hasName = input.name !== undefined;
+      const hasPosition = input.position !== undefined;
+      if (!hasName && !hasPosition) {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
+      let nextName: string | undefined;
+      if (hasName) {
+        if (typeof input.name !== "string") {
+          return fail(400, "VALIDATION_ERROR", "error.validation");
+        }
+        const trimmed = input.name.trim();
+        if (!trimmed) {
+          return fail(400, "VALIDATION_ERROR", "error.validation");
+        }
+        nextName = trimmed;
+      }
+      if (
+        hasPosition &&
+        (typeof input.position !== "number" ||
+          !Number.isInteger(input.position) ||
+          input.position < 0)
+      ) {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
+
+      return deps.uow.run(async (repos) => {
+        const project = await repos.projects.findByIdForUpdate(projectId);
+        if (!project) {
+          return fail(404, "NOT_FOUND", "error.notFound");
+        }
+        const role = await resolveActorProjectRole(repos, actor.userId, project);
+        if (!canReadProject(role)) {
+          await appendOutbox(repos, {
+            workspaceId: project.workspaceId,
+            projectId: project.id,
+            eventType: "project.status.update.denied",
+            action: "project.status.update",
+            outcome: "denied",
+            actor,
+            targetType: "status",
+            targetId: statusId,
+            reasonCode: "FORBIDDEN",
+            payload: { projectId: project.id, statusId },
+          });
+          return fail(404, "NOT_FOUND", "error.notFound");
+        }
+        if (!canManageProject(role)) {
+          await appendOutbox(repos, {
+            workspaceId: project.workspaceId,
+            projectId: project.id,
+            eventType: "project.status.update.denied",
+            action: "project.status.update",
+            outcome: "denied",
+            actor,
+            targetType: "status",
+            targetId: statusId,
+            reasonCode: "FORBIDDEN",
+            payload: { projectId: project.id, statusId },
+          });
+          return fail(403, "FORBIDDEN", "error.forbidden");
+        }
+
+        const projectStatuses = await repos.statuses.listByProject(project.id);
+        const existingStatus = projectStatuses.find((s) => s.id === statusId);
+        if (!existingStatus) {
+          return fail(404, "NOT_FOUND", "error.notFound");
+        }
+        if (
+          nextName !== undefined &&
+          projectStatuses.some((s) => s.id !== statusId && s.name === nextName)
+        ) {
+          return fail(409, "CONFLICT", "error.conflict");
+        }
+
+        const nowIso = deps.clock.now().toISOString();
+        const updated = await repos.statuses.update(statusId, {
+          ...(nextName !== undefined ? { name: nextName } : {}),
+          ...(hasPosition ? { position: input.position } : {}),
+          updatedAt: nowIso,
+        });
+        if (!updated) {
+          return fail(404, "NOT_FOUND", "error.notFound");
+        }
+
+        await appendOutbox(repos, {
+          workspaceId: project.workspaceId,
+          projectId: project.id,
+          eventType: "project.status.updated",
+          action: "project.status.update",
+          outcome: "succeeded",
+          actor,
+          targetType: "status",
+          targetId: updated.id,
+          reasonCode: null,
+          payload: {
+            projectId: project.id,
+            statusId: updated.id,
+            name: updated.name,
+            category: updated.category,
+            position: updated.position,
+          },
+        });
+
+        return {
+          ok: true,
+          data: {
+            contractVersion: CONTRACT_VERSION,
+            status: toStatusDto(updated),
+          },
+        };
+      });
+    },
+
+    async deleteProjectStatus(
+      actor: AuditActorContext,
+      projectId: ProjectId,
+      statusId: StatusId,
+      input: DeleteProjectStatusRequest & Record<string, unknown> = {},
+    ): Promise<WorkUseCaseResult<DeleteProjectStatusResponse>> {
+      if (!isPlainObject(input)) {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
+      if (
+        input.replacementStatusId !== undefined &&
+        input.replacementStatusId !== null &&
+        (typeof input.replacementStatusId !== "string" ||
+          !isValidEntityId("sts", input.replacementStatusId))
+      ) {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
+
+      return deps.uow.run(async (repos) => {
+        const project = await repos.projects.findByIdForUpdate(projectId);
+        if (!project) {
+          return fail(404, "NOT_FOUND", "error.notFound");
+        }
+        const role = await resolveActorProjectRole(repos, actor.userId, project);
+        if (!canReadProject(role)) {
+          await appendOutbox(repos, {
+            workspaceId: project.workspaceId,
+            projectId: project.id,
+            eventType: "project.status.delete.denied",
+            action: "project.status.delete",
+            outcome: "denied",
+            actor,
+            targetType: "status",
+            targetId: statusId,
+            reasonCode: "FORBIDDEN",
+            payload: { projectId: project.id, statusId },
+          });
+          return fail(404, "NOT_FOUND", "error.notFound");
+        }
+        if (!canManageProject(role)) {
+          await appendOutbox(repos, {
+            workspaceId: project.workspaceId,
+            projectId: project.id,
+            eventType: "project.status.delete.denied",
+            action: "project.status.delete",
+            outcome: "denied",
+            actor,
+            targetType: "status",
+            targetId: statusId,
+            reasonCode: "FORBIDDEN",
+            payload: { projectId: project.id, statusId },
+          });
+          return fail(403, "FORBIDDEN", "error.forbidden");
+        }
+
+        const projectStatuses = await repos.statuses.listByProject(project.id);
+        const targetStatus = projectStatuses.find((s) => s.id === statusId);
+        if (!targetStatus) {
+          return fail(404, "NOT_FOUND", "error.notFound");
+        }
+
+        const remaining = projectStatuses.filter((s) => s.id !== statusId);
+        let fallbackStatusId: StatusId | null;
+        if (input.replacementStatusId !== undefined) {
+          if (
+            input.replacementStatusId !== null &&
+            !remaining.some((s) => s.id === input.replacementStatusId)
+          ) {
+            return fail(400, "VALIDATION_ERROR", "error.validation");
+          }
+          fallbackStatusId = input.replacementStatusId;
+        } else {
+          fallbackStatusId =
+            remaining.find((s) => s.category === targetStatus.category)?.id ??
+            remaining[0]?.id ??
+            null;
+        }
+
+        const nowIso = deps.clock.now().toISOString();
+        const namespace =
+          await repos.issueKeys.findNamespaceByProjectIdForUpdate(project.id);
+        let nextStartStatusId = namespace?.startStatusId ?? null;
+        if (namespace && namespace.startStatusId === statusId) {
+          const replacement =
+            input.replacementStatusId !== undefined &&
+            input.replacementStatusId !== null
+              ? (remaining.find((s) => s.id === input.replacementStatusId) ??
+                null)
+              : null;
+          nextStartStatusId =
+            replacement && replacement.category !== "done"
+              ? replacement.id
+              : (remaining.find((s) => s.category === "in_progress")?.id ??
+                null);
+          await repos.issueKeys.updateNamespace(namespace.id, {
+            startStatusId: nextStartStatusId,
+            updatedAt: nowIso,
+          });
+        }
+
+        await repos.tasks.replaceStatusInProject(
+          project.id,
+          statusId,
+          fallbackStatusId,
+          nowIso,
+        );
+        await repos.statuses.deleteById(statusId);
+
+        await appendOutbox(repos, {
+          workspaceId: project.workspaceId,
+          projectId: project.id,
+          eventType: "project.status.deleted",
+          action: "project.status.delete",
+          outcome: "succeeded",
+          actor,
+          targetType: "status",
+          targetId: statusId,
+          reasonCode: null,
+          payload: {
+            projectId: project.id,
+            deletedStatusId: statusId,
+            fallbackStatusId,
+            startStatusId: nextStartStatusId,
+          },
+        });
+
+        return {
+          ok: true,
+          data: {
+            contractVersion: CONTRACT_VERSION,
+            deletedStatusId: statusId,
+            fallbackStatusId,
+            startStatusId: nextStartStatusId,
           },
         };
       });

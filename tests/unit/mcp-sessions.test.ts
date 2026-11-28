@@ -414,7 +414,7 @@ describe("@prood/integration-fastmcp bounded session retention", () => {
     await handler.close?.();
   });
 
-  it("rejects create_task with 403 insufficient_scope when token only has prood:read and does not refresh session TTL", async () => {
+  it("rejects create_task and start_task with 403 insufficient_scope when token only has prood:read and does not refresh session TTL", async () => {
     const nowMs = { value: 1_795_000_000_000 };
     const authFailures: Array<{ path: string; reasonCode: string }> = [];
     const handler = createProodMcpServer({
@@ -428,37 +428,52 @@ describe("@prood/integration-fastmcp bounded session retention", () => {
     const sessionId = await initializeMcpSession(handler, "Bearer valid");
     nowMs.value += 4_500;
 
-    const writeRes = await handler.handleRequest(
-      new Request("http://127.0.0.1:3000/mcp", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          accept: "application/json, text/event-stream",
-          authorization: "Bearer valid",
-          "mcp-session-id": sessionId,
+    for (const toolCall of [
+      {
+        id: 40,
+        name: "create_task",
+        arguments: {
+          projectRef: "PRD",
+          title: "Blocked write",
+          idempotencyKey: "k-read-only",
         },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 40,
-          method: "tools/call",
-          params: {
-            name: "create_task",
-            arguments: {
-              projectRef: "PRD",
-              title: "Blocked write",
-              idempotencyKey: "k-read-only",
-            },
+      },
+      {
+        id: 41,
+        name: "start_task",
+        arguments: {
+          taskRef: "PRD-1",
+        },
+      },
+    ]) {
+      const writeRes = await handler.handleRequest(
+        new Request("http://127.0.0.1:3000/mcp", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json, text/event-stream",
+            authorization: "Bearer valid",
+            "mcp-session-id": sessionId,
           },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: toolCall.id,
+            method: "tools/call",
+            params: {
+              name: toolCall.name,
+              arguments: toolCall.arguments,
+            },
+          }),
         }),
-      }),
-    );
+      );
 
-    expect(writeRes.status).toBe(403);
-    expect(writeRes.headers.get("www-authenticate")).toContain("insufficient_scope");
-    expect(writeRes.headers.get("www-authenticate")).toContain("prood:write");
+      expect(writeRes.status).toBe(403);
+      expect(writeRes.headers.get("www-authenticate")).toContain("insufficient_scope");
+      expect(writeRes.headers.get("www-authenticate")).toContain("prood:write");
+    }
     expect(
-      authFailures.some((entry) => entry.reasonCode === "INSUFFICIENT_SCOPE"),
-    ).toBe(true);
+      authFailures.filter((entry) => entry.reasonCode === "INSUFFICIENT_SCOPE"),
+    ).toHaveLength(2);
 
     nowMs.value += 600;
     expect((await listToolsInSession(handler, sessionId)).status).toBe(404);

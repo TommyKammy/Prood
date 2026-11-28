@@ -287,6 +287,12 @@ export interface UpdateTaskInput {
   updatedAt: string;
 }
 
+export interface UpdateProjectStatusInput {
+  name?: string;
+  position?: number;
+  updatedAt: string;
+}
+
 export interface CreateIssueKeyNamespaceInput {
   id: NamespaceId;
   workspaceId: WorkspaceId;
@@ -396,6 +402,11 @@ export interface ProjectStatusRepository {
   create(input: CreateProjectStatusInput): Promise<ProjectStatusRecord>;
   findById(id: StatusId): Promise<ProjectStatusRecord | null>;
   listByProject(projectId: ProjectId): Promise<ProjectStatusRecord[]>;
+  update(
+    id: StatusId,
+    input: UpdateProjectStatusInput,
+  ): Promise<ProjectStatusRecord | null>;
+  deleteById(id: StatusId): Promise<boolean>;
 }
 
 export interface TaskRepository {
@@ -422,6 +433,12 @@ export interface TaskRepository {
   updateStatusForTaskIds(
     taskIds: readonly TaskPublicId[],
     statusId: StatusId | null,
+    updatedAt: string,
+  ): Promise<void>;
+  replaceStatusInProject(
+    projectId: ProjectId,
+    fromStatusId: StatusId,
+    toStatusId: StatusId | null,
     updatedAt: string,
   ): Promise<void>;
   deleteById(id: TaskPublicId): Promise<boolean>;

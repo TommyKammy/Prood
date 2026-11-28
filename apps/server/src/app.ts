@@ -20,9 +20,12 @@ import {
   type CopyTaskRequest,
   type CreateProjectRequest,
   type CreateTaskRequest,
+  type DeleteProjectStatusRequest,
   type EnableDevProjectRequest,
   type MoveTaskRequest,
+  type StartTaskRequest,
   type UpdateDevProjectSettingsRequest,
+  type UpdateProjectStatusRequest,
   type UpdateTaskRequest,
   type UpdateWorkspaceSettingsRequest,
 } from "@prood/contracts";
@@ -30,6 +33,7 @@ import {
   isValidEntityId,
   type AuditActorContext,
   type LocaleCode,
+  type StatusId,
   type WorkspaceId,
 } from "@prood/domain";
 
@@ -195,6 +199,24 @@ export function createApp(deps: AppDeps): Hono {
     ): Promise<T | null> {
       try {
         const parsed = (await c.req.json()) as unknown;
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          return null;
+        }
+        return parsed as T;
+      } catch {
+        return null;
+      }
+    }
+
+    async function parseOptionalJsonBody<T extends Record<string, unknown>>(
+      c: Context,
+    ): Promise<T | null> {
+      const raw = await c.req.text();
+      if (!raw.trim()) {
+        return {} as T;
+      }
+      try {
+        const parsed = JSON.parse(raw) as unknown;
         if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
           return null;
         }
@@ -511,6 +533,45 @@ export function createApp(deps: AppDeps): Hono {
     app.patch("/api/v1/tasks/:taskRef", (c) => handleTaskUpdate(c));
     app.post("/api/v1/tasks/:taskRef/move", (c) => handleTaskMove(c));
 
+    async function handleTaskStart(
+      c: Context,
+      explicitWorkspaceId?: WorkspaceId,
+    ): Promise<Response> {
+      c.header("Cache-Control", "no-store");
+      const session = await requireSessionOrRecord(c);
+      if (!session) {
+        return c.json(errorBody("UNAUTHORIZED", "error.unauthorized"), 401);
+      }
+      if (!identityUseCases || !workUseCases) {
+        return c.json(errorBody("INTERNAL_ERROR", "error.generic"), 500);
+      }
+      let workspaceId = explicitWorkspaceId;
+      if (workspaceId === undefined) {
+        const parsedWs = parseWorkspaceQueryParam(c);
+        if (!parsedWs.ok) {
+          return parsedWs.response;
+        }
+        workspaceId = parsedWs.workspaceId;
+      } else if (!isValidEntityId("wks", workspaceId)) {
+        return c.json(errorBody("NOT_FOUND", "error.notFound"), 404);
+      }
+      const taskRef = c.req.param("taskRef") ?? "";
+      const body = await parseOptionalJsonBody<StartTaskRequest & Record<string, unknown>>(c);
+      if (!body) {
+        return c.json(errorBody("VALIDATION_ERROR", "error.validation"), 400);
+      }
+      const actorResult = await resolveActorOrRespond(c, session);
+      if (!actorResult.ok) {
+        return actorResult.response;
+      }
+      const result = await workUseCases.startTask(actorResult.actor, taskRef, body, {
+        ...(workspaceId ? { workspaceId } : {}),
+      });
+      return sendWorkResult(c, result);
+    }
+
+    app.post("/api/v1/tasks/:taskRef/start", (c) => handleTaskStart(c));
+
     app.get("/api/v1/workspaces/:workspaceId/projects/:projectRef", async (c) => {
       c.header("Cache-Control", "no-store");
       const session = await requireSessionOrRecord(c);
@@ -580,6 +641,9 @@ export function createApp(deps: AppDeps): Hono {
     );
     app.post("/api/v1/workspaces/:workspaceId/tasks/:taskRef/move", (c) =>
       handleTaskMove(c, c.req.param("workspaceId") as WorkspaceId),
+    );
+    app.post("/api/v1/workspaces/:workspaceId/tasks/:taskRef/start", (c) =>
+      handleTaskStart(c, c.req.param("workspaceId") as WorkspaceId),
     );
 
     app.get("/api/v1/workspaces/:workspaceId/settings", async (c) => {
@@ -718,6 +782,72 @@ export function createApp(deps: AppDeps): Hono {
       const result = await workUseCases.updateDevProjectSettings(
         actorResult.actor,
         projectId,
+        body,
+      );
+      return sendWorkResult(c, result);
+    });
+
+    app.patch("/api/v1/projects/:projectId/statuses/:statusId", async (c) => {
+      c.header("Cache-Control", "no-store");
+      const session = await requireSessionOrRecord(c);
+      if (!session) {
+        return c.json(errorBody("UNAUTHORIZED", "error.unauthorized"), 401);
+      }
+      if (!identityUseCases || !workUseCases) {
+        return c.json(errorBody("INTERNAL_ERROR", "error.generic"), 500);
+      }
+      const projectId = c.req.param("projectId");
+      const statusId = c.req.param("statusId");
+      if (!isValidEntityId("prj", projectId) || !isValidEntityId("sts", statusId)) {
+        return c.json(errorBody("NOT_FOUND", "error.notFound"), 404);
+      }
+      const body = await parseJsonBody<
+        UpdateProjectStatusRequest & Record<string, unknown>
+      >(c);
+      if (!body) {
+        return c.json(errorBody("VALIDATION_ERROR", "error.validation"), 400);
+      }
+      const actorResult = await resolveActorOrRespond(c, session);
+      if (!actorResult.ok) {
+        return actorResult.response;
+      }
+      const result = await workUseCases.updateProjectStatus(
+        actorResult.actor,
+        projectId,
+        statusId as StatusId,
+        body,
+      );
+      return sendWorkResult(c, result);
+    });
+
+    app.delete("/api/v1/projects/:projectId/statuses/:statusId", async (c) => {
+      c.header("Cache-Control", "no-store");
+      const session = await requireSessionOrRecord(c);
+      if (!session) {
+        return c.json(errorBody("UNAUTHORIZED", "error.unauthorized"), 401);
+      }
+      if (!identityUseCases || !workUseCases) {
+        return c.json(errorBody("INTERNAL_ERROR", "error.generic"), 500);
+      }
+      const projectId = c.req.param("projectId");
+      const statusId = c.req.param("statusId");
+      if (!isValidEntityId("prj", projectId) || !isValidEntityId("sts", statusId)) {
+        return c.json(errorBody("NOT_FOUND", "error.notFound"), 404);
+      }
+      const body = await parseOptionalJsonBody<
+        DeleteProjectStatusRequest & Record<string, unknown>
+      >(c);
+      if (!body) {
+        return c.json(errorBody("VALIDATION_ERROR", "error.validation"), 400);
+      }
+      const actorResult = await resolveActorOrRespond(c, session);
+      if (!actorResult.ok) {
+        return actorResult.response;
+      }
+      const result = await workUseCases.deleteProjectStatus(
+        actorResult.actor,
+        projectId,
+        statusId as StatusId,
         body,
       );
       return sendWorkResult(c, result);
