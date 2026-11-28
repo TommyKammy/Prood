@@ -51,14 +51,14 @@ function showCopyFeedback(
   }
   lastAnnouncement = message;
 
-  if (tip instanceof HTMLElement) {
+  if (tip) {
     tip.textContent = "";
   }
   void button.offsetWidth;
   button.setAttribute(ok ? "data-copied" : "data-failed", "");
 
   const applyMessage = () => {
-    if (tip instanceof HTMLElement) {
+    if (tip) {
       tip.textContent = message;
     }
   };
@@ -69,9 +69,10 @@ function showCopyFeedback(
   }
 
   const timer = setTimeout(() => {
+    copyTimers.delete(button);
     button.removeAttribute("data-copied");
     button.removeAttribute("data-failed");
-    if (tip instanceof HTMLElement) {
+    if (tip) {
       tip.textContent = "";
     }
   }, 2000);
