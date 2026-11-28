@@ -28,6 +28,7 @@ import {
   type WorkspaceSettingsResponse,
 } from "@prood/contracts";
 import {
+  canonicalizeIdempotencyPayload,
   canManageProject,
   canReadProject,
   canWriteProjectTasks,
@@ -39,6 +40,7 @@ import {
   isValidProjectKind,
   isValidProjectVisibility,
   normalizeDevPrefix,
+  normalizeIdempotencyKey,
   OUTBOX_SCHEMA_VERSION,
   parseIssueKey,
   resolveEffectiveProjectRole,
@@ -85,6 +87,8 @@ export interface WorkUseCaseDeps {
 
 const MAX_PARENT_HOPS = 16;
 const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+const TASK_CREATE_OPERATION = "task.create" as const;
+const MAX_IDEMPOTENCY_RACE_RETRIES = 3;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -101,6 +105,12 @@ function fail<T>(
 class RollbackWorkResultError<T> extends Error {
   constructor(readonly result: WorkUseCaseResult<T>) {
     super("Rollback work use case transaction");
+  }
+}
+
+class IdempotencyRaceRollbackError extends Error {
+  constructor() {
+    super("Rollback concurrent idempotent task creation to replay");
   }
 }
 
@@ -494,6 +504,193 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       return null;
     }
     return project;
+  }
+
+  async function resolveReadableProjectRefInTx<T>(
+    repos: TransactionRepositories,
+    actor: AuditActorContext,
+    projectRef: string,
+    options?: { workspaceId?: WorkspaceId },
+  ): Promise<
+    | { found: true; project: ProjectRecord; role: ProjectRole }
+    | {
+        found: false;
+        failure: WorkUseCaseResult<T>;
+        deniedProject?: ProjectRecord;
+      }
+  > {
+    if (
+      options?.workspaceId !== undefined &&
+      !isValidEntityId("wks", options.workspaceId)
+    ) {
+      return { found: false, failure: fail(404, "NOT_FOUND", "error.notFound") };
+    }
+    const trimmed = typeof projectRef === "string" ? projectRef.trim() : "";
+    if (!trimmed) {
+      return { found: false, failure: fail(404, "NOT_FOUND", "error.notFound") };
+    }
+
+    if (isValidEntityId("prj", trimmed)) {
+      const project = await repos.projects.findById(trimmed);
+      if (
+        !project ||
+        (options?.workspaceId && project.workspaceId !== options.workspaceId)
+      ) {
+        return {
+          found: false,
+          failure: fail(404, "NOT_FOUND", "error.notFound"),
+        };
+      }
+      const role = await resolveActorProjectRole(repos, actor.userId, project);
+      if (!canReadProject(role) || role === null) {
+        return {
+          found: false,
+          failure: fail(404, "NOT_FOUND", "error.notFound"),
+          deniedProject: project,
+        };
+      }
+      return { found: true, project, role };
+    }
+
+    const normalizedPrefix = normalizeDevPrefix(trimmed);
+    if (!normalizedPrefix) {
+      return { found: false, failure: fail(404, "NOT_FOUND", "error.notFound") };
+    }
+
+    if (options?.workspaceId) {
+      const projectId = await repos.issueKeys.findProjectIdByWorkspacePrefix(
+        options.workspaceId,
+        normalizedPrefix,
+      );
+      if (!projectId) {
+        return {
+          found: false,
+          failure: fail(404, "NOT_FOUND", "error.notFound"),
+        };
+      }
+      const project = await repos.projects.findById(projectId);
+      if (!project || project.workspaceId !== options.workspaceId) {
+        return {
+          found: false,
+          failure: fail(404, "NOT_FOUND", "error.notFound"),
+        };
+      }
+      const role = await resolveActorProjectRole(repos, actor.userId, project);
+      if (!canReadProject(role) || role === null) {
+        return {
+          found: false,
+          failure: fail(404, "NOT_FOUND", "error.notFound"),
+          deniedProject: project,
+        };
+      }
+      return { found: true, project, role };
+    }
+
+    const summaries = actor.userId
+      ? await repos.memberships.listSummariesForUser(actor.userId)
+      : [];
+    if (summaries.length === 0) {
+      return { found: false, failure: fail(404, "NOT_FOUND", "error.notFound") };
+    }
+
+    const candidates = await repos.issueKeys.findProjectIdsByWorkspacesAndPrefix(
+      summaries.map((s) => s.workspaceId),
+      normalizedPrefix,
+    );
+    const readable: Array<{ project: ProjectRecord; role: ProjectRole }> = [];
+    const denied: ProjectRecord[] = [];
+    for (const candidate of candidates) {
+      const project = await repos.projects.findById(candidate.projectId);
+      if (!project || project.workspaceId !== candidate.workspaceId) {
+        continue;
+      }
+      const role = await resolveActorProjectRole(repos, actor.userId, project);
+      if (canReadProject(role) && role !== null) {
+        readable.push({ project, role });
+      } else {
+        denied.push(project);
+      }
+    }
+
+    if (readable.length === 1) {
+      return {
+        found: true,
+        project: readable[0]!.project,
+        role: readable[0]!.role,
+      };
+    }
+    if (readable.length > 1) {
+      return {
+        found: false,
+        failure: fail(409, "CONFLICT", "error.ambiguousProjectPrefix"),
+      };
+    }
+    return {
+      found: false,
+      failure: fail(404, "NOT_FOUND", "error.notFound"),
+      deniedProject: denied[0],
+    };
+  }
+
+  async function buildVisibleProjectDtosInTx(
+    repos: TransactionRepositories,
+    visibleProjects: ReadonlyArray<{ project: ProjectRecord; role: ProjectRole }>,
+  ): Promise<ProjectDto[]> {
+    const namespaces = await repos.issueKeys.findNamespacesByProjectIds(
+      visibleProjects.map((entry) => entry.project.id),
+    );
+    const namespaceByProjectId = new Map<ProjectId, IssueKeyNamespaceRecord>();
+    for (const ns of namespaces) {
+      if (ns.projectId) {
+        namespaceByProjectId.set(ns.projectId, ns);
+      }
+    }
+    const prefixes = await repos.issueKeys.listPrefixesByNamespaceIds(
+      namespaces.map((n) => n.id),
+    );
+    const prefixesByNamespaceId = new Map<string, IssueKeyPrefixRecord[]>();
+    for (const entry of prefixes) {
+      const list = prefixesByNamespaceId.get(entry.namespaceId) ?? [];
+      list.push(entry);
+      prefixesByNamespaceId.set(entry.namespaceId, list);
+    }
+
+    const dtos: ProjectDto[] = [];
+    for (const { project, role } of visibleProjects) {
+      const statuses = await repos.statuses.listByProject(project.id);
+      const ns = namespaceByProjectId.get(project.id) ?? null;
+      const devSettings = ns
+        ? toDevProjectSettingsDto(ns, prefixesByNamespaceId.get(ns.id) ?? [])
+        : null;
+      dtos.push(toProjectDto(project, statuses, devSettings, role));
+    }
+    return dtos;
+  }
+
+  async function buildProjectTaskListInTx(
+    repos: TransactionRepositories,
+    project: ProjectRecord,
+  ): Promise<TaskListResponse> {
+    const collectedTasks = await collectProjectTasksInTx(repos, project.id);
+    const activeNamespace = await repos.issueKeys.findNamespaceByProjectId(
+      project.id,
+    );
+    const showKeys = activeNamespace !== null;
+    const issueKeysByTaskId = showKeys
+      ? await repos.issueKeys.findByTaskIds(collectedTasks.map((t) => t.id))
+      : new Map<TaskPublicId, TaskIssueKeyView>();
+
+    return {
+      contractVersion: CONTRACT_VERSION,
+      tasks: collectedTasks.map((t) =>
+        toTaskDto(
+          t,
+          project.id,
+          issueKeysByTaskId.get(t.id) ?? null,
+          showKeys,
+        ),
+      ),
+    };
   }
 
   async function loadTaskContextInTx(
@@ -914,6 +1111,633 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
     return { task, issueKey: issueKeyView };
   }
 
+  async function searchWorkspaceInTx(
+    repos: TransactionRepositories,
+    actor: AuditActorContext,
+    workspaceId: WorkspaceId,
+    input: {
+      trimmedQuery: string;
+      projectRef?: string;
+      limit: number;
+    },
+  ): Promise<WorkUseCaseResult<TaskSearchItemDto[]>> {
+    const allProjects = await repos.projects.listByWorkspace(workspaceId);
+    const readableProjects: ProjectRecord[] = [];
+    for (const project of allProjects) {
+      const role = await resolveActorProjectRole(repos, actor.userId, project);
+      if (canReadProject(role)) {
+        readableProjects.push(project);
+      }
+    }
+    const readableIds = new Set(readableProjects.map((p) => p.id));
+
+    let allowedProjects = readableProjects;
+    if (input.projectRef !== undefined && input.projectRef.trim() !== "") {
+      const scopedProject = await resolveProjectRefInTx(
+        repos,
+        workspaceId,
+        input.projectRef,
+      );
+      if (!scopedProject || !readableIds.has(scopedProject.id)) {
+        await appendOutbox(repos, {
+          workspaceId,
+          projectId: scopedProject?.id ?? null,
+          eventType: "task.search.denied",
+          action: "task.search",
+          outcome: "denied",
+          actor,
+          targetType: "project",
+          targetId: scopedProject?.id ?? input.projectRef.trim(),
+          reasonCode: "FORBIDDEN",
+          payload: { workspaceId, projectRef: input.projectRef.trim() },
+        });
+        return fail(404, "NOT_FOUND", "error.notFound");
+      }
+      allowedProjects = [scopedProject];
+    }
+
+    const allowedProjectMap = new Map<ProjectId, ProjectRecord>(
+      allowedProjects.map((p) => [p.id, p]),
+    );
+    const allowedProjectIds = Array.from(allowedProjectMap.keys());
+    const activeNamespaces = await repos.issueKeys.findNamespacesByProjectIds(
+      allowedProjectIds,
+    );
+    const devProjectIds = new Set<ProjectId>(
+      activeNamespaces
+        .map((ns) => ns.projectId)
+        .filter((id): id is ProjectId => id !== null),
+    );
+
+    let exactEntry: {
+      task: TaskRecord;
+      effectiveProjectId: ProjectId;
+      matchKind: TaskSearchMatchKind;
+    } | null = null;
+
+    if (isValidEntityId("tsk", input.trimmedQuery)) {
+      const candidate = await repos.tasks.findById(input.trimmedQuery);
+      if (candidate && candidate.workspaceId === workspaceId) {
+        const resolved = await resolveTaskEffectiveProject(repos, candidate);
+        if (resolved && allowedProjectMap.has(resolved.project.id)) {
+          exactEntry = {
+            task: candidate,
+            effectiveProjectId: resolved.project.id,
+            matchKind: "exact_id",
+          };
+        }
+      }
+    } else {
+      const parsedKey = parseIssueKey(input.trimmedQuery);
+      if (parsedKey) {
+        const candidateId = await repos.issueKeys.findTaskIdByWorkspaceKey(
+          workspaceId,
+          parsedKey.prefix,
+          parsedKey.number,
+        );
+        if (candidateId) {
+          const candidate = await repos.tasks.findById(candidateId);
+          if (candidate && candidate.workspaceId === workspaceId) {
+            const resolved = await resolveTaskEffectiveProject(repos, candidate);
+            if (resolved && allowedProjectMap.has(resolved.project.id)) {
+              exactEntry = {
+                task: candidate,
+                effectiveProjectId: resolved.project.id,
+                matchKind: "exact_key",
+              };
+            }
+          }
+        }
+      }
+    }
+
+    const selected: Array<{
+      task: TaskRecord;
+      effectiveProjectId: ProjectId;
+      matchKind: TaskSearchMatchKind;
+    }> = [];
+    const seenTaskIds = new Set<TaskPublicId>();
+    if (exactEntry) {
+      selected.push(exactEntry);
+      seenTaskIds.add(exactEntry.task.id);
+    }
+
+    const pageSize = Math.min(Math.max(input.limit * 4, 50), 200);
+    let cursor: { updatedAt: string; id: TaskPublicId } | undefined;
+    const resolvedProjectCache = new Map<TaskPublicId, ProjectRecord | null>();
+
+    while (selected.length < input.limit) {
+      const textCandidates = await repos.tasks.searchInWorkspace({
+        workspaceId,
+        allowedProjectIds,
+        query: input.trimmedQuery,
+        limit: pageSize,
+        ...(cursor ? { before: cursor } : {}),
+      });
+      if (textCandidates.length === 0) {
+        break;
+      }
+
+      for (const candidate of textCandidates) {
+        if (selected.length >= input.limit) {
+          break;
+        }
+        if (seenTaskIds.has(candidate.id)) {
+          continue;
+        }
+        seenTaskIds.add(candidate.id);
+        let effectiveProject: ProjectRecord | null = null;
+        if (candidate.projectId) {
+          effectiveProject = allowedProjectMap.get(candidate.projectId) ?? null;
+        } else if (resolvedProjectCache.has(candidate.id)) {
+          effectiveProject = resolvedProjectCache.get(candidate.id) ?? null;
+        } else {
+          const resolved = await resolveTaskEffectiveProject(repos, candidate);
+          effectiveProject = resolved
+            ? (allowedProjectMap.get(resolved.project.id) ?? null)
+            : null;
+          resolvedProjectCache.set(candidate.id, effectiveProject);
+        }
+        if (!effectiveProject) {
+          continue;
+        }
+        selected.push({
+          task: candidate,
+          effectiveProjectId: effectiveProject.id,
+          matchKind: "text",
+        });
+      }
+
+      if (textCandidates.length < pageSize) {
+        break;
+      }
+      const last = textCandidates[textCandidates.length - 1]!;
+      cursor = { updatedAt: last.updatedAt, id: last.id };
+    }
+
+    const issueKeysByTaskId = await repos.issueKeys.findByTaskIds(
+      selected.map((s) => s.task.id),
+    );
+
+    return {
+      ok: true,
+      data: selected.map((entry) => ({
+        matchKind: entry.matchKind,
+        task: toTaskDto(
+          entry.task,
+          entry.effectiveProjectId,
+          issueKeysByTaskId.get(entry.task.id) ?? null,
+          devProjectIds.has(entry.effectiveProjectId),
+        ),
+      })),
+    };
+  }
+
+  async function createTaskInternal(
+    actor: AuditActorContext,
+    target:
+      | { kind: "projectId"; projectId: ProjectId }
+      | { kind: "projectRef"; projectRef: string; workspaceId?: WorkspaceId },
+    input: CreateTaskRequest,
+  ): Promise<WorkUseCaseResult<TaskResponse>> {
+    if (!isPlainObject(input)) {
+      return fail(400, "VALIDATION_ERROR", "error.validation");
+    }
+    const title = typeof input.title === "string" ? input.title.trim() : "";
+    if (!title) {
+      return fail(400, "VALIDATION_ERROR", "error.validation");
+    }
+    if (input.description !== undefined && typeof input.description !== "string") {
+      return fail(400, "VALIDATION_ERROR", "error.validation");
+    }
+    if (
+      input.inheritParentProject !== undefined &&
+      typeof input.inheritParentProject !== "boolean"
+    ) {
+      return fail(400, "VALIDATION_ERROR", "error.validation");
+    }
+    if (
+      input.parentTaskId !== undefined &&
+      input.parentTaskId !== null &&
+      (typeof input.parentTaskId !== "string" ||
+        !isValidEntityId("tsk", input.parentTaskId))
+    ) {
+      return fail(400, "VALIDATION_ERROR", "error.validation");
+    }
+    if (
+      input.parentTaskRef !== undefined &&
+      input.parentTaskRef !== null &&
+      (typeof input.parentTaskRef !== "string" ||
+        input.parentTaskRef.trim() === "")
+    ) {
+      return fail(400, "VALIDATION_ERROR", "error.validation");
+    }
+    if (
+      input.statusId !== undefined &&
+      input.statusId !== null &&
+      (typeof input.statusId !== "string" ||
+        !isValidEntityId("sts", input.statusId))
+    ) {
+      return fail(400, "VALIDATION_ERROR", "error.validation");
+    }
+    if (
+      input.assigneeId !== undefined &&
+      input.assigneeId !== null &&
+      (typeof input.assigneeId !== "string" ||
+        !isValidEntityId("usr", input.assigneeId))
+    ) {
+      return fail(400, "VALIDATION_ERROR", "error.validation");
+    }
+    if (
+      input.dueOn !== undefined &&
+      input.dueOn !== null &&
+      (typeof input.dueOn !== "string" || !ISO_DATE_REGEX.test(input.dueOn))
+    ) {
+      return fail(400, "VALIDATION_ERROR", "error.validation");
+    }
+
+    let idempotencyKey: string | null = null;
+    if (input.idempotencyKey !== undefined) {
+      if (typeof input.idempotencyKey !== "string") {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
+      idempotencyKey = normalizeIdempotencyKey(input.idempotencyKey);
+      if (!idempotencyKey) {
+        return fail(400, "VALIDATION_ERROR", "error.validation");
+      }
+    }
+
+    const description =
+      typeof input.description === "string" ? input.description : "";
+    const explicitParentTaskId = input.parentTaskId ?? null;
+    const explicitParentTaskRef =
+      input.parentTaskRef !== undefined && input.parentTaskRef !== null
+        ? input.parentTaskRef.trim()
+        : null;
+
+    for (let attempt = 0; attempt < MAX_IDEMPOTENCY_RACE_RETRIES; attempt += 1) {
+      try {
+        return await deps.uow.run(async (repos) => {
+          let effectiveProject: ProjectRecord;
+          let initialRole: ProjectRole | null;
+
+          if (target.kind === "projectId") {
+            const loadedProject = await repos.projects.findById(target.projectId);
+            if (!loadedProject) {
+              return fail(404, "NOT_FOUND", "error.notFound");
+            }
+            effectiveProject = loadedProject;
+            initialRole = await resolveActorProjectRole(
+              repos,
+              actor.userId,
+              effectiveProject,
+            );
+          } else {
+            const resolvedProject =
+              await resolveReadableProjectRefInTx<TaskResponse>(
+                repos,
+                actor,
+                target.projectRef,
+                {
+                  ...(target.workspaceId !== undefined
+                    ? { workspaceId: target.workspaceId }
+                    : {}),
+                },
+              );
+            if (!resolvedProject.found) {
+              if (resolvedProject.deniedProject) {
+                const existingReplay =
+                  idempotencyKey && actor.userId
+                    ? await repos.idempotency.findByKey(
+                        actor.userId,
+                        TASK_CREATE_OPERATION,
+                        idempotencyKey,
+                      )
+                    : null;
+                if (existingReplay) {
+                  await appendOutbox(repos, {
+                    workspaceId: resolvedProject.deniedProject.workspaceId,
+                    projectId: resolvedProject.deniedProject.id,
+                    eventType: "task.read.denied",
+                    action: "task.read",
+                    outcome: "denied",
+                    actor,
+                    targetType: "task",
+                    targetId: existingReplay.targetId,
+                    reasonCode: "FORBIDDEN",
+                    payload: {
+                      taskId: existingReplay.targetId,
+                      projectId: resolvedProject.deniedProject.id,
+                    },
+                  });
+                } else {
+                  await appendOutbox(repos, {
+                    workspaceId: resolvedProject.deniedProject.workspaceId,
+                    projectId: resolvedProject.deniedProject.id,
+                    eventType: "task.create.denied",
+                    action: "task.create",
+                    outcome: "denied",
+                    actor,
+                    targetType: "project",
+                    targetId: resolvedProject.deniedProject.id,
+                    reasonCode: "FORBIDDEN",
+                    payload: { title, parentTaskId: explicitParentTaskId },
+                  });
+                }
+              }
+              return resolvedProject.failure;
+            }
+            effectiveProject = resolvedProject.project;
+            initialRole = resolvedProject.role;
+          }
+
+          let resolvedParentTaskId: TaskPublicId | null = explicitParentTaskId;
+          let parentDepth = 0;
+
+          if (explicitParentTaskRef !== null) {
+            const resolvedParent = await resolveTaskRefInTx<TaskResponse>(
+              repos,
+              actor,
+              explicitParentTaskRef,
+              {
+                workspaceId: effectiveProject.workspaceId,
+                lockForWrite: true,
+              },
+            );
+            if (!resolvedParent.found) {
+              if (resolvedParent.deniedTarget) {
+                await appendOutbox(repos, {
+                  workspaceId:
+                    resolvedParent.deniedTarget.effectiveProject.workspaceId,
+                  projectId: resolvedParent.deniedTarget.effectiveProject.id,
+                  eventType: "task.read.denied",
+                  action: "task.read",
+                  outcome: "denied",
+                  actor,
+                  targetType: "task",
+                  targetId: resolvedParent.deniedTarget.task.id,
+                  reasonCode: "FORBIDDEN",
+                  payload: {
+                    taskId: resolvedParent.deniedTarget.task.id,
+                    projectId: resolvedParent.deniedTarget.effectiveProject.id,
+                  },
+                });
+              }
+              return resolvedParent.failure;
+            }
+            if (!canReadProject(resolvedParent.ctx.role)) {
+              await appendOutbox(repos, {
+                workspaceId: resolvedParent.ctx.effectiveProject.workspaceId,
+                projectId: resolvedParent.ctx.effectiveProject.id,
+                eventType: "task.read.denied",
+                action: "task.read",
+                outcome: "denied",
+                actor,
+                targetType: "task",
+                targetId: resolvedParent.ctx.task.id,
+                reasonCode: "FORBIDDEN",
+                payload: {
+                  taskId: resolvedParent.ctx.task.id,
+                  projectId: resolvedParent.ctx.effectiveProject.id,
+                },
+              });
+              return fail(404, "NOT_FOUND", "error.notFound");
+            }
+            if (
+              explicitParentTaskId !== null &&
+              resolvedParent.ctx.task.id !== explicitParentTaskId
+            ) {
+              return fail(400, "VALIDATION_ERROR", "error.validation");
+            }
+            resolvedParentTaskId = resolvedParent.ctx.task.id;
+          }
+
+          if (resolvedParentTaskId) {
+            const parentLocked = await lockTaskChainInTx(
+              repos,
+              resolvedParentTaskId,
+            );
+            if (!parentLocked) {
+              return fail(404, "NOT_FOUND", "error.notFound");
+            }
+            if (parentLocked.project.id !== effectiveProject.id) {
+              return fail(400, "VALIDATION_ERROR", "error.validation");
+            }
+            effectiveProject = parentLocked.project;
+            parentDepth = parentLocked.depth;
+            initialRole = await resolveActorProjectRole(
+              repos,
+              actor.userId,
+              effectiveProject,
+            );
+          }
+
+          const storedProjectId =
+            resolvedParentTaskId && input.inheritParentProject !== false
+              ? null
+              : effectiveProject.id;
+
+          if (storedProjectId === null && parentDepth + 1 >= MAX_PARENT_HOPS) {
+            return fail(400, "VALIDATION_ERROR", "error.validation");
+          }
+
+          const requestFingerprint =
+            idempotencyKey !== null
+              ? canonicalizeIdempotencyPayload({
+                  projectId: effectiveProject.id,
+                  parentTaskId: resolvedParentTaskId,
+                  inheritParentProject: resolvedParentTaskId
+                    ? input.inheritParentProject !== false
+                    : false,
+                  title,
+                  description,
+                  statusId:
+                    input.statusId === undefined ? "__default__" : input.statusId,
+                  assigneeId: input.assigneeId ?? null,
+                  dueOn: input.dueOn ?? null,
+                })
+              : null;
+
+          if (idempotencyKey !== null && actor.userId !== null) {
+            const existing = await repos.idempotency.findByKey(
+              actor.userId,
+              TASK_CREATE_OPERATION,
+              idempotencyKey,
+            );
+            if (existing) {
+              if (!canReadProject(initialRole)) {
+                await appendOutbox(repos, {
+                  workspaceId: effectiveProject.workspaceId,
+                  projectId: effectiveProject.id,
+                  eventType: "task.read.denied",
+                  action: "task.read",
+                  outcome: "denied",
+                  actor,
+                  targetType: "task",
+                  targetId: existing.targetId,
+                  reasonCode: "FORBIDDEN",
+                  payload: {
+                    taskId: existing.targetId,
+                    projectId: effectiveProject.id,
+                  },
+                });
+                return fail(404, "NOT_FOUND", "error.notFound");
+              }
+              if (existing.requestFingerprint !== requestFingerprint) {
+                return fail(409, "CONFLICT", "error.idempotencyConflict");
+              }
+
+              const liveCtx = await loadTaskContextInTx(
+                repos,
+                actor,
+                existing.targetId as TaskPublicId,
+              );
+              if (!liveCtx) {
+                return fail(404, "NOT_FOUND", "error.notFound");
+              }
+              if (!canReadProject(liveCtx.role)) {
+                await appendOutbox(repos, {
+                  workspaceId: liveCtx.effectiveProject.workspaceId,
+                  projectId: liveCtx.effectiveProject.id,
+                  eventType: "task.read.denied",
+                  action: "task.read",
+                  outcome: "denied",
+                  actor,
+                  targetType: "task",
+                  targetId: liveCtx.task.id,
+                  reasonCode: "FORBIDDEN",
+                  payload: {
+                    taskId: liveCtx.task.id,
+                    projectId: liveCtx.effectiveProject.id,
+                  },
+                });
+                return fail(404, "NOT_FOUND", "error.notFound");
+              }
+
+              const [liveIssueKey, liveActiveNamespace] = await Promise.all([
+                repos.issueKeys.findByTaskId(liveCtx.task.id),
+                repos.issueKeys.findNamespaceByProjectId(
+                  liveCtx.effectiveProject.id,
+                ),
+              ]);
+              return {
+                ok: true,
+                data: {
+                  contractVersion: CONTRACT_VERSION,
+                  task: toTaskDto(
+                    liveCtx.task,
+                    liveCtx.effectiveProject.id,
+                    liveIssueKey,
+                    liveActiveNamespace !== null,
+                  ),
+                  idempotentReplay: true,
+                },
+              };
+            }
+          }
+
+          if (!canWriteProjectTasks(initialRole)) {
+            await appendOutbox(repos, {
+              workspaceId: effectiveProject.workspaceId,
+              projectId: effectiveProject.id,
+              eventType: "task.create.denied",
+              action: "task.create",
+              outcome: "denied",
+              actor,
+              targetType: "project",
+              targetId: effectiveProject.id,
+              reasonCode: "FORBIDDEN",
+              payload: { title, parentTaskId: resolvedParentTaskId },
+            });
+            return fail(403, "FORBIDDEN", "error.forbidden");
+          }
+
+          let resolvedStatusId: CreateTaskRequest["statusId"] =
+            input.statusId ?? null;
+          if (resolvedStatusId) {
+            const status = await repos.statuses.findById(resolvedStatusId);
+            if (!status || status.projectId !== effectiveProject.id) {
+              return fail(400, "VALIDATION_ERROR", "error.validation");
+            }
+          } else if (input.statusId === undefined) {
+            const projectStatuses = await repos.statuses.listByProject(
+              effectiveProject.id,
+            );
+            resolvedStatusId = projectStatuses[0]?.id ?? null;
+          }
+
+          const assigneeId = input.assigneeId ?? null;
+          if (assigneeId) {
+            const assigneeMembership =
+              await repos.memberships.findByWorkspaceAndUser(
+                effectiveProject.workspaceId,
+                assigneeId,
+              );
+            if (!assigneeMembership) {
+              return fail(400, "VALIDATION_ERROR", "error.validation");
+            }
+          }
+
+          const { task, issueKey } = await insertTaskAndIssueKeyInTx(repos, {
+            actor,
+            effectiveProject,
+            storedProjectId,
+            parentTaskId: resolvedParentTaskId,
+            statusId: resolvedStatusId,
+            title,
+            description,
+            assigneeId,
+            dueOn: input.dueOn ?? null,
+            creationKind: resolvedParentTaskId ? "subtask" : "create",
+          });
+
+          const taskDto = toTaskDto(task, effectiveProject.id, issueKey);
+          const responsePayload: TaskResponse = {
+            contractVersion: CONTRACT_VERSION,
+            task: taskDto,
+          };
+
+          if (
+            idempotencyKey !== null &&
+            actor.userId !== null &&
+            requestFingerprint !== null
+          ) {
+            const inserted = await repos.idempotency.createIfAbsent({
+              actorUserId: actor.userId,
+              operation: TASK_CREATE_OPERATION,
+              idempotencyKey,
+              requestFingerprint,
+              workspaceId: effectiveProject.workspaceId,
+              projectId: effectiveProject.id,
+              targetType: "task",
+              targetId: task.id,
+              responseJson: JSON.stringify(responsePayload),
+              createdAt: task.createdAt,
+            });
+            if (!inserted) {
+              throw new IdempotencyRaceRollbackError();
+            }
+          }
+
+          return {
+            ok: true,
+            data: {
+              ...responsePayload,
+              ...(idempotencyKey !== null ? { idempotentReplay: false } : {}),
+            },
+          };
+        });
+      } catch (error) {
+        if (error instanceof IdempotencyRaceRollbackError) {
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    throw new Error("Idempotency race retry budget exceeded");
+  }
+
   return {
     async recordEntryAuthFailure(input: {
       channel: EventChannel;
@@ -1095,34 +1919,59 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           }
         }
 
-        const namespaces = await repos.issueKeys.findNamespacesByProjectIds(
-          visibleProjects.map((entry) => entry.project.id),
-        );
-        const namespaceByProjectId = new Map<ProjectId, IssueKeyNamespaceRecord>();
-        for (const ns of namespaces) {
-          if (ns.projectId) {
-            namespaceByProjectId.set(ns.projectId, ns);
+        const visible = await buildVisibleProjectDtosInTx(repos, visibleProjects);
+        return {
+          ok: true,
+          data: {
+            contractVersion: CONTRACT_VERSION,
+            projects: visible,
+          },
+        };
+      });
+    },
+
+    async listAccessibleProjects(
+      actor: AuditActorContext,
+      options?: { workspaceId?: WorkspaceId },
+    ): Promise<WorkUseCaseResult<ProjectListResponse>> {
+      if (options?.workspaceId !== undefined) {
+        if (!isValidEntityId("wks", options.workspaceId)) {
+          return fail(403, "FORBIDDEN", "error.forbidden");
+        }
+        return this.listProjects(actor, options.workspaceId);
+      }
+
+      return deps.uow.run(async (repos) => {
+        const summaries = actor.userId
+          ? await repos.memberships.listSummariesForUser(actor.userId)
+          : [];
+        const visibleProjects: Array<{ project: ProjectRecord; role: ProjectRole }> = [];
+        for (const summary of summaries) {
+          const projectsInWs = await repos.projects.listByWorkspace(
+            summary.workspaceId,
+          );
+          for (const project of projectsInWs) {
+            const role = await resolveActorProjectRole(repos, actor.userId, project);
+            if (canReadProject(role) && role !== null) {
+              visibleProjects.push({ project, role });
+            }
           }
         }
-        const prefixes = await repos.issueKeys.listPrefixesByNamespaceIds(
-          namespaces.map((n) => n.id),
-        );
-        const prefixesByNamespaceId = new Map<string, IssueKeyPrefixRecord[]>();
-        for (const entry of prefixes) {
-          const list = prefixesByNamespaceId.get(entry.namespaceId) ?? [];
-          list.push(entry);
-          prefixesByNamespaceId.set(entry.namespaceId, list);
-        }
+        visibleProjects.sort((a, b) => {
+          if (a.project.workspaceId !== b.project.workspaceId) {
+            return a.project.workspaceId < b.project.workspaceId ? -1 : 1;
+          }
+          if (a.project.createdAt !== b.project.createdAt) {
+            return a.project.createdAt < b.project.createdAt ? -1 : 1;
+          }
+          return a.project.id < b.project.id
+            ? -1
+            : a.project.id > b.project.id
+              ? 1
+              : 0;
+        });
 
-        const visible: ProjectDto[] = [];
-        for (const { project, role } of visibleProjects) {
-          const statuses = await repos.statuses.listByProject(project.id);
-          const ns = namespaceByProjectId.get(project.id) ?? null;
-          const devSettings = ns
-            ? toDevProjectSettingsDto(ns, prefixesByNamespaceId.get(ns.id) ?? [])
-            : null;
-          visible.push(toProjectDto(project, statuses, devSettings, role));
-        }
+        const visible = await buildVisibleProjectDtosInTx(repos, visibleProjects);
         return {
           ok: true,
           data: {
@@ -1138,33 +1987,40 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       workspaceId: WorkspaceId,
       projectRef: string,
     ): Promise<WorkUseCaseResult<ProjectResponse>> {
+      return this.getProjectByRef(actor, projectRef, { workspaceId });
+    },
+
+    async getProjectByRef(
+      actor: AuditActorContext,
+      projectRef: string,
+      options?: { workspaceId?: WorkspaceId },
+    ): Promise<WorkUseCaseResult<ProjectResponse>> {
       return deps.uow.run(async (repos) => {
-        const wsMembership = actor.userId
-          ? await repos.memberships.findByWorkspaceAndUser(workspaceId, actor.userId)
-          : null;
-        const project = await resolveProjectRefInTx(repos, workspaceId, projectRef);
-        if (!project) {
-          return fail(404, "NOT_FOUND", "error.notFound");
-        }
-        const role = wsMembership
-          ? await resolveActorProjectRole(repos, actor.userId, project)
-          : null;
-        if (!canReadProject(role)) {
-          await appendOutbox(repos, {
-            workspaceId: project.workspaceId,
-            projectId: project.id,
-            eventType: "project.read.denied",
-            action: "project.read",
-            outcome: "denied",
-            actor,
-            targetType: "project",
-            targetId: project.id,
-            reasonCode: "FORBIDDEN",
-            payload: { projectId: project.id },
-          });
-          return fail(404, "NOT_FOUND", "error.notFound");
+        const resolved = await resolveReadableProjectRefInTx<ProjectResponse>(
+          repos,
+          actor,
+          projectRef,
+          options,
+        );
+        if (!resolved.found) {
+          if (resolved.deniedProject) {
+            await appendOutbox(repos, {
+              workspaceId: resolved.deniedProject.workspaceId,
+              projectId: resolved.deniedProject.id,
+              eventType: "project.read.denied",
+              action: "project.read",
+              outcome: "denied",
+              actor,
+              targetType: "project",
+              targetId: resolved.deniedProject.id,
+              reasonCode: "FORBIDDEN",
+              payload: { projectId: resolved.deniedProject.id },
+            });
+          }
+          return resolved.failure;
         }
 
+        const { project, role } = resolved;
         const statuses = await repos.statuses.listByProject(project.id);
         const ns = await repos.issueKeys.findNamespaceByProjectId(project.id);
         const prefixes = ns
@@ -1178,7 +2034,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
               project,
               statuses,
               ns ? toDevProjectSettingsDto(ns, prefixes) : null,
-              role ?? undefined,
+              role,
             ),
           },
         };
@@ -1190,152 +2046,24 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       projectId: ProjectId,
       input: CreateTaskRequest,
     ): Promise<WorkUseCaseResult<TaskResponse>> {
-      if (!isPlainObject(input)) {
-        return fail(400, "VALIDATION_ERROR", "error.validation");
-      }
-      const title = typeof input.title === "string" ? input.title.trim() : "";
-      if (!title) {
-        return fail(400, "VALIDATION_ERROR", "error.validation");
-      }
-      if (input.description !== undefined && typeof input.description !== "string") {
-        return fail(400, "VALIDATION_ERROR", "error.validation");
-      }
-      if (
-        input.inheritParentProject !== undefined &&
-        typeof input.inheritParentProject !== "boolean"
-      ) {
-        return fail(400, "VALIDATION_ERROR", "error.validation");
-      }
-      if (
-        input.parentTaskId !== undefined &&
-        input.parentTaskId !== null &&
-        (typeof input.parentTaskId !== "string" ||
-          !isValidEntityId("tsk", input.parentTaskId))
-      ) {
-        return fail(400, "VALIDATION_ERROR", "error.validation");
-      }
-      if (
-        input.statusId !== undefined &&
-        input.statusId !== null &&
-        (typeof input.statusId !== "string" ||
-          !isValidEntityId("sts", input.statusId))
-      ) {
-        return fail(400, "VALIDATION_ERROR", "error.validation");
-      }
-      if (
-        input.assigneeId !== undefined &&
-        input.assigneeId !== null &&
-        (typeof input.assigneeId !== "string" ||
-          !isValidEntityId("usr", input.assigneeId))
-      ) {
-        return fail(400, "VALIDATION_ERROR", "error.validation");
-      }
-      if (
-        input.dueOn !== undefined &&
-        input.dueOn !== null &&
-        (typeof input.dueOn !== "string" || !ISO_DATE_REGEX.test(input.dueOn))
-      ) {
-        return fail(400, "VALIDATION_ERROR", "error.validation");
-      }
+      return createTaskInternal(actor, { kind: "projectId", projectId }, input);
+    },
 
-      const description =
-        typeof input.description === "string" ? input.description : "";
-
-      return deps.uow.run(async (repos) => {
-        let effectiveProject = await repos.projects.findById(projectId);
-        if (!effectiveProject) {
-          return fail(404, "NOT_FOUND", "error.notFound");
-        }
-
-        const parentTaskId = input.parentTaskId ?? null;
-        let parentDepth = 0;
-        if (parentTaskId) {
-          const parentLocked = await lockTaskChainInTx(repos, parentTaskId);
-          if (!parentLocked) {
-            return fail(404, "NOT_FOUND", "error.notFound");
-          }
-          if (parentLocked.project.id !== effectiveProject.id) {
-            return fail(400, "VALIDATION_ERROR", "error.validation");
-          }
-          effectiveProject = parentLocked.project;
-          parentDepth = parentLocked.depth;
-        }
-
-        const storedProjectId =
-          parentTaskId && input.inheritParentProject !== false
-            ? null
-            : effectiveProject.id;
-
-        if (storedProjectId === null && parentDepth + 1 >= MAX_PARENT_HOPS) {
-          return fail(400, "VALIDATION_ERROR", "error.validation");
-        }
-
-        const role = await resolveActorProjectRole(
-          repos,
-          actor.userId,
-          effectiveProject,
-        );
-        if (!canWriteProjectTasks(role)) {
-          await appendOutbox(repos, {
-            workspaceId: effectiveProject.workspaceId,
-            projectId: effectiveProject.id,
-            eventType: "task.create.denied",
-            action: "task.create",
-            outcome: "denied",
-            actor,
-            targetType: "project",
-            targetId: effectiveProject.id,
-            reasonCode: "FORBIDDEN",
-            payload: { title, parentTaskId },
-          });
-          return fail(403, "FORBIDDEN", "error.forbidden");
-        }
-
-        let resolvedStatusId: CreateTaskRequest["statusId"] = input.statusId ?? null;
-        if (resolvedStatusId) {
-          const status = await repos.statuses.findById(resolvedStatusId);
-          if (!status || status.projectId !== effectiveProject.id) {
-            return fail(400, "VALIDATION_ERROR", "error.validation");
-          }
-        } else if (input.statusId === undefined) {
-          const projectStatuses = await repos.statuses.listByProject(
-            effectiveProject.id,
-          );
-          resolvedStatusId = projectStatuses[0]?.id ?? null;
-        }
-
-        const assigneeId = input.assigneeId ?? null;
-        if (assigneeId) {
-          const assigneeMembership = await repos.memberships.findByWorkspaceAndUser(
-            effectiveProject.workspaceId,
-            assigneeId,
-          );
-          if (!assigneeMembership) {
-            return fail(400, "VALIDATION_ERROR", "error.validation");
-          }
-        }
-
-        const { task, issueKey } = await insertTaskAndIssueKeyInTx(repos, {
-          actor,
-          effectiveProject,
-          storedProjectId,
-          parentTaskId,
-          statusId: resolvedStatusId,
-          title,
-          description,
-          assigneeId,
-          dueOn: input.dueOn ?? null,
-          creationKind: parentTaskId ? "subtask" : "create",
-        });
-
-        return {
-          ok: true,
-          data: {
-            contractVersion: CONTRACT_VERSION,
-            task: toTaskDto(task, effectiveProject.id, issueKey),
-          },
-        };
-      });
+    async createTaskByProjectRef(
+      actor: AuditActorContext,
+      projectRef: string,
+      input: CreateTaskRequest,
+      options?: { workspaceId?: WorkspaceId },
+    ): Promise<WorkUseCaseResult<TaskResponse>> {
+      return createTaskInternal(
+        actor,
+        {
+          kind: "projectRef",
+          projectRef,
+          workspaceId: options?.workspaceId,
+        },
+        input,
+      );
     },
 
     async getTask(
@@ -1435,28 +2163,46 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           return fail(404, "NOT_FOUND", "error.notFound");
         }
 
-        const collectedTasks = await collectProjectTasksInTx(repos, project.id);
-        const activeNamespace = await repos.issueKeys.findNamespaceByProjectId(
-          project.id,
+        return {
+          ok: true,
+          data: await buildProjectTaskListInTx(repos, project),
+        };
+      });
+    },
+
+    async listProjectTasksByRef(
+      actor: AuditActorContext,
+      projectRef: string,
+      options?: { workspaceId?: WorkspaceId },
+    ): Promise<WorkUseCaseResult<TaskListResponse>> {
+      return deps.uow.run(async (repos) => {
+        const resolved = await resolveReadableProjectRefInTx<TaskListResponse>(
+          repos,
+          actor,
+          projectRef,
+          options,
         );
-        const showKeys = activeNamespace !== null;
-        const issueKeysByTaskId = showKeys
-          ? await repos.issueKeys.findByTaskIds(collectedTasks.map((t) => t.id))
-          : new Map<TaskPublicId, TaskIssueKeyView>();
+        if (!resolved.found) {
+          if (resolved.deniedProject) {
+            await appendOutbox(repos, {
+              workspaceId: resolved.deniedProject.workspaceId,
+              projectId: resolved.deniedProject.id,
+              eventType: "project.tasks.read.denied",
+              action: "task.list",
+              outcome: "denied",
+              actor,
+              targetType: "project",
+              targetId: resolved.deniedProject.id,
+              reasonCode: "FORBIDDEN",
+              payload: { projectId: resolved.deniedProject.id },
+            });
+          }
+          return resolved.failure;
+        }
 
         return {
           ok: true,
-          data: {
-            contractVersion: CONTRACT_VERSION,
-            tasks: collectedTasks.map((t) =>
-              toTaskDto(
-                t,
-                project.id,
-                issueKeysByTaskId.get(t.id) ?? null,
-                showKeys,
-              ),
-            ),
-          },
+          data: await buildProjectTaskListInTx(repos, resolved.project),
         };
       });
     },
@@ -1834,180 +2580,163 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           return fail(403, "FORBIDDEN", "error.forbidden");
         }
 
-        const allProjects = await repos.projects.listByWorkspace(workspaceId);
-        const readableProjects: ProjectRecord[] = [];
-        for (const project of allProjects) {
-          const role = await resolveActorProjectRole(repos, actor.userId, project);
-          if (canReadProject(role)) {
-            readableProjects.push(project);
-          }
+        const items = await searchWorkspaceInTx(repos, actor, workspaceId, {
+          trimmedQuery,
+          projectRef: input.projectRef,
+          limit,
+        });
+        if (!items.ok) {
+          return items;
         }
-        const readableIds = new Set(readableProjects.map((p) => p.id));
+        return {
+          ok: true,
+          data: {
+            contractVersion: CONTRACT_VERSION,
+            query: rawQuery,
+            items: items.data,
+          },
+        };
+      });
+    },
 
-        let allowedProjects = readableProjects;
+    async searchTasksByRef(
+      actor: AuditActorContext,
+      input: {
+        query?: string;
+        workspaceId?: WorkspaceId;
+        projectRef?: string;
+        limit?: number;
+      },
+    ): Promise<WorkUseCaseResult<TaskSearchResponse>> {
+      if (input.workspaceId !== undefined) {
+        if (!isValidEntityId("wks", input.workspaceId)) {
+          return fail(404, "NOT_FOUND", "error.notFound");
+        }
+        return this.searchTasks(actor, input.workspaceId, {
+          query: input.query,
+          projectRef: input.projectRef,
+          limit: input.limit,
+        });
+      }
+
+      const rawQuery = typeof input.query === "string" ? input.query : "";
+      const trimmedQuery = rawQuery.trim();
+      const rawLimit =
+        typeof input.limit === "number" && Number.isFinite(input.limit)
+          ? Math.trunc(input.limit)
+          : 20;
+      const limit = Math.min(Math.max(rawLimit, 1), 100);
+
+      return deps.uow.run(async (repos) => {
         if (input.projectRef !== undefined && input.projectRef.trim() !== "") {
-          const scopedProject = await resolveProjectRefInTx(
-            repos,
-            workspaceId,
-            input.projectRef,
-          );
-          if (!scopedProject || !readableIds.has(scopedProject.id)) {
-            await appendOutbox(repos, {
-              workspaceId,
-              projectId: scopedProject?.id ?? null,
-              eventType: "task.search.denied",
-              action: "task.search",
-              outcome: "denied",
+          const resolvedProject =
+            await resolveReadableProjectRefInTx<TaskSearchResponse>(
+              repos,
               actor,
-              targetType: "project",
-              targetId: scopedProject?.id ?? input.projectRef.trim(),
-              reasonCode: "FORBIDDEN",
-              payload: { workspaceId, projectRef: input.projectRef.trim() },
-            });
-            return fail(404, "NOT_FOUND", "error.notFound");
-          }
-          allowedProjects = [scopedProject];
-        }
-
-        const allowedProjectMap = new Map<ProjectId, ProjectRecord>(
-          allowedProjects.map((p) => [p.id, p]),
-        );
-        const allowedProjectIds = Array.from(allowedProjectMap.keys());
-        const activeNamespaces = await repos.issueKeys.findNamespacesByProjectIds(
-          allowedProjectIds,
-        );
-        const devProjectIds = new Set<ProjectId>(
-          activeNamespaces
-            .map((ns) => ns.projectId)
-            .filter((id): id is ProjectId => id !== null),
-        );
-
-        let exactEntry: {
-          task: TaskRecord;
-          effectiveProjectId: ProjectId;
-          matchKind: TaskSearchMatchKind;
-        } | null = null;
-
-        if (isValidEntityId("tsk", trimmedQuery)) {
-          const candidate = await repos.tasks.findById(trimmedQuery);
-          if (candidate && candidate.workspaceId === workspaceId) {
-            const resolved = await resolveTaskEffectiveProject(repos, candidate);
-            if (resolved && allowedProjectMap.has(resolved.project.id)) {
-              exactEntry = {
-                task: candidate,
-                effectiveProjectId: resolved.project.id,
-                matchKind: "exact_id",
-              };
-            }
-          }
-        } else {
-          const parsedKey = parseIssueKey(trimmedQuery);
-          if (parsedKey) {
-            const candidateId = await repos.issueKeys.findTaskIdByWorkspaceKey(
-              workspaceId,
-              parsedKey.prefix,
-              parsedKey.number,
+              input.projectRef,
             );
-            if (candidateId) {
-              const candidate = await repos.tasks.findById(candidateId);
-              if (candidate && candidate.workspaceId === workspaceId) {
-                const resolved = await resolveTaskEffectiveProject(repos, candidate);
-                if (resolved && allowedProjectMap.has(resolved.project.id)) {
-                  exactEntry = {
-                    task: candidate,
-                    effectiveProjectId: resolved.project.id,
-                    matchKind: "exact_key",
-                  };
-                }
-              }
+          if (!resolvedProject.found) {
+            if (resolvedProject.deniedProject) {
+              await appendOutbox(repos, {
+                workspaceId: resolvedProject.deniedProject.workspaceId,
+                projectId: resolvedProject.deniedProject.id,
+                eventType: "task.search.denied",
+                action: "task.search",
+                outcome: "denied",
+                actor,
+                targetType: "project",
+                targetId: resolvedProject.deniedProject.id,
+                reasonCode: "FORBIDDEN",
+                payload: {
+                  workspaceId: resolvedProject.deniedProject.workspaceId,
+                  projectRef: input.projectRef.trim(),
+                },
+              });
             }
+            return resolvedProject.failure;
+          }
+
+          const items = await searchWorkspaceInTx(
+            repos,
+            actor,
+            resolvedProject.project.workspaceId,
+            {
+              trimmedQuery,
+              projectRef: resolvedProject.project.id,
+              limit,
+            },
+          );
+          if (!items.ok) {
+            return items as WorkUseCaseResult<TaskSearchResponse>;
+          }
+          return {
+            ok: true,
+            data: {
+              contractVersion: CONTRACT_VERSION,
+              query: rawQuery,
+              items: items.data,
+            },
+          };
+        }
+
+        const summaries = actor.userId
+          ? await repos.memberships.listSummariesForUser(actor.userId)
+          : [];
+        if (summaries.length === 0) {
+          return {
+            ok: true,
+            data: {
+              contractVersion: CONTRACT_VERSION,
+              query: rawQuery,
+              items: [],
+            },
+          };
+        }
+
+        const collected: TaskSearchItemDto[] = [];
+        for (const summary of summaries) {
+          const res = await searchWorkspaceInTx(
+            repos,
+            actor,
+            summary.workspaceId,
+            { trimmedQuery, limit },
+          );
+          if (res.ok) {
+            collected.push(...res.data);
           }
         }
 
-        const selected: Array<{
-          task: TaskRecord;
-          effectiveProjectId: ProjectId;
-          matchKind: TaskSearchMatchKind;
-        }> = [];
-        const seenTaskIds = new Set<TaskPublicId>();
-        if (exactEntry) {
-          selected.push(exactEntry);
-          seenTaskIds.add(exactEntry.task.id);
+        const exactPriority = (kind: TaskSearchMatchKind): number =>
+          kind === "exact_id" ? 0 : kind === "exact_key" ? 1 : 2;
+        const deduped = new Map<TaskPublicId, TaskSearchItemDto>();
+        for (const item of collected) {
+          const prev = deduped.get(item.task.id);
+          if (
+            !prev ||
+            exactPriority(item.matchKind) < exactPriority(prev.matchKind)
+          ) {
+            deduped.set(item.task.id, item);
+          }
         }
 
-        const pageSize = Math.min(Math.max(limit * 4, 50), 200);
-        let cursor: { updatedAt: string; id: TaskPublicId } | undefined;
-        const resolvedProjectCache = new Map<TaskPublicId, ProjectRecord | null>();
-
-        while (selected.length < limit) {
-          const textCandidates = await repos.tasks.searchInWorkspace({
-            workspaceId,
-            allowedProjectIds,
-            query: trimmedQuery,
-            limit: pageSize,
-            ...(cursor ? { before: cursor } : {}),
-          });
-          if (textCandidates.length === 0) {
-            break;
+        const sorted = Array.from(deduped.values()).sort((a, b) => {
+          const pa = exactPriority(a.matchKind);
+          const pb = exactPriority(b.matchKind);
+          if (pa !== pb) {
+            return pa - pb;
           }
-
-          for (const candidate of textCandidates) {
-            if (selected.length >= limit) {
-              break;
-            }
-            if (seenTaskIds.has(candidate.id)) {
-              continue;
-            }
-            seenTaskIds.add(candidate.id);
-            let effectiveProject: ProjectRecord | null = null;
-            if (candidate.projectId) {
-              effectiveProject = allowedProjectMap.get(candidate.projectId) ?? null;
-            } else if (resolvedProjectCache.has(candidate.id)) {
-              effectiveProject = resolvedProjectCache.get(candidate.id) ?? null;
-            } else {
-              const resolved = await resolveTaskEffectiveProject(repos, candidate);
-              effectiveProject = resolved
-                ? (allowedProjectMap.get(resolved.project.id) ?? null)
-                : null;
-              resolvedProjectCache.set(candidate.id, effectiveProject);
-            }
-            if (!effectiveProject) {
-              continue;
-            }
-            selected.push({
-              task: candidate,
-              effectiveProjectId: effectiveProject.id,
-              matchKind: "text",
-            });
+          if (a.task.updatedAt !== b.task.updatedAt) {
+            return a.task.updatedAt > b.task.updatedAt ? -1 : 1;
           }
-
-          if (textCandidates.length < pageSize) {
-            break;
-          }
-          const last = textCandidates[textCandidates.length - 1]!;
-          cursor = { updatedAt: last.updatedAt, id: last.id };
-        }
-
-        const issueKeysByTaskId = await repos.issueKeys.findByTaskIds(
-          selected.map((s) => s.task.id),
-        );
-
-        const items: TaskSearchItemDto[] = selected.map((entry) => ({
-          matchKind: entry.matchKind,
-          task: toTaskDto(
-            entry.task,
-            entry.effectiveProjectId,
-            issueKeysByTaskId.get(entry.task.id) ?? null,
-            devProjectIds.has(entry.effectiveProjectId),
-          ),
-        }));
+          return a.task.id > b.task.id ? -1 : a.task.id < b.task.id ? 1 : 0;
+        });
 
         return {
           ok: true,
           data: {
             contractVersion: CONTRACT_VERSION,
             query: rawQuery,
-            items,
+            items: sorted.slice(0, limit),
           },
         };
       });

@@ -128,6 +128,10 @@ export const enMessages = {
     "This prefix is already reserved in this workspace.",
   "error.ambiguousIssueKey":
     "This issue key matches tasks in multiple workspaces. Specify a workspace.",
+  "error.ambiguousProjectPrefix":
+    "This project prefix matches projects in multiple workspaces. Specify a workspace.",
+  "error.idempotencyConflict":
+    "This idempotency key was already used with different request parameters.",
   "aria.mainNavigation": "Main navigation",
   "aria.taskList": "Task list",
   "aria.searchTasks": "Search tasks",

@@ -163,6 +163,32 @@ export interface OutboxEventRecord {
   createdAt: string;
 }
 
+export interface IdempotencyRecord {
+  actorUserId: UserId;
+  operation: string;
+  idempotencyKey: string;
+  requestFingerprint: string;
+  workspaceId: WorkspaceId | null;
+  projectId: ProjectId | null;
+  targetType: string;
+  targetId: string;
+  responseJson: string;
+  createdAt: string;
+}
+
+export interface CreateIdempotencyRecordInput {
+  actorUserId: UserId;
+  operation: string;
+  idempotencyKey: string;
+  requestFingerprint: string;
+  workspaceId: WorkspaceId | null;
+  projectId: ProjectId | null;
+  targetType: string;
+  targetId: string;
+  responseJson: string;
+  createdAt: string;
+}
+
 export interface CreateWorkspaceInput {
   id: WorkspaceId;
   slug: string;
@@ -432,6 +458,10 @@ export interface IssueKeyRepository {
     workspaceId: WorkspaceId,
     prefix: string,
   ): Promise<ProjectId | null>;
+  findProjectIdsByWorkspacesAndPrefix(
+    workspaceIds: readonly WorkspaceId[],
+    prefix: string,
+  ): Promise<Array<{ workspaceId: WorkspaceId; projectId: ProjectId }>>;
   findTaskIdByWorkspaceKey(
     workspaceId: WorkspaceId,
     prefix: string,
@@ -460,6 +490,17 @@ export interface OutboxRepository {
   listAll(): Promise<OutboxEventRecord[]>;
 }
 
+export interface IdempotencyRepository {
+  findByKey(
+    actorUserId: UserId,
+    operation: string,
+    idempotencyKey: string,
+  ): Promise<IdempotencyRecord | null>;
+  createIfAbsent(
+    input: CreateIdempotencyRecordInput,
+  ): Promise<IdempotencyRecord | null>;
+}
+
 export interface TransactionRepositories {
   readonly driver?: DbDriverKind;
   readonly workspaces: WorkspaceRepository;
@@ -471,6 +512,7 @@ export interface TransactionRepositories {
   readonly tasks: TaskRepository;
   readonly issueKeys: IssueKeyRepository;
   readonly outbox: OutboxRepository;
+  readonly idempotency: IdempotencyRepository;
 }
 
 /**

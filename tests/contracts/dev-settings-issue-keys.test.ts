@@ -296,7 +296,7 @@ describe(`Dev settings & issue key issuance (${targetDb})`, () => {
     });
 
     const v6 = await db.migrate();
-    expect(v6).toEqual({ appliedVersions: [6], currentVersion: 6 });
+    expect(v6).toEqual({ appliedVersions: [6, 7], currentVersion: 7 });
 
     const harness = createServerHarness(db);
     const admin1 = await harness.signUpUser("admin1@example.com", "Admin One");
