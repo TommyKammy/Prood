@@ -9,6 +9,7 @@ import type {
   OutboxId,
   ProjectId,
   ProjectKind,
+  ProjectRole,
   ProjectVisibility,
   StatusCategory,
   StatusId,
@@ -79,7 +80,18 @@ export interface ApiErrorResponse {
   };
 }
 
-export const MCP_REQUIRED_WHOAMI_SCOPE = "prood:read" as const;
+export const MCP_READ_SCOPE = "prood:read" as const;
+export const MCP_WRITE_SCOPE = "prood:write" as const;
+export const MCP_REQUIRED_WHOAMI_SCOPE = MCP_READ_SCOPE;
+
+export interface McpToolErrorPayload {
+  contractVersion: typeof CONTRACT_VERSION;
+  error: {
+    code: ApiErrorCode;
+    status: number;
+    messageKey: string;
+  };
+}
 
 export interface McpWhoamiResponse {
   contractVersion: typeof CONTRACT_VERSION;
@@ -120,6 +132,7 @@ export interface ProjectDto {
   description: string;
   statuses: ProjectStatusDto[];
   devSettings: DevProjectSettingsDto | null;
+  myRole?: ProjectRole;
   createdAt: string;
   updatedAt: string;
 }
@@ -144,6 +157,7 @@ export interface UpdateWorkspaceSettingsRequest {
 export interface ProjectDevSettingsResponse {
   contractVersion: typeof CONTRACT_VERSION;
   allowed: boolean;
+  canManage?: boolean;
   dev: DevProjectSettingsDto | null;
   statuses: ProjectStatusDto[];
 }
@@ -214,9 +228,28 @@ export interface DeleteTaskResponse {
   deletedTaskId: TaskPublicId;
 }
 
+export interface MoveTaskRequest {
+  projectId: ProjectId;
+  statusId?: StatusId | null;
+}
+
+export type TaskSearchMatchKind = "exact_id" | "exact_key" | "text";
+
+export interface TaskSearchItemDto {
+  task: TaskDto;
+  matchKind: TaskSearchMatchKind;
+}
+
+export interface TaskSearchResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  query: string;
+  items: TaskSearchItemDto[];
+}
+
 export interface TaskResponse {
   contractVersion: typeof CONTRACT_VERSION;
   task: TaskDto;
+  idempotentReplay?: boolean;
 }
 
 export interface TaskListResponse {
@@ -228,19 +261,54 @@ export interface CreateTaskRequest {
   title: string;
   description?: string;
   parentTaskId?: TaskPublicId | null;
+  parentTaskRef?: string | null;
   inheritParentProject?: boolean;
   statusId?: StatusId | null;
   assigneeId?: UserId | null;
   dueOn?: string | null;
+  idempotencyKey?: string;
 }
 
 export interface UpdateTaskRequest {
   title?: string;
   description?: string;
+  projectId?: ProjectId;
   statusId?: StatusId | null;
   assigneeId?: UserId | null;
   dueOn?: string | null;
   completedAt?: string | null;
+}
+
+export interface StartTaskRequest {
+  reopen?: boolean;
+}
+
+export interface StartTaskResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  task: TaskDto;
+  branchName: string | null;
+  changed: boolean;
+}
+
+export interface UpdateProjectStatusRequest {
+  name?: string;
+  position?: number;
+}
+
+export interface ProjectStatusResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  status: ProjectStatusDto;
+}
+
+export interface DeleteProjectStatusRequest {
+  replacementStatusId?: StatusId | null;
+}
+
+export interface DeleteProjectStatusResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  deletedStatusId: StatusId;
+  fallbackStatusId: StatusId | null;
+  startStatusId: StatusId | null;
 }
 
 export interface OutboxEventDto {

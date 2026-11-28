@@ -67,7 +67,7 @@ export async function routeTaskEvent(
     !e.workspaceId ||
     !e.targetId ||
     e.outcome !== "succeeded" ||
-    !["task.created", "task.updated", "task.manual"].includes(e.eventType)
+    !["task.created", "task.updated", "task.started", "task.manual"].includes(e.eventType)
   )
     return;
   const p = e.payload;
@@ -103,7 +103,7 @@ export async function routeTaskEvent(
     } else if (def.when === "task.created") {
       if (e.eventType !== "task.created") continue;
     } else {
-      if (e.eventType !== "task.updated" || !before || !after) continue;
+      if ((e.eventType !== "task.updated" && e.eventType !== "task.started") || !before || !after) continue;
       const field = def.when === "status.changed" ? "statusId" : "assigneeId";
       if (
         before[field] === after[field] ||

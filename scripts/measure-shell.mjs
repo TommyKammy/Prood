@@ -5,11 +5,54 @@ import { gzipSync } from "node:zlib";
 
 const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const maxGzipBytes = Number(process.env.PROOD_SHELL_MAX_GZIP_BYTES ?? 16384);
+const distDir = resolve(rootDir, "apps/web/dist");
+const metafilePath = resolve(distDir, "metafile.json");
+
+if (!existsSync(metafilePath)) {
+  console.error(`Missing web metafile: ${metafilePath}. Run pnpm build first.`);
+  process.exit(1);
+}
+
+const metafile = JSON.parse(readFileSync(metafilePath, "utf8"));
+const outputs = metafile.outputs ?? {};
+const entryKey =
+  "dist/shell.js" in outputs
+    ? "dist/shell.js"
+    : Object.keys(outputs).find((key) =>
+        outputs[key]?.entryPoint?.endsWith("src/index.ts"),
+      );
+
+if (!entryKey) {
+  console.error("Missing shell entry output in apps/web/dist/metafile.json.");
+  process.exit(1);
+}
+
+const visited = new Set([entryKey]);
+const queue = [entryKey];
+while (queue.length > 0) {
+  const cur = queue.shift();
+  for (const imp of outputs[cur]?.imports ?? []) {
+    if (imp.kind !== "dynamic-import" && imp.path && !visited.has(imp.path)) {
+      visited.add(imp.path);
+      queue.push(imp.path);
+    }
+  }
+}
+
+const eagerJsAssets = [
+  entryKey,
+  ...Array.from(visited)
+    .filter((key) => key !== entryKey)
+    .sort(),
+];
 
 const assets = [
-  { name: "index.html", path: resolve(rootDir, "apps/web/dist/index.html") },
-  { name: "shell.js", path: resolve(rootDir, "apps/web/dist/shell.js") },
-  { name: "shell.css", path: resolve(rootDir, "apps/web/dist/shell.css") },
+  { name: "index.html", path: resolve(distDir, "index.html") },
+  ...eagerJsAssets.map((metaKey) => ({
+    name: metaKey.replace(/^dist\//, ""),
+    path: resolve(rootDir, "apps/web", metaKey),
+  })),
+  { name: "shell.css", path: resolve(distDir, "shell.css") },
 ];
 
 for (const asset of assets) {

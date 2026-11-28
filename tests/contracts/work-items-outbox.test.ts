@@ -259,7 +259,7 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
     });
 
     const v5 = await db.migrate();
-    expect(v5).toEqual({ appliedVersions: [5, 6, 8], currentVersion: 8 });
+    expect(v5).toEqual({ appliedVersions: [5, 6, 7, 8], currentVersion: 8 });
 
     const loaded = await db.uow.run(async (repos) => ({
       ws: await repos.workspaces.findById(wksId),
@@ -1419,5 +1419,210 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
       { op: "stop", revision: 1 },
     );
     expect(stopped.ok && stopped.data.delegateName).toBe(user.userId);
+  });
+
+  it("upgrades from v7 preserving tasks and idempotency records, and invalidates automation on status deletion", async () => {
+    const ctx = await createIsolatedDb();
+    const db = ctx.openClient();
+    expect(await db.migrate({ targetVersion: 7 })).toEqual({
+      appliedVersions: [1, 2, 3, 4, 5, 6, 7],
+      currentVersion: 7,
+    });
+
+    const ids = createSystemIdGenerator();
+    const now = "2026-11-28T10:00:00.000Z";
+    const wksId = ids.next("wks");
+    const usrId = ids.next("usr");
+    const prjId = ids.next("prj");
+    const stsTodo = ids.next("sts");
+    const stsDone = ids.next("sts");
+    const tskId = ids.next("tsk");
+    const outId = ids.next("out");
+    const evtId = ids.next("evt");
+
+    await db.uow.run(async (repos) => {
+      await repos.users.create({
+        id: usrId,
+        email: "v7-upgrade@example.com",
+        displayName: "V7 User",
+        createdAt: now,
+      });
+      await repos.workspaces.create({
+        id: wksId,
+        slug: "v7-upgrade",
+        name: "V7 Upgrade",
+        createdAt: now,
+      });
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: usrId,
+        role: "admin",
+        createdAt: now,
+      });
+      await repos.projects.create({
+        id: prjId,
+        workspaceId: wksId,
+        kind: "general",
+        visibility: "private",
+        name: "Legacy Board",
+        description: "",
+        createdAt: now,
+      });
+      await repos.projects.upsertMembership({
+        id: ids.next("mbr"),
+        projectId: prjId,
+        userId: usrId,
+        role: "admin",
+        createdAt: now,
+      });
+      await repos.statuses.create({
+        id: stsTodo,
+        workspaceId: wksId,
+        projectId: prjId,
+        name: "To Do",
+        category: "todo",
+        position: 0,
+        createdAt: now,
+      });
+      await repos.statuses.create({
+        id: stsDone,
+        workspaceId: wksId,
+        projectId: prjId,
+        name: "Done",
+        category: "done",
+        position: 1,
+        createdAt: now,
+      });
+      await repos.tasks.create({
+        id: tskId,
+        workspaceId: wksId,
+        projectId: prjId,
+        parentTaskId: null,
+        statusId: stsDone,
+        title: "Pre-v8 task",
+        description: "",
+        assigneeId: null,
+        createdBy: usrId,
+        dueOn: null,
+        position: 0,
+        createdAt: now,
+      });
+      await repos.idempotency.createIfAbsent({
+        actorUserId: usrId,
+        operation: "task.create",
+        idempotencyKey: "pre-v8-key",
+        requestFingerprint: "fp-v7",
+        workspaceId: wksId,
+        projectId: prjId,
+        targetType: "task",
+        targetId: tskId,
+        responseJson: JSON.stringify({ taskId: tskId }),
+        createdAt: now,
+      });
+      await repos.outbox.append({
+        id: outId,
+        eventId: evtId,
+        schemaVersion: 1,
+        workspaceId: wksId,
+        projectId: prjId,
+        eventType: "task.created",
+        action: "task.create",
+        outcome: "succeeded",
+        actorUserId: usrId,
+        actorType: "user",
+        channel: "web",
+        targetType: "task",
+        targetId: tskId,
+        reasonCode: null,
+        payload: { taskId: tskId },
+        occurredAt: now,
+      });
+    });
+
+    expect(await db.migrate()).toEqual({
+      appliedVersions: [8],
+      currentVersion: 8,
+    });
+
+    const loaded = await db.uow.run(async (repos) => ({
+      task: await repos.tasks.findById(tskId),
+      idem: await repos.idempotency.findByKey(usrId, "task.create", "pre-v8-key"),
+    }));
+    expect(loaded.task?.version).toBe(1);
+    expect(loaded.task?.title).toBe("Pre-v8 task");
+    expect(loaded.idem?.targetId).toBe(tskId);
+
+    const h = createServerHarness(db);
+    const actor = { userId: usrId, actorType: "user", channel: "web" } as const;
+    const work = h.workUseCases;
+    const deps = {
+      uow: db.uow,
+      idGenerator: ids,
+      clock: { now: () => new Date() },
+    };
+
+    const pubRes = await work.manageAutomation(actor, prjId, "on-done", {
+      op: "publish",
+      revision: 0,
+      delegate: usrId,
+      definition: {
+        when: "manual",
+        action: { field: "statusId", value: stsDone },
+      },
+    });
+    expect(pubRes.ok).toBe(true);
+
+    const pubUnassign = await work.manageAutomation(actor, prjId, "assign-me", {
+      op: "publish",
+      revision: 0,
+      delegate: usrId,
+      definition: {
+        when: "manual",
+        action: { field: "assigneeId", value: usrId },
+      },
+    });
+    expect(pubUnassign.ok).toBe(true);
+
+    const startTarget = await work.manualAutomation(actor, prjId, "on-done", tskId);
+    const startVersioned = await work.manualAutomation(actor, prjId, "assign-me", tskId);
+    expect(startTarget.ok && startVersioned.ok).toBe(true);
+    if (!startTarget.ok || !startVersioned.ok) throw new Error("expected manual starts");
+
+    expect(await deliverNext(deps, wksId, () => "run-done")).toBe(true);
+    expect(await deliverNext(deps, wksId, () => "run-assign")).toBe(true);
+
+    const deleted = await work.deleteProjectStatus(actor, prjId, stsDone, {
+      replacementStatusId: stsTodo,
+    });
+    expect(deleted.ok).toBe(true);
+
+    const refreshed = await db.uow.run((repos) => repos.tasks.findById(tskId));
+    expect(refreshed?.version).toBe(2);
+
+    expect(
+      (
+        await work.prepareAutomation(
+          wksId,
+          startTarget.data.event,
+          "on-done",
+          "run-done",
+          prjId,
+          1,
+        )
+      ).status,
+    ).toBe("denied");
+    expect(
+      (
+        await work.prepareAutomation(
+          wksId,
+          startVersioned.data.event,
+          "assign-me",
+          "run-assign",
+          prjId,
+          1,
+        )
+      ).status,
+    ).toBe("skipped");
   });
 });

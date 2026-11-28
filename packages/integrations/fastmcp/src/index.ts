@@ -1,18 +1,33 @@
-import { FastMCP, type FastMCPSession } from "fastmcp";
+import { FastMCP, UserError, type FastMCPSession } from "fastmcp";
 import { WebStreamableHTTPServerTransport } from "fastmcp/edge";
 import { z } from "zod";
 import {
   createMcpIdentityUseCase,
   createWorkUseCases,
+  isEmailVerificationRequiredError,
   type Clock,
   type IdGenerator,
   type McpHttpHandler,
   type McpTokenVerifier,
   type McpVerifiedToken,
   type UnitOfWork,
+  type WorkUseCaseResult,
 } from "@prood/application";
-import { isValidEntityId } from "@prood/domain";
-import { MCP_REQUIRED_WHOAMI_SCOPE } from "@prood/contracts";
+import {
+  CONTRACT_VERSION,
+  MCP_READ_SCOPE,
+  MCP_REQUIRED_WHOAMI_SCOPE,
+  MCP_WRITE_SCOPE,
+  type ApiErrorCode,
+  type McpToolErrorPayload,
+} from "@prood/contracts";
+import {
+  isValidEntityId,
+  type AuditActorContext,
+  type StatusId,
+  type UserId,
+  type WorkspaceId,
+} from "@prood/domain";
 
 const DEFAULT_SESSION_IDLE_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_ACTIVE_SESSIONS = 1000;
@@ -50,9 +65,15 @@ interface ActiveSessionEntry {
 }
 
 const TOOL_REQUIRED_SCOPES = new Map<string, readonly string[]>([
-  ["create_task", ["prood:write"]],
-  ["update_task", ["prood:write"]],
   ["whoami", [MCP_REQUIRED_WHOAMI_SCOPE]],
+  ["list_projects", [MCP_READ_SCOPE]],
+  ["get_project", [MCP_READ_SCOPE]],
+  ["list_tasks", [MCP_READ_SCOPE]],
+  ["get_task", [MCP_READ_SCOPE]],
+  ["search_tasks", [MCP_READ_SCOPE]],
+  ["create_task", [MCP_WRITE_SCOPE]],
+  ["update_task", [MCP_WRITE_SCOPE]],
+  ["start_task", [MCP_WRITE_SCOPE]],
 ]);
 
 function sanitizeHeaderValue(value: string): string {
@@ -124,6 +145,51 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
     idGenerator: deps.idGenerator,
     clock: deps.clock,
   });
+  const workUseCases = createWorkUseCases({
+    uow: deps.uow,
+    idGenerator: deps.idGenerator,
+    clock: deps.clock,
+  });
+
+  function throwMcpToolError(
+    status: number,
+    code: ApiErrorCode,
+    messageKey: string,
+  ): never {
+    const payload: McpToolErrorPayload = {
+      contractVersion: CONTRACT_VERSION,
+      error: { code, status, messageKey },
+    };
+    throw new UserError(JSON.stringify(payload));
+  }
+
+  async function resolveMcpToolActor(
+    sessionAuth: ProodMcpSessionAuth | undefined,
+    requiredScope: string,
+  ): Promise<AuditActorContext> {
+    if (
+      !sessionAuth ||
+      !Array.isArray(sessionAuth.scopes) ||
+      !sessionAuth.scopes.includes(requiredScope)
+    ) {
+      throw new Error(`Insufficient scope: ${requiredScope} is required`);
+    }
+    try {
+      return await identityUseCase.resolveActor(sessionAuth);
+    } catch (error) {
+      if (isEmailVerificationRequiredError(error)) {
+        throwMcpToolError(403, "FORBIDDEN", "error.emailVerificationRequired");
+      }
+      throw error;
+    }
+  }
+
+  function unwrapWorkResult<T>(result: WorkUseCaseResult<T>): string {
+    if (!result.ok) {
+      throwMcpToolError(result.status, result.code, result.messageKey);
+    }
+    return JSON.stringify(result.data);
+  }
 
   const sessionIdleTtlMs = Math.max(
     1,
@@ -193,63 +259,252 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
     },
   });
 
-  const work = createWorkUseCases(deps);
-  async function writer(token: ProodMcpSessionAuth | undefined) {
-    if (!token?.scopes.includes("prood:write")) throw Error("Task write scope required");
-    const profile = await identityUseCase.whoami(token, deps.resource);
-    if (!isValidEntityId("usr", profile.userId)) throw Error("Invalid principal");
-    return {
-      userId: profile.userId,
-      actorType: "agent",
-      channel: "mcp",
-      clientId: token.clientId,
-    } as const;
-  }
-  const statusId = z
-    .string()
-    .refine((v) => isValidEntityId("sts", v))
-    .nullable()
-    .optional();
-  const assigneeId = z
-    .string()
-    .refine((v) => isValidEntityId("usr", v))
-    .nullable()
-    .optional();
   server.addTool({
-    name: "create_task",
-    description: "Create a task in an accessible project.",
-    scopes: ["prood:write"],
-    parameters: z
-      .object({ projectId: z.string(), title: z.string(), statusId, assigneeId })
-      .strict(),
-    execute: async ({ projectId, title, statusId, assigneeId }, ctx) => {
-      if (!isValidEntityId("prj", projectId)) throw Error("Invalid project");
-      const result = await work.createTask(await writer(ctx.session), projectId, {
-        title,
-        statusId,
-        assigneeId,
+    name: "list_projects",
+    description:
+      "List projects accessible to the authenticated user, optionally filtered by workspace ID.",
+    parameters: z.object({
+      workspaceId: z.string().optional(),
+    }),
+    scopes: [MCP_READ_SCOPE],
+    annotations: {
+      readOnlyHint: true,
+      title: "List projects",
+    },
+    execute: async (args, context) => {
+      const actor = await resolveMcpToolActor(context.session, MCP_READ_SCOPE);
+      const result = await workUseCases.listAccessibleProjects(actor, {
+        ...(args.workspaceId !== undefined
+          ? { workspaceId: args.workspaceId as WorkspaceId }
+          : {}),
       });
-      if (!result.ok) throw Error(result.code);
-      return JSON.stringify(result.data);
+      return unwrapWorkResult(result);
     },
   });
+
+  server.addTool({
+    name: "get_project",
+    description:
+      "Get a project by project ID (prj_...) or issue key prefix (e.g. PRD, APP), optionally scoped by workspace ID.",
+    parameters: z.object({
+      projectRef: z.string().min(1),
+      workspaceId: z.string().optional(),
+    }),
+    scopes: [MCP_READ_SCOPE],
+    annotations: {
+      readOnlyHint: true,
+      title: "Get project",
+    },
+    execute: async (args, context) => {
+      const actor = await resolveMcpToolActor(context.session, MCP_READ_SCOPE);
+      const result = await workUseCases.getProjectByRef(
+        actor,
+        args.projectRef,
+        {
+          ...(args.workspaceId !== undefined
+            ? { workspaceId: args.workspaceId as WorkspaceId }
+            : {}),
+        },
+      );
+      return unwrapWorkResult(result);
+    },
+  });
+
+  server.addTool({
+    name: "list_tasks",
+    description:
+      "List tasks in a project (including inherited subtasks) by project ID or issue key prefix.",
+    parameters: z.object({
+      projectRef: z.string().min(1),
+      workspaceId: z.string().optional(),
+    }),
+    scopes: [MCP_READ_SCOPE],
+    annotations: {
+      readOnlyHint: true,
+      title: "List tasks",
+    },
+    execute: async (args, context) => {
+      const actor = await resolveMcpToolActor(context.session, MCP_READ_SCOPE);
+      const result = await workUseCases.listProjectTasksByRef(
+        actor,
+        args.projectRef,
+        {
+          ...(args.workspaceId !== undefined
+            ? { workspaceId: args.workspaceId as WorkspaceId }
+            : {}),
+        },
+      );
+      return unwrapWorkResult(result);
+    },
+  });
+
+  server.addTool({
+    name: "get_task",
+    description:
+      "Get a task by immutable public ID (tsk_...) or issue key (current or historical, e.g. PRD-1 or APP-1).",
+    parameters: z.object({
+      taskRef: z.string().min(1),
+      workspaceId: z.string().optional(),
+    }),
+    scopes: [MCP_READ_SCOPE],
+    annotations: {
+      readOnlyHint: true,
+      title: "Get task",
+    },
+    execute: async (args, context) => {
+      const actor = await resolveMcpToolActor(context.session, MCP_READ_SCOPE);
+      const result = await workUseCases.getTask(actor, args.taskRef, {
+        ...(args.workspaceId !== undefined
+          ? { workspaceId: args.workspaceId as WorkspaceId }
+          : {}),
+      });
+      return unwrapWorkResult(result);
+    },
+  });
+
+  server.addTool({
+    name: "search_tasks",
+    description:
+      "Search readable tasks by public ID, issue key, or title/description keyword across accessible workspaces or a scoped workspace/project.",
+    parameters: z.object({
+      query: z.string().min(1),
+      workspaceId: z.string().optional(),
+      projectRef: z.string().optional(),
+      limit: z.number().int().min(1).max(100).optional(),
+    }),
+    scopes: [MCP_READ_SCOPE],
+    annotations: {
+      readOnlyHint: true,
+      title: "Search tasks",
+    },
+    execute: async (args, context) => {
+      const actor = await resolveMcpToolActor(context.session, MCP_READ_SCOPE);
+      const result = await workUseCases.searchTasksByRef(actor, {
+        query: args.query,
+        ...(args.workspaceId !== undefined
+          ? { workspaceId: args.workspaceId as WorkspaceId }
+          : {}),
+        ...(args.projectRef !== undefined
+          ? { projectRef: args.projectRef }
+          : {}),
+        ...(args.limit !== undefined ? { limit: args.limit } : {}),
+      });
+      return unwrapWorkResult(result);
+    },
+  });
+
+  server.addTool({
+    name: "create_task",
+    description:
+      "Idempotently create a task in a project (by prj_... ID or issue key prefix) using a caller-supplied idempotencyKey.",
+    parameters: z.object({
+      projectRef: z.string().min(1),
+      title: z.string().min(1),
+      idempotencyKey: z.string().min(1).max(128),
+      workspaceId: z.string().optional(),
+      description: z.string().optional(),
+      parentTaskRef: z.string().min(1).nullable().optional(),
+      inheritParentProject: z.boolean().optional(),
+      statusId: z.string().nullable().optional(),
+      assigneeId: z.string().nullable().optional(),
+      dueOn: z.string().nullable().optional(),
+    }),
+    scopes: [MCP_WRITE_SCOPE],
+    annotations: {
+      readOnlyHint: false,
+      idempotentHint: true,
+      title: "Create task",
+    },
+    execute: async (args, context) => {
+      const actor = await resolveMcpToolActor(context.session, MCP_WRITE_SCOPE);
+      const result = await workUseCases.createTaskByProjectRef(
+        actor,
+        args.projectRef,
+        {
+          title: args.title,
+          idempotencyKey: args.idempotencyKey,
+          description: args.description,
+          parentTaskRef: args.parentTaskRef,
+          inheritParentProject: args.inheritParentProject,
+          statusId: args.statusId as StatusId | null | undefined,
+          assigneeId: args.assigneeId as UserId | null | undefined,
+          dueOn: args.dueOn,
+        },
+        {
+          ...(args.workspaceId !== undefined
+            ? { workspaceId: args.workspaceId as WorkspaceId }
+            : {}),
+        },
+      );
+      return unwrapWorkResult(result);
+    },
+  });
+
   server.addTool({
     name: "update_task",
     description: "Update a task's status or assignee.",
-    scopes: ["prood:write"],
-    parameters: z.object({ taskId: z.string(), statusId, assigneeId }).strict(),
-    execute: async ({ taskId, statusId, assigneeId }, ctx) => {
+    parameters: z
+      .object({
+        taskId: z.string().min(1),
+        statusId: z.string().nullable().optional(),
+        assigneeId: z.string().nullable().optional(),
+      })
+      .strict(),
+    scopes: [MCP_WRITE_SCOPE],
+    annotations: {
+      readOnlyHint: false,
+      title: "Update task",
+    },
+    execute: async (args, context) => {
+      const actor = await resolveMcpToolActor(context.session, MCP_WRITE_SCOPE);
       if (
-        !isValidEntityId("tsk", taskId) ||
-        (statusId === undefined && assigneeId === undefined)
-      )
-        throw Error("Invalid task change");
-      const result = await work.updateTask(await writer(ctx.session), taskId, {
-        statusId,
-        assigneeId,
+        !isValidEntityId("tsk", args.taskId) ||
+        (args.statusId === undefined && args.assigneeId === undefined)
+      ) {
+        throwMcpToolError(400, "VALIDATION_ERROR", "error.validation");
+      }
+      const result = await workUseCases.updateTask(actor, args.taskId, {
+        ...(args.statusId !== undefined
+          ? { statusId: args.statusId as StatusId | null }
+          : {}),
+        ...(args.assigneeId !== undefined
+          ? { assigneeId: args.assigneeId as UserId | null }
+          : {}),
       });
-      if (!result.ok) throw Error(result.code);
-      return JSON.stringify(result.data);
+      return unwrapWorkResult(result);
+    },
+  });
+
+  server.addTool({
+    name: "start_task",
+    description:
+      "Atomically start a task by public ID (tsk_...) or issue key (current or historical): assigns the actor if unassigned, transitions status without regressing, requires reopen=true for completed tasks, and returns the immutable Git branch name.",
+    parameters: z.object({
+      taskRef: z.string().min(1),
+      workspaceId: z.string().optional(),
+      reopen: z.boolean().optional(),
+    }),
+    scopes: [MCP_WRITE_SCOPE],
+    annotations: {
+      readOnlyHint: false,
+      idempotentHint: true,
+      title: "Start task",
+    },
+    execute: async (args, context) => {
+      const actor = await resolveMcpToolActor(context.session, MCP_WRITE_SCOPE);
+      const result = await workUseCases.startTask(
+        actor,
+        args.taskRef,
+        {
+          ...(args.reopen !== undefined ? { reopen: args.reopen } : {}),
+        },
+        {
+          ...(args.workspaceId !== undefined
+            ? { workspaceId: args.workspaceId as WorkspaceId }
+            : {}),
+        },
+      );
+      return unwrapWorkResult(result);
     },
   });
 

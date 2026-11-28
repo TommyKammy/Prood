@@ -164,6 +164,32 @@ export interface OutboxEventRecord {
   createdAt: string;
 }
 
+export interface IdempotencyRecord {
+  actorUserId: UserId;
+  operation: string;
+  idempotencyKey: string;
+  requestFingerprint: string;
+  workspaceId: WorkspaceId | null;
+  projectId: ProjectId | null;
+  targetType: string;
+  targetId: string;
+  responseJson: string;
+  createdAt: string;
+}
+
+export interface CreateIdempotencyRecordInput {
+  actorUserId: UserId;
+  operation: string;
+  idempotencyKey: string;
+  requestFingerprint: string;
+  workspaceId: WorkspaceId | null;
+  projectId: ProjectId | null;
+  targetType: string;
+  targetId: string;
+  responseJson: string;
+  createdAt: string;
+}
+
 export interface CreateWorkspaceInput {
   id: WorkspaceId;
   slug: string;
@@ -253,10 +279,18 @@ export interface CreateTaskInput {
 export interface UpdateTaskInput {
   title?: string;
   description?: string;
+  projectId?: ProjectId | null;
+  parentTaskId?: TaskPublicId | null;
   statusId?: StatusId | null;
   assigneeId?: UserId | null;
   dueOn?: string | null;
   completedAt?: string | null;
+  updatedAt: string;
+}
+
+export interface UpdateProjectStatusInput {
+  name?: string;
+  position?: number;
   updatedAt: string;
 }
 
@@ -337,6 +371,10 @@ export interface WorkspaceMembershipRepository {
     workspaceId: WorkspaceId,
     userId: UserId,
   ): Promise<WorkspaceMembershipRecord | null>;
+  deleteByWorkspaceAndUser(
+    workspaceId: WorkspaceId,
+    userId: UserId,
+  ): Promise<boolean>;
   listSummariesForUser(userId: UserId): Promise<WorkspaceMembershipSummary[]>;
 }
 
@@ -358,23 +396,52 @@ export interface ProjectRepository {
     projectId: ProjectId,
     userId: UserId,
   ): Promise<ProjectMembershipRecord | null>;
+  deleteMembership(projectId: ProjectId, userId: UserId): Promise<boolean>;
 }
 
 export interface ProjectStatusRepository {
   create(input: CreateProjectStatusInput): Promise<ProjectStatusRecord>;
   findById(id: StatusId): Promise<ProjectStatusRecord | null>;
   listByProject(projectId: ProjectId): Promise<ProjectStatusRecord[]>;
+  update(
+    id: StatusId,
+    input: UpdateProjectStatusInput,
+  ): Promise<ProjectStatusRecord | null>;
+  deleteById(id: StatusId): Promise<boolean>;
 }
 
 export interface TaskRepository {
   create(input: CreateTaskInput): Promise<TaskRecord>;
   findById(id: TaskPublicId, forUpdate?: boolean): Promise<TaskRecord | null>;
+  lockByIdsForUpdate(ids: readonly TaskPublicId[]): Promise<TaskRecord[]>;
   listByProject(projectId: ProjectId): Promise<TaskRecord[]>;
   listSubtasks(parentTaskId: TaskPublicId): Promise<TaskRecord[]>;
   listSubtasksByParentIds(
     parentTaskIds: readonly TaskPublicId[],
   ): Promise<TaskRecord[]>;
+  searchInWorkspace(input: {
+    workspaceId: WorkspaceId;
+    allowedProjectIds: readonly ProjectId[];
+    query: string;
+    limit: number;
+    before?: { updatedAt: string; id: TaskPublicId };
+  }): Promise<TaskRecord[]>;
   update(id: TaskPublicId, input: UpdateTaskInput): Promise<TaskRecord | null>;
+  clearParentTaskIds(
+    taskIds: readonly TaskPublicId[],
+    updatedAt: string,
+  ): Promise<void>;
+  updateStatusForTaskIds(
+    taskIds: readonly TaskPublicId[],
+    statusId: StatusId | null,
+    updatedAt: string,
+  ): Promise<void>;
+  replaceStatusInProject(
+    projectId: ProjectId,
+    fromStatusId: StatusId,
+    toStatusId: StatusId | null,
+    updatedAt: string,
+  ): Promise<void>;
   deleteById(id: TaskPublicId): Promise<boolean>;
 }
 
@@ -405,6 +472,24 @@ export interface IssueKeyRepository {
     workspaceId: WorkspaceId,
     prefix: string,
   ): Promise<IssueKeyPrefixRecord | null>;
+  findProjectIdByWorkspacePrefix(
+    workspaceId: WorkspaceId,
+    prefix: string,
+  ): Promise<ProjectId | null>;
+  findProjectIdsByWorkspacesAndPrefix(
+    workspaceIds: readonly WorkspaceId[],
+    prefix: string,
+  ): Promise<Array<{ workspaceId: WorkspaceId; projectId: ProjectId }>>;
+  findTaskIdByWorkspaceKey(
+    workspaceId: WorkspaceId,
+    prefix: string,
+    issueNumber: number,
+  ): Promise<TaskPublicId | null>;
+  findTaskIdsByWorkspacesAndKey(
+    workspaceIds: readonly WorkspaceId[],
+    prefix: string,
+    issueNumber: number,
+  ): Promise<Array<{ workspaceId: WorkspaceId; taskId: TaskPublicId }>>;
   reservePrefix(
     input: IssueKeyPrefixRecord,
   ): Promise<IssueKeyPrefixRecord | null>;
@@ -423,6 +508,17 @@ export interface OutboxRepository {
   listAll(): Promise<OutboxEventRecord[]>;
 }
 
+export interface IdempotencyRepository {
+  findByKey(
+    actorUserId: UserId,
+    operation: string,
+    idempotencyKey: string,
+  ): Promise<IdempotencyRecord | null>;
+  createIfAbsent(
+    input: CreateIdempotencyRecordInput,
+  ): Promise<IdempotencyRecord | null>;
+}
+
 export interface TransactionRepositories {
   readonly automation: import("./automation.js").AutomationRepository;
   readonly driver?: DbDriverKind;
@@ -435,6 +531,7 @@ export interface TransactionRepositories {
   readonly tasks: TaskRepository;
   readonly issueKeys: IssueKeyRepository;
   readonly outbox: OutboxRepository;
+  readonly idempotency: IdempotencyRepository;
 }
 
 /**
