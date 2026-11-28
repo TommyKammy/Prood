@@ -154,6 +154,8 @@ describe("@prood/server Web-Standard app", () => {
             },
             findById: async () => null,
             listByProject: async () => [],
+            update: async () => null,
+            deleteById: async () => false,
           },
           tasks: {
             create: async () => {
@@ -168,6 +170,7 @@ describe("@prood/server Web-Standard app", () => {
             update: async () => null,
             clearParentTaskIds: async () => {},
             updateStatusForTaskIds: async () => {},
+            replaceStatusInProject: async () => {},
             deleteById: async () => false,
           },
           issueKeys: {

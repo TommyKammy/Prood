@@ -66,6 +66,7 @@ const TOOL_REQUIRED_SCOPES = new Map<string, readonly string[]>([
   ["get_task", [MCP_READ_SCOPE]],
   ["search_tasks", [MCP_READ_SCOPE]],
   ["create_task", [MCP_WRITE_SCOPE]],
+  ["start_task", [MCP_WRITE_SCOPE]],
 ]);
 
 function sanitizeHeaderValue(value: string): string {
@@ -421,6 +422,39 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
           statusId: args.statusId as StatusId | null | undefined,
           assigneeId: args.assigneeId as UserId | null | undefined,
           dueOn: args.dueOn,
+        },
+        {
+          ...(args.workspaceId !== undefined
+            ? { workspaceId: args.workspaceId as WorkspaceId }
+            : {}),
+        },
+      );
+      return unwrapWorkResult(result);
+    },
+  });
+
+  server.addTool({
+    name: "start_task",
+    description:
+      "Atomically start a task by public ID (tsk_...) or issue key (current or historical): assigns the actor if unassigned, transitions status without regressing, requires reopen=true for completed tasks, and returns the immutable Git branch name.",
+    parameters: z.object({
+      taskRef: z.string().min(1),
+      workspaceId: z.string().optional(),
+      reopen: z.boolean().optional(),
+    }),
+    scopes: [MCP_WRITE_SCOPE],
+    annotations: {
+      readOnlyHint: false,
+      idempotentHint: true,
+      title: "Start task",
+    },
+    execute: async (args, context) => {
+      const actor = await resolveMcpToolActor(context.session, MCP_WRITE_SCOPE);
+      const result = await workUseCases.startTask(
+        actor,
+        args.taskRef,
+        {
+          ...(args.reopen !== undefined ? { reopen: args.reopen } : {}),
         },
         {
           ...(args.workspaceId !== undefined
