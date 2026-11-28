@@ -786,4 +786,320 @@ describe(`Issue resolution, move visibility & search (${targetDb})`, () => {
       }
     }
   });
+
+  it("detaches source-project children, maps inherited descendant statuses on move, and paginates search past disallowed or out-of-scope null-project subtasks", async () => {
+    const ctx = await createIsolatedDb();
+    const db = ctx.openClient();
+    await db.migrate();
+    const ids = createSystemIdGenerator();
+    const harness = createServerHarness(db, "2026-11-28T10:00:00.000Z");
+
+    const wksId = ids.next("wks");
+    const now = "2026-11-28T10:00:00.000Z";
+    await db.uow.run(async (repos) => {
+      await repos.workspaces.create({
+        id: wksId,
+        slug: "move-search-hardening-ws",
+        name: "Move & Search Hardening WS",
+        createdAt: now,
+      });
+      await repos.workspaceSettings.upsert({
+        workspaceId: wksId,
+        defaultLocale: "en",
+        devProjectsEnabled: true,
+        updatedAt: now,
+      });
+    });
+
+    const admin = await harness.signUpUser("hardening-admin@example.com", "Admin");
+    const bWriter = await harness.signUpUser("hardening-writer@example.com", "B Writer");
+    await db.uow.run(async (repos) => {
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: admin.userId,
+        role: "admin",
+        createdAt: now,
+      });
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: bWriter.userId,
+        role: "member",
+        createdAt: now,
+      });
+    });
+
+    const privA = ((await (
+      await harness.request(`/api/v1/workspaces/${wksId}/projects`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { name: "Private Source A", kind: "general", visibility: "private" },
+      })
+    ).json()) as ProjectResponse).project;
+    const openB = ((await (
+      await harness.request(`/api/v1/workspaces/${wksId}/projects`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { name: "Open Target B", kind: "general", visibility: "workspace" },
+      })
+    ).json()) as ProjectResponse).project;
+    await harness.request(`/api/v1/projects/${openB.id}/dev-settings/enable`, {
+      method: "POST",
+      cookieHeader: admin.jar.toHeader(),
+      json: { prefix: "OPENB" },
+    });
+    const openC = ((await (
+      await harness.request(`/api/v1/workspaces/${wksId}/projects`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { name: "Open Other C", kind: "general", visibility: "workspace" },
+      })
+    ).json()) as ProjectResponse).project;
+
+    const aInProgress = privA.statuses.find((s) => s.category === "in_progress")!;
+    const aDone = privA.statuses.find((s) => s.category === "done")!;
+    const bTodo = openB.statuses.find((s) => s.category === "todo")!;
+    const bInProgress = openB.statuses.find((s) => s.category === "in_progress")!;
+    const bDone = openB.statuses.find((s) => s.category === "done")!;
+
+    // P in privA with:
+    // - C1 (inheritParentProject: false -> remains in privA) + C1Sub
+    // - C2 (inheritParentProject: true -> moves to openB, status In Progress -> maps to B's In Progress)
+    //   - G1 under C2 (inheritParentProject: false -> remains in privA, must detach from C2)
+    //   - G2 under C2 (inheritParentProject: true -> moves to openB, status Done -> maps to B's Done)
+    const pTask = ((await (
+      await harness.request(`/api/v1/projects/${privA.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { title: "Moveable Root P" },
+      })
+    ).json()) as TaskResponse).task;
+    const c1Task = ((await (
+      await harness.request(`/api/v1/projects/${privA.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: {
+          title: "Stays in PrivA C1",
+          parentTaskId: pTask.id,
+          inheritParentProject: false,
+          statusId: aDone.id,
+        },
+      })
+    ).json()) as TaskResponse).task;
+    const c1Sub = ((await (
+      await harness.request(`/api/v1/projects/${privA.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { title: "Child of C1", parentTaskId: c1Task.id },
+      })
+    ).json()) as TaskResponse).task;
+    const c2Task = ((await (
+      await harness.request(`/api/v1/projects/${privA.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: {
+          title: "Inherited C2",
+          parentTaskId: pTask.id,
+          inheritParentProject: true,
+          statusId: aInProgress.id,
+        },
+      })
+    ).json()) as TaskResponse).task;
+    const g1Task = ((await (
+      await harness.request(`/api/v1/projects/${privA.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: {
+          title: "Non-inherited under C2",
+          parentTaskId: c2Task.id,
+          inheritParentProject: false,
+          statusId: aDone.id,
+        },
+      })
+    ).json()) as TaskResponse).task;
+    const g2Task = ((await (
+      await harness.request(`/api/v1/projects/${privA.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: {
+          title: "Inherited Grandchild G2",
+          parentTaskId: c2Task.id,
+          inheritParentProject: true,
+          statusId: aDone.id,
+        },
+      })
+    ).json()) as TaskResponse).task;
+
+    // Move P from privA -> openB
+    const moveRes = await harness.request(`/api/v1/tasks/${pTask.id}/move`, {
+      method: "POST",
+      cookieHeader: admin.jar.toHeader(),
+      json: { projectId: openB.id },
+    });
+    expect(moveRes.status).toBe(200);
+    const movedP = ((await moveRes.json()) as TaskResponse).task;
+    expect(movedP.effectiveProjectId).toBe(openB.id);
+    expect(movedP.statusId).toBe(bTodo.id);
+
+    // 1. Verify C1 and G1 were detached and retained privA project + privA Done status
+    const readC1 = ((await (
+      await harness.request(`/api/v1/tasks/${c1Task.id}`, {
+        cookieHeader: admin.jar.toHeader(),
+      })
+    ).json()) as TaskResponse).task;
+    expect(readC1.parentTaskId).toBeNull();
+    expect(readC1.effectiveProjectId).toBe(privA.id);
+    expect(readC1.statusId).toBe(aDone.id);
+
+    const readG1 = ((await (
+      await harness.request(`/api/v1/tasks/${g1Task.id}`, {
+        cookieHeader: admin.jar.toHeader(),
+      })
+    ).json()) as TaskResponse).task;
+    expect(readG1.parentTaskId).toBeNull();
+    expect(readG1.effectiveProjectId).toBe(privA.id);
+    expect(readG1.statusId).toBe(aDone.id);
+
+    // 2. Verify inherited C2 and G2 moved to openB AND had statuses mapped cleanly
+    const readC2 = ((await (
+      await harness.request(`/api/v1/tasks/${c2Task.id}`, {
+        cookieHeader: bWriter.jar.toHeader(),
+      })
+    ).json()) as TaskResponse).task;
+    expect(readC2.effectiveProjectId).toBe(openB.id);
+    expect(readC2.statusId).toBe(bInProgress.id);
+
+    const readG2 = ((await (
+      await harness.request(`/api/v1/tasks/${g2Task.id}`, {
+        cookieHeader: bWriter.jar.toHeader(),
+      })
+    ).json()) as TaskResponse).task;
+    expect(readG2.effectiveProjectId).toBe(openB.id);
+    expect(readG2.statusId).toBe(bDone.id);
+
+    const listB = ((await (
+      await harness.request(`/api/v1/projects/${openB.id}/tasks`, {
+        cookieHeader: bWriter.jar.toHeader(),
+      })
+    ).json()) as TaskListResponse).tasks;
+    expect(listB.find((t) => t.id === c2Task.id)?.statusId).toBe(bInProgress.id);
+    expect(listB.find((t) => t.id === g2Task.id)?.statusId).toBe(bDone.id);
+    expect(listB.some((t) => t.id === c1Task.id || t.id === g1Task.id)).toBe(false);
+
+    // Passing C2's mapped statusId back to PATCH must succeed
+    const patchC2 = await harness.request(`/api/v1/tasks/${c2Task.id}`, {
+      method: "PATCH",
+      cookieHeader: bWriter.jar.toHeader(),
+      json: { statusId: readC2.statusId, title: "Inherited C2 updated" },
+    });
+    expect(patchC2.status).toBe(200);
+
+    // 3. B-only writer (no access to privA) deletes P -> C2 & G2 cascade, C1/C1Sub/G1 in privA survive intact!
+    const delPRes = await harness.request(`/api/v1/tasks/${pTask.id}`, {
+      method: "DELETE",
+      cookieHeader: bWriter.jar.toHeader(),
+    });
+    expect(delPRes.status).toBe(200);
+
+    for (const survivedId of [c1Task.id, c1Sub.id, g1Task.id]) {
+      const checkRes = await harness.request(`/api/v1/tasks/${survivedId}`, {
+        cookieHeader: admin.jar.toHeader(),
+      });
+      expect(checkRes.status).toBe(200);
+    }
+
+    // 4. Search pagination past >50 disallowed / out-of-scope null-project subtasks with limit=1
+    const targetInB = ((await (
+      await harness.request(`/api/v1/projects/${openB.id}/tasks`, {
+        method: "POST",
+        cookieHeader: bWriter.jar.toHeader(),
+        json: { title: "Older horizon-signal target in B" },
+      })
+    ).json()) as TaskResponse).task;
+
+    // Create 55 newer matching inherited subtasks in private privA + 5 in openC (all project_id = NULL)
+    const privParent = ((await (
+      await harness.request(`/api/v1/projects/${privA.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { title: "Noise container in PrivA" },
+      })
+    ).json()) as TaskResponse).task;
+    const cParent = ((await (
+      await harness.request(`/api/v1/projects/${openC.id}/tasks`, {
+        method: "POST",
+        cookieHeader: admin.jar.toHeader(),
+        json: { title: "Noise container in OpenC" },
+      })
+    ).json()) as TaskResponse).task;
+
+    await db.uow.run(async (repos) => {
+      for (let i = 0; i < 55; i += 1) {
+        const ts = `2026-11-28T11:${String(Math.floor(i / 60)).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}.000Z`;
+        await repos.tasks.create({
+          id: ids.next("tsk"),
+          workspaceId: wksId,
+          projectId: null,
+          parentTaskId: privParent.id,
+          statusId: null,
+          title: `Newer horizon-signal priv noise ${i}`,
+          description: "",
+          assigneeId: null,
+          createdBy: admin.userId,
+          dueOn: null,
+          position: i,
+          createdAt: ts,
+        });
+      }
+      for (let i = 0; i < 5; i += 1) {
+        const ts = `2026-11-28T11:01:${String(i).padStart(2, "0")}.000Z`;
+        await repos.tasks.create({
+          id: ids.next("tsk"),
+          workspaceId: wksId,
+          projectId: null,
+          parentTaskId: cParent.id,
+          statusId: null,
+          title: `Newer horizon-signal openC noise ${i}`,
+          description: "",
+          assigneeId: null,
+          createdBy: admin.userId,
+          dueOn: null,
+          position: i,
+          createdAt: ts,
+        });
+      }
+    });
+
+    // Workspace search with limit=1 by bWriter (cannot read privA): skips all 55 privA subtasks and returns 1 readable match (from openC)
+    const wsSearchLimit1 = ((await (
+      await harness.request(
+        `/api/v1/workspaces/${wksId}/tasks/search?q=horizon-signal&limit=1`,
+        { cookieHeader: bWriter.jar.toHeader() },
+      )
+    ).json()) as TaskSearchResponse);
+    expect(wsSearchLimit1.items).toHaveLength(1);
+    expect(wsSearchLimit1.items[0]?.task.effectiveProjectId).not.toBe(privA.id);
+
+    // Project-scoped search for openB with limit=1 skips all 60 newer null-project noise rows (55 privA + 5 openC) and finds targetInB!
+    const scopedLimit1 = ((await (
+      await harness.request(
+        `/api/v1/workspaces/${wksId}/tasks/search?q=horizon-signal&projectId=${openB.id}&limit=1`,
+        { cookieHeader: bWriter.jar.toHeader() },
+      )
+    ).json()) as TaskSearchResponse);
+    expect(scopedLimit1.items).toHaveLength(1);
+    expect(scopedLimit1.items[0]?.task.id).toBe(targetInB.id);
+
+    // Exact key search with limit=1 keeps exact match priority
+    const exactKeyLimit1 = ((await (
+      await harness.request(
+        `/api/v1/workspaces/${wksId}/tasks/search?q=${targetInB.issueKey}&limit=1`,
+        { cookieHeader: bWriter.jar.toHeader() },
+      )
+    ).json()) as TaskSearchResponse);
+    expect(exactKeyLimit1.items).toHaveLength(1);
+    expect(exactKeyLimit1.items[0]?.matchKind).toBe("exact_key");
+    expect(exactKeyLimit1.items[0]?.task.id).toBe(targetInB.id);
+  });
 });

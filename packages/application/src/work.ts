@@ -47,6 +47,7 @@ import {
   type LocaleCode,
   type ProjectId,
   type ProjectRole,
+  type StatusCategory,
   type StatusId,
   type TaskPublicId,
   type UserId,
@@ -549,9 +550,101 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
     };
   }
 
+  async function partitionMovingSubtreeInTx(
+    repos: TransactionRepositories,
+    rootTaskId: TaskPublicId,
+    targetProjectId: ProjectId,
+  ): Promise<{
+    movingInheritedDescendants: TaskRecord[];
+    detachChildIds: TaskPublicId[];
+  }> {
+    const moving = new Map<TaskPublicId, TaskRecord>();
+    const detach = new Set<TaskPublicId>();
+    let frontier: TaskPublicId[] = [rootTaskId];
+
+    for (
+      let depth = 0;
+      depth < MAX_PARENT_HOPS && frontier.length > 0;
+      depth += 1
+    ) {
+      const children = await repos.tasks.listSubtasksByParentIds(frontier);
+      const nextFrontier: TaskPublicId[] = [];
+      for (const child of children) {
+        if (child.projectId === null) {
+          if (!moving.has(child.id)) {
+            moving.set(child.id, child);
+            nextFrontier.push(child.id);
+          }
+        } else if (child.projectId !== targetProjectId) {
+          // Child explicitly lives in another project (e.g. sourceProject);
+          // detach it so parent deletion in targetProject cannot cascade across projects.
+          detach.add(child.id);
+        }
+      }
+      frontier = nextFrontier;
+    }
+
+    return {
+      movingInheritedDescendants: Array.from(moving.values()),
+      detachChildIds: Array.from(detach),
+    };
+  }
+
+  async function remapMovingSubtreeStatusesInTx(
+    repos: TransactionRepositories,
+    movingDescendants: readonly TaskRecord[],
+    sourceProjectId: ProjectId,
+    targetProjectId: ProjectId,
+    prefetchedTargetStatuses: readonly ProjectStatusRecord[] | undefined,
+    nowIso: string,
+  ): Promise<void> {
+    if (movingDescendants.length === 0) {
+      return;
+    }
+    const [sourceStatuses, targetStatuses] = await Promise.all([
+      repos.statuses.listByProject(sourceProjectId),
+      prefetchedTargetStatuses
+        ? Promise.resolve(prefetchedTargetStatuses)
+        : repos.statuses.listByProject(targetProjectId),
+    ]);
+    const sourceById = new Map<StatusId, ProjectStatusRecord>(
+      sourceStatuses.map((s) => [s.id, s]),
+    );
+    const targetByCategory = new Map<StatusCategory, StatusId>();
+    for (const st of targetStatuses) {
+      if (!targetByCategory.has(st.category)) {
+        targetByCategory.set(st.category, st.id);
+      }
+    }
+    const defaultTargetStatusId = targetStatuses[0]?.id ?? null;
+
+    const groupedByNextStatus = new Map<StatusId | null, TaskPublicId[]>();
+    for (const desc of movingDescendants) {
+      if (desc.statusId === null) {
+        continue;
+      }
+      const sourceStatus = sourceById.get(desc.statusId);
+      const nextStatusId =
+        (sourceStatus
+          ? targetByCategory.get(sourceStatus.category)
+          : undefined) ?? defaultTargetStatusId;
+      if (nextStatusId === desc.statusId) {
+        continue;
+      }
+      const bucket = groupedByNextStatus.get(nextStatusId) ?? [];
+      bucket.push(desc.id);
+      groupedByNextStatus.set(nextStatusId, bucket);
+    }
+
+    for (const [nextStatusId, ids] of groupedByNextStatus) {
+      await repos.tasks.updateStatusForTaskIds(ids, nextStatusId, nowIso);
+    }
+  }
+
   async function assignMissingKeysForSubtreeInTx(
     repos: TransactionRepositories,
     rootTask: TaskRecord,
+    movingInheritedDescendants: readonly TaskRecord[],
     targetProject: ProjectRecord,
     nowIso: string,
   ): Promise<void> {
@@ -563,12 +656,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       return;
     }
 
-    const inheritedSubtasks = await collectDescendantsInTx(
-      repos,
-      [rootTask.id],
-      (child) => child.projectId === null,
-    );
-    const subtreeTasks = [rootTask, ...inheritedSubtasks];
+    const subtreeTasks = [rootTask, ...movingInheritedDescendants];
     const existingKeys = await repos.issueKeys.findByTaskIds(
       subtreeTasks.map((t) => t.id),
     );
@@ -1415,16 +1503,17 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         }
 
         let resolvedStatusId: StatusId | null | undefined = patch.statusId;
+        let prefetchedTargetStatuses: ProjectStatusRecord[] | undefined;
         if (patch.statusId !== undefined && patch.statusId !== null) {
           const status = await repos.statuses.findById(patch.statusId);
           if (!status || status.projectId !== targetProject.id) {
             return fail(400, "VALIDATION_ERROR", "error.validation");
           }
         } else if (isMovingProject && patch.statusId === undefined) {
-          const targetStatuses = await repos.statuses.listByProject(
+          prefetchedTargetStatuses = await repos.statuses.listByProject(
             targetProject.id,
           );
-          resolvedStatusId = targetStatuses[0]?.id ?? null;
+          resolvedStatusId = prefetchedTargetStatuses[0]?.id ?? null;
         }
 
         if (patch.assigneeId !== undefined && patch.assigneeId !== null) {
@@ -1463,9 +1552,27 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         }
 
         if (isMovingProject) {
+          const { movingInheritedDescendants, detachChildIds } =
+            await partitionMovingSubtreeInTx(
+              repos,
+              existing.id,
+              targetProject.id,
+            );
+          if (detachChildIds.length > 0) {
+            await repos.tasks.clearParentTaskIds(detachChildIds, nowIso);
+          }
+          await remapMovingSubtreeStatusesInTx(
+            repos,
+            movingInheritedDescendants,
+            sourceProject.id,
+            targetProject.id,
+            prefetchedTargetStatuses,
+            nowIso,
+          );
           await assignMissingKeysForSubtreeInTx(
             repos,
             updated,
+            movingInheritedDescendants,
             targetProject,
             nowIso,
           );
@@ -1686,14 +1793,6 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           }
         }
 
-        const candidateLimit = Math.min(limit * 3, 300);
-        const textCandidates = await repos.tasks.searchInWorkspace({
-          workspaceId,
-          allowedProjectIds,
-          query: trimmedQuery,
-          limit: candidateLimit,
-        });
-
         const selected: Array<{
           task: TaskRecord;
           effectiveProjectId: ProjectId;
@@ -1705,31 +1804,57 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           seenTaskIds.add(exactEntry.task.id);
         }
 
-        for (const candidate of textCandidates) {
-          if (selected.length >= limit) {
+        const pageSize = Math.min(Math.max(limit * 4, 50), 200);
+        let cursor: { updatedAt: string; id: TaskPublicId } | undefined;
+        const resolvedProjectCache = new Map<TaskPublicId, ProjectRecord | null>();
+
+        while (selected.length < limit) {
+          const textCandidates = await repos.tasks.searchInWorkspace({
+            workspaceId,
+            allowedProjectIds,
+            query: trimmedQuery,
+            limit: pageSize,
+            ...(cursor ? { before: cursor } : {}),
+          });
+          if (textCandidates.length === 0) {
             break;
           }
-          if (seenTaskIds.has(candidate.id)) {
-            continue;
-          }
-          let effectiveProject: ProjectRecord | undefined;
-          if (candidate.projectId) {
-            effectiveProject = allowedProjectMap.get(candidate.projectId);
-          } else {
-            const resolved = await resolveTaskEffectiveProject(repos, candidate);
-            if (resolved) {
-              effectiveProject = allowedProjectMap.get(resolved.project.id);
+
+          for (const candidate of textCandidates) {
+            if (selected.length >= limit) {
+              break;
             }
+            if (seenTaskIds.has(candidate.id)) {
+              continue;
+            }
+            seenTaskIds.add(candidate.id);
+            let effectiveProject: ProjectRecord | null = null;
+            if (candidate.projectId) {
+              effectiveProject = allowedProjectMap.get(candidate.projectId) ?? null;
+            } else if (resolvedProjectCache.has(candidate.id)) {
+              effectiveProject = resolvedProjectCache.get(candidate.id) ?? null;
+            } else {
+              const resolved = await resolveTaskEffectiveProject(repos, candidate);
+              effectiveProject = resolved
+                ? (allowedProjectMap.get(resolved.project.id) ?? null)
+                : null;
+              resolvedProjectCache.set(candidate.id, effectiveProject);
+            }
+            if (!effectiveProject) {
+              continue;
+            }
+            selected.push({
+              task: candidate,
+              effectiveProjectId: effectiveProject.id,
+              matchKind: "text",
+            });
           }
-          if (!effectiveProject) {
-            continue;
+
+          if (textCandidates.length < pageSize) {
+            break;
           }
-          seenTaskIds.add(candidate.id);
-          selected.push({
-            task: candidate,
-            effectiveProjectId: effectiveProject.id,
-            matchKind: "text",
-          });
+          const last = textCandidates[textCandidates.length - 1]!;
+          cursor = { updatedAt: last.updatedAt, id: last.id };
         }
 
         const issueKeysByTaskId = await repos.issueKeys.findByTaskIds(

@@ -165,6 +165,8 @@ describe("@prood/server Web-Standard app", () => {
             listSubtasksByParentIds: async () => [],
             searchInWorkspace: async () => [],
             update: async () => null,
+            clearParentTaskIds: async () => {},
+            updateStatusForTaskIds: async () => {},
             deleteById: async () => false,
           },
           issueKeys: {

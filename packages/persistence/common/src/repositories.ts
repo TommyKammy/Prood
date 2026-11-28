@@ -1009,6 +1009,7 @@ export function createKyselyRepositories(
       allowedProjectIds: readonly ProjectId[];
       query: string;
       limit: number;
+      before?: { updatedAt: string; id: TaskPublicId };
     }): Promise<TaskRecord[]> {
       const uniqueProjectIds = Array.from(new Set(input.allowedProjectIds));
       if (uniqueProjectIds.length === 0 || input.limit <= 0) {
@@ -1046,6 +1047,18 @@ export function createKyselyRepositories(
                 eb.or([
                   sql<boolean>`lower(${eb.ref("title")}) LIKE ${escapedPattern} ESCAPE '\\'`,
                   sql<boolean>`lower(${eb.ref("description")}) LIKE ${escapedPattern} ESCAPE '\\'`,
+                ]),
+              );
+            }
+            if (input.before) {
+              const { updatedAt, id } = input.before;
+              queryBuilder = queryBuilder.where((eb) =>
+                eb.or([
+                  eb("updated_at", "<", updatedAt),
+                  eb.and([
+                    eb("updated_at", "=", updatedAt),
+                    eb("id", "<", id),
+                  ]),
                 ]),
               );
             }
@@ -1124,6 +1137,47 @@ export function createKyselyRepositories(
         assertActive,
       );
       return row ? toTaskRecord(row) : null;
+    },
+
+    async clearParentTaskIds(
+      taskIds: readonly TaskPublicId[],
+      updatedAt: string,
+    ): Promise<void> {
+      const uniqueIds = Array.from(new Set(taskIds));
+      for (let i = 0; i < uniqueIds.length; i += IN_CLAUSE_BATCH_SIZE) {
+        const chunk = uniqueIds.slice(i, i + IN_CLAUSE_BATCH_SIZE);
+        await runQuery(
+          () =>
+            executor
+              .updateTable("tasks")
+              .set({ parent_task_id: null, updated_at: updatedAt })
+              .where("id", "in", chunk)
+              .execute(),
+          mapError,
+          assertActive,
+        );
+      }
+    },
+
+    async updateStatusForTaskIds(
+      taskIds: readonly TaskPublicId[],
+      statusId: StatusId | null,
+      updatedAt: string,
+    ): Promise<void> {
+      const uniqueIds = Array.from(new Set(taskIds));
+      for (let i = 0; i < uniqueIds.length; i += IN_CLAUSE_BATCH_SIZE) {
+        const chunk = uniqueIds.slice(i, i + IN_CLAUSE_BATCH_SIZE);
+        await runQuery(
+          () =>
+            executor
+              .updateTable("tasks")
+              .set({ status_id: statusId, updated_at: updatedAt })
+              .where("id", "in", chunk)
+              .execute(),
+          mapError,
+          assertActive,
+        );
+      }
     },
 
     async deleteById(id: TaskPublicId): Promise<boolean> {

@@ -385,8 +385,18 @@ export interface TaskRepository {
     allowedProjectIds: readonly ProjectId[];
     query: string;
     limit: number;
+    before?: { updatedAt: string; id: TaskPublicId };
   }): Promise<TaskRecord[]>;
   update(id: TaskPublicId, input: UpdateTaskInput): Promise<TaskRecord | null>;
+  clearParentTaskIds(
+    taskIds: readonly TaskPublicId[],
+    updatedAt: string,
+  ): Promise<void>;
+  updateStatusForTaskIds(
+    taskIds: readonly TaskPublicId[],
+    statusId: StatusId | null,
+    updatedAt: string,
+  ): Promise<void>;
   deleteById(id: TaskPublicId): Promise<boolean>;
 }
 
