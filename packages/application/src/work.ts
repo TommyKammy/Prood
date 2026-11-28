@@ -1,6 +1,7 @@
 import {
   routeTaskEvent,
-  parseRule,
+  parseRule, matchesTrigger,
+  type Delivery, type EffectReceipt,
   type RuleDefinition,
   type Subscription,
   type TaskField,
@@ -113,7 +114,7 @@ function fail<T>(
   status: 400 | 401 | 403 | 404 | 409,
   code: ApiErrorCode,
   messageKey: string,
-): WorkUseCaseResult<T> {
+): Extract<WorkUseCaseResult<T>, { ok:false }> {
   return { ok: false, status, code, messageKey };
 }
 
@@ -285,6 +286,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       payload: Record<string, unknown>;
     },
     manualSubscription?: Subscription,
+    cause?: Delivery,
   ): Promise<OutboxEventRecord> {
     const nowIso = deps.clock.now().toISOString();
     const event = await repos.outbox.append({
@@ -312,7 +314,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       },
       occurredAt: nowIso,
     });
-    await routeTaskEvent(repos, event, manualSubscription);
+    await routeTaskEvent(repos, event, manualSubscription, cause);
     return event;
   }
 
@@ -1184,6 +1186,92 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
     return { task, issueKey: issueKeyView };
   }
 
+  async function evaluate(repos: TransactionRepositories, d: Delivery, draft?: Subscription) {
+    await repos.projects.lockForTaskWrite(d.project);
+    const p = d.proposal;
+    const task = await repos.tasks.findById(p.task, true);
+    const resolved = task && (await resolveTaskEffectiveProject(repos, task));
+    const sub =
+      draft ?? (await repos.automation.rules(d.project)).find((r) => r.rule === d.rule);
+    const field = p.definition.action.field;
+    const ref = p.definition.action.value;
+    const value = ref !== null && typeof ref === "object" ? p.fields[ref.event] : ref;
+    const authorized = !!(
+      task &&
+      resolved &&
+      task.workspaceId === d.organization &&
+      resolved.project.id === d.project &&
+      sub?.enabled &&
+      sub.delegation === p.delegation &&
+      sub.actor === p.delegate &&
+      canWriteProjectTasks(
+        await resolveActorProjectRole(repos, p.delegate, resolved.project),
+      ) &&
+      (await visibleFilters(repos, resolved.project, p.definition)) &&
+      (await allowedValue(repos, resolved.project, field, value))
+    );
+    const status = !authorized
+      ? "denied"
+      : task!.version !== p.version ||
+          (p.definition.ifUnassigned && task!.assigneeId !== null)
+        ? "skipped"
+        : "prepared";
+    return { status, field, value, authorized, task, resolved };
+  }
+
+  async function change(
+    repos: TransactionRepositories,
+    d: Delivery,
+    task: TaskRecord,
+    field: TaskField,
+    value: string | null,
+    run: string,
+    undo: boolean,
+  ) {
+    const updated = await repos.tasks.update(task.id, {
+      ...(field === "assigneeId"
+        ? { assigneeId: value as UserId | null }
+        : { statusId: value as StatusId | null }),
+      updatedAt: deps.clock.now().toISOString(),
+    });
+    if (!updated) throw Error("Task disappeared during operation");
+    await appendOutbox(
+      repos,
+      {
+        workspaceId: d.organization,
+        projectId: d.project,
+        eventType: "task.updated",
+        action: "task.update",
+        outcome: "succeeded",
+        actor: {
+          actorType: "user",
+          userId: d.proposal.delegate,
+          channel: "automation",
+          parentRun: run,
+        },
+        targetType: "task",
+        targetId: task.id,
+        reasonCode: null,
+        payload: {
+          taskId: task.id,
+          projectId: d.project,
+          taskVersion: updated.version,
+          before: { statusId: task.statusId, assigneeId: task.assigneeId },
+          after: { statusId: updated.statusId, assigneeId: updated.assigneeId },
+          changes: { [field]: value },
+          rule: d.rule,
+          revision: d.revision,
+          run,
+          origin: d.proposal.origin,
+          compensation: undo,
+        },
+      },
+      undefined,
+      d,
+    );
+    return updated.version;
+  }
+
   async function searchWorkspaceInTx(
     repos: TransactionRepositories,
     actor: AuditActorContext,
@@ -1822,7 +1910,6 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
 
     throw new Error("Idempotency race retry budget exceeded");
   }
-
   return {
     async manageAutomation(
       actor: AuditActorContext,
@@ -1957,23 +2044,27 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           (r) => r.rule === rule && r.enabled && r.definition.when === "manual",
         );
         if (!sub) return fail(404, "NOT_FOUND", "error.notFound");
-        const e = await appendOutbox(repos, {
-          workspaceId: task.workspaceId,
-          projectId,
-          eventType: "task.manual",
-          action: "automation.start",
-          outcome: "succeeded",
-          actor,
-          targetType: "task",
-          targetId: id,
-          reasonCode: null,
-          payload: {
-            rule,
-            taskVersion: task.version,
-            statusId: task.statusId,
-            assigneeId: task.assigneeId,
+        const e = await appendOutbox(
+          repos,
+          {
+            workspaceId: task.workspaceId,
+            projectId,
+            eventType: "task.manual",
+            action: "automation.start",
+            outcome: "succeeded",
+            actor,
+            targetType: "task",
+            targetId: id,
+            reasonCode: null,
+            payload: {
+              rule,
+              taskVersion: task.version,
+              statusId: task.statusId,
+              assigneeId: task.assigneeId,
+            },
           },
-        }, sub);
+          sub,
+        );
         return { ok: true, data: { event: e.eventId } };
       });
     },
@@ -1991,34 +2082,8 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         const d = await repos.automation.intent(workspace, event, rule);
         if (!d || d.project !== projectId || d.revision !== revision)
           return { status: "denied" } as const;
-        await repos.projects.lockForTaskWrite(d.project);
+        const { status, field, value, authorized } = await evaluate(repos, d);
         const p = d.proposal;
-        const task = await repos.tasks.findById(p.task, true);
-        const resolved = task && (await resolveTaskEffectiveProject(repos, task));
-        const sub = (await repos.automation.rules(d.project)).find((r) => r.rule === rule);
-        const field = p.definition.action.field;
-        const ref = p.definition.action.value;
-        const value = ref !== null && typeof ref === "object" ? p.fields[ref.event] : ref;
-        const authorized = !!(
-          task &&
-          resolved &&
-          task.workspaceId === workspace &&
-          resolved.project.id === d.project &&
-          sub?.enabled &&
-          sub.delegation === p.delegation &&
-          sub.actor === p.delegate &&
-          canWriteProjectTasks(
-            await resolveActorProjectRole(repos, p.delegate, resolved.project),
-          ) &&
-          (await visibleFilters(repos, resolved.project, p.definition)) &&
-          (await allowedValue(repos, resolved.project, field, value))
-        );
-        const status = !authorized
-          ? "denied"
-          : task!.version !== p.version ||
-              (p.definition.ifUnassigned && task!.assigneeId !== null)
-            ? "skipped"
-            : "prepared";
         if (await repos.automation.firstCheck(d, run, status))
           await appendOutbox(repos, {
             workspaceId: workspace,
@@ -2043,6 +2108,421 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         return status === "prepared"
           ? ({ status, field, value } as const)
           : ({ status } as const);
+      });
+    },
+
+    async executeAutomation(
+      workspace: WorkspaceId,
+      event: string,
+      rule: string,
+      run: string,
+      projectId: ProjectId,
+      revision: number,
+      probe = false,
+      canStart: () => boolean = () => true,
+    ) {
+      return deps.uow.run(async (repos) => {
+        await repos.automation.lockOperation(workspace, run);
+        const d = await repos.automation.intent(workspace, event, rule);
+        if (!d || d.project !== projectId || d.revision !== revision)
+          return { status: "conflict" } as const;
+        const { task, resolved, authorized, field, value, status } = await evaluate(repos, d);
+        const def = d.proposal.definition;
+        const input = JSON.stringify([
+          workspace,
+          projectId,
+          event,
+          rule,
+          revision,
+          d.proposal.task,
+          d.proposal.version,
+          d.proposal.delegate,
+          d.proposal.delegation,
+          field,
+          value,
+          def.apply === true,
+          def.reversible === true,
+          def.ifUnassigned === true,
+        ]);
+        const prior = await repos.automation.receipt(workspace, run);
+        if (prior) {
+          if (prior.input !== input) return { status: "conflict" } as const;
+          if (
+            !resolved ||
+            resolved.project.id !== projectId ||
+            !canReadProject(
+              await resolveActorProjectRole(repos, d.proposal.delegate, resolved.project),
+            )
+          )
+            return { status: "denied" } as const;
+          return { status: prior.status };
+        }
+        if (!def.apply) return { status } as { status: "prepared" | "skipped" | "denied" };
+        const known =
+          (await repos.automation.confirmed(workspace, event, rule)) ??
+          (await repos.automation.operationRun(event, rule));
+        if (known && known !== run) return { status: "conflict" } as const;
+        if (!canStart()) return { status: "canceled" } as const;
+        if (probe) {
+          if (await repos.automation.firstCheck(d, run, "review"))
+            await appendOutbox(repos, {
+              workspaceId: workspace,
+              projectId,
+              eventType: "automation.review",
+              action: "automation.lookup",
+              outcome: "succeeded",
+              actor: {
+                userId: d.proposal.delegate,
+                actorType: "user",
+                channel: "automation",
+              },
+              targetType: "task",
+              targetId: d.proposal.task,
+              reasonCode: "receipt-unconfirmed",
+              payload: { rule, run, revision, cause: event, origin: d.proposal.origin },
+            });
+          return { status: "review" } as const;
+        }
+        const outcome =
+          !authorized || !task
+            ? "denied"
+            : status === "skipped" || task[field] === value
+              ? "skipped"
+              : "applied";
+        const version =
+          outcome === "applied"
+            ? await change(repos, d, task!, field, value, run, false)
+            : (task?.version ?? 0);
+        const receipt: EffectReceipt = {
+          input,
+          workspace,
+          project: projectId,
+          run,
+          event,
+          rule,
+          revision,
+          task: d.proposal.task,
+          field,
+          before: authorized ? task![field] : null,
+          after: authorized ? value : null,
+          version,
+          status: outcome,
+          decision: null,
+          reason:
+            outcome === "denied"
+              ? "permission"
+              : status === "skipped"
+                ? "stale-or-condition"
+                : outcome === "skipped"
+                  ? "unchanged"
+                  : "applied",
+        };
+        await repos.automation.record(receipt);
+        await appendOutbox(repos, {
+          workspaceId: workspace,
+          projectId,
+          eventType: "automation." + outcome,
+          action: "automation.execute",
+          outcome: outcome === "denied" ? "denied" : "succeeded",
+          actor: { userId: d.proposal.delegate, actorType: "user", channel: "automation" },
+          targetType: "task",
+          targetId: d.proposal.task,
+          reasonCode: receipt.reason,
+          payload: { rule, run, revision, cause: event, origin: d.proposal.origin },
+        });
+        return { status: outcome };
+      });
+    },
+
+    async automationOptions(actor: AuditActorContext, projectId: ProjectId) {
+      return deps.uow.run(async (repos) => {
+        const project = await repos.projects.findById(projectId);
+        const role = project && (await resolveActorProjectRole(repos, actor.userId, project));
+        if (!project || !canReadProject(role))
+          return fail(404, "NOT_FOUND", "error.notFound");
+        const members = [];
+        for (const u of await repos.automation.members(project.workspaceId))
+          if (canReadProject(await resolveActorProjectRole(repos, u.id, project)))
+            members.push(u);
+        const rules = (await repos.automation.rules(projectId)).map((r) => ({
+          rule: r.rule,
+          revision: r.revision,
+          enabled: r.enabled,
+        }));
+        return {
+          ok: true as const,
+          data: {
+            project: project.name,
+            manage: canManageProject(role),
+            members,
+            rules,
+            statuses: (await repos.statuses.listByProject(projectId)).map((s) => ({
+              id: s.id,
+              name: s.name,
+            })),
+            tasks: (await collectProjectTasksInTx(repos, projectId)).map((t) => ({
+              id: t.id,
+              name: t.title,
+            })),
+          },
+        };
+      });
+    },
+    async simulateAutomation(
+      actor: AuditActorContext,
+      projectId: ProjectId,
+      rule: string,
+      id: TaskPublicId,
+      input: unknown,
+    ) {
+      return deps.uow.run(async (repos) => {
+        if (!(await repos.projects.lockForTaskWrite(projectId)))
+          return fail(404, "NOT_FOUND", "error.notFound");
+        const task = await repos.tasks.findById(id, true),
+          pr = task && (await resolveTaskEffectiveProject(repos, task))?.project;
+        if (
+          !task ||
+          !pr ||
+          pr.id !== projectId ||
+          !actor.userId ||
+          !canManageProject(await resolveActorProjectRole(repos, actor.userId, pr))
+        )
+          return fail(404, "NOT_FOUND", "error.notFound");
+        const def = parseRule(input);
+        if (!def || !(await validCandidates(repos, pr, def)))
+          return fail(400, "VALIDATION_ERROR", "error.validation");
+        const fields = { statusId: task.statusId, assigneeId: task.assigneeId };
+        const sample =
+          def.when === "manual"
+            ? {
+                eventType: "task.manual",
+                payload: { rule, ...fields, taskVersion: task.version },
+              }
+            : (
+                await repos.automation.events(
+                  projectId,
+                  id,
+                  undefined,
+                  def.when === "task.created" ? "task.created" : "task.updated",
+                )
+              )[0];
+        if (!sample || !matchesTrigger(def, rule, sample.eventType, sample.payload))
+          return {
+            ok: true as const,
+            data: {
+              task: task.title,
+              field: def.action.field,
+              before: task[def.action.field],
+              after: task[def.action.field],
+              status: "skipped",
+              reason: "trigger-or-condition",
+            },
+          };
+        const sub: Subscription = {
+          project: projectId,
+          rule,
+          enabled: true,
+          revision: 1,
+          delegation: 1,
+          actor: actor.userId,
+          definition: def,
+        };
+        const sampleFields = (("after" in sample.payload ? sample.payload.after : null) ??
+          sample.payload) as typeof fields;
+        const proposal = {
+          task: id,
+          version: Number(sample.payload.taskVersion),
+          fields: sampleFields,
+          origin: actor.userId,
+          delegate: actor.userId,
+          delegation: 1,
+          definition: def,
+          ancestry: [],
+          cause: null,
+        };
+        const result = await evaluate(
+          repos,
+          {
+            organization: pr.workspaceId,
+            project: projectId,
+            event: "sample",
+            rule,
+            revision: 1,
+            proposal,
+          },
+          sub,
+        );
+        const field = result.field;
+        if (!result.authorized)
+          return {
+            ok: true as const,
+            data: { task: task.title, status: "denied", reason: "permission" },
+          };
+        const before = task[field],
+          after = result.value;
+        return {
+          ok: true as const,
+          data: {
+            task: task.title,
+            field,
+            before,
+            after: result.status === "prepared" ? after : before,
+            status:
+              result.status === "prepared" && before === after ? "skipped" : result.status,
+            reason:
+              result.status === "skipped"
+                ? "stale-or-condition"
+                : before === after
+                  ? "unchanged"
+                  : "eligible",
+          },
+        };
+      });
+    },
+    async automationHistory(
+      actor: AuditActorContext,
+      projectId: ProjectId,
+      taskId?: TaskPublicId,
+      rule?: string,
+    ) {
+      return deps.uow.run(async (repos) => {
+        const pr = await repos.projects.findById(projectId);
+        const role = pr && (await resolveActorProjectRole(repos, actor.userId, pr));
+        if (!pr || !canReadProject(role)) return fail(404, "NOT_FOUND", "error.notFound");
+        const entries = [];
+        for (const e of await repos.automation.events(projectId, taskId, rule)) {
+          if (e.targetType === "task") {
+            const t = await repos.tasks.findById(e.targetId as TaskPublicId);
+            if (!t || (await resolveTaskEffectiveProject(repos, t))?.project.id !== projectId)
+              continue;
+          }
+          const run = typeof e.payload.run === "string" ? e.payload.run : null;
+          const receipt = run && (await repos.automation.receipt(pr.workspaceId, run));
+          let actions: string[] = [];
+          if (
+            canManageProject(role) &&
+            receipt &&
+            receipt.status === "applied" &&
+            !receipt.decision &&
+            e.eventType === "automation.applied"
+          ) {
+            const d = await repos.automation.intent(
+              pr.workspaceId,
+              receipt.event,
+              receipt.rule,
+            );
+            if (d) {
+              const current = await evaluate(repos, d);
+              if (current.authorized) {
+                actions = ["keep"];
+                if (
+                  d.proposal.definition.reversible &&
+                  current.task?.version === receipt.version &&
+                  (await allowedValue(repos, pr, receipt.field, receipt.before))
+                )
+                  actions.push("undo");
+              }
+            }
+          }
+          entries.push({
+            event: e.eventType,
+            task: e.targetType === "task" ? e.targetId : null,
+            rule: e.payload.rule ?? (e.targetType === "rule" ? e.targetId : null),
+            revision: e.payload.revision ?? null,
+            at: e.occurredAt,
+            channel: e.channel,
+            actor: e.actorUserId,
+            origin: e.payload.origin ?? null,
+            run,
+            reason: e.reasonCode,
+            decision: receipt ? receipt.decision : null,
+            actions,
+          });
+        }
+        for (const { delivery: d, run, reason, at } of await repos.automation.routed(
+          projectId,
+          taskId,
+          rule,
+        )) {
+          if (!d.proposal.definition.apply || entries.some((e) => run && e.run === run))
+            continue;
+          const task = await repos.tasks.findById(d.proposal.task);
+          if (
+            !task ||
+            (await resolveTaskEffectiveProject(repos, task))?.project.id !== projectId
+          )
+            continue;
+          entries.push({
+            event: reason ? "automation.skipped" : "automation.pending",
+            task: task.id,
+            rule: d.rule,
+            revision: d.revision,
+            at,
+            channel: "automation",
+            actor: d.proposal.delegate,
+            origin: d.proposal.origin,
+            run,
+            reason: reason ?? "pending",
+            decision: null,
+            actions: [],
+          });
+        }
+        entries.sort((a, b) => b.at.localeCompare(a.at));
+        return { ok: true as const, data: { entries } };
+      });
+    },
+
+    async decideAutomation(
+      actor: AuditActorContext,
+      project: ProjectId,
+      rule: string,
+      run: string,
+      decision: "keep" | "undo",
+    ) {
+      return deps.uow.run(async (repos) => {
+        const pr = await repos.projects.findById(project);
+        if (!pr || !canManageProject(await resolveActorProjectRole(repos, actor.userId, pr)))
+          return fail(404, "NOT_FOUND", "error.notFound");
+        const effect = await repos.automation.receipt(pr.workspaceId, run);
+        if (
+          !effect ||
+          effect.project !== project ||
+          effect.rule !== rule ||
+          effect.status !== "applied"
+        )
+          return fail(404, "NOT_FOUND", "error.notFound");
+        const d = await repos.automation.intent(pr.workspaceId, effect.event, rule);
+        if (!d) return fail(404, "NOT_FOUND", "error.notFound");
+        const { task, authorized } = await evaluate(repos, d);
+        if (!authorized || !task) return fail(403, "FORBIDDEN", "error.forbidden");
+        const current = await repos.automation.receipt(pr.workspaceId, run);
+        if (current?.decision === decision) return { ok: true as const, data: { decision } };
+        if (
+          current?.decision ||
+          (decision === "undo" &&
+            (!d.proposal.definition.reversible ||
+              task.version !== effect.version ||
+              task[effect.field] !== effect.after ||
+              !(await allowedValue(repos, pr, effect.field, effect.before))))
+        )
+          return fail(409, "CONFLICT", "error.conflict");
+        if (!(await repos.automation.decide(pr.workspaceId, run, decision)))
+          return fail(409, "CONFLICT", "error.conflict");
+        if (decision === "undo")
+          await change(repos, d, task, effect.field, effect.before, run, true);
+        await appendOutbox(repos, {
+          workspaceId: pr.workspaceId,
+          projectId: project,
+          eventType: "automation." + decision,
+          action: "automation.decide",
+          outcome: "succeeded",
+          actor,
+          targetType: "task",
+          targetId: task.id,
+          reasonCode: null,
+          payload: { rule, run, revision: d.revision, decision },
+        });
+        return { ok: true as const, data: { decision } };
       });
     },
 
@@ -3172,8 +3652,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       }
       if (
         input.projectId !== undefined &&
-        (typeof input.projectId !== "string" ||
-          !isValidEntityId("prj", input.projectId))
+        (typeof input.projectId !== "string" || !isValidEntityId("prj", input.projectId))
       ) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
@@ -3302,11 +3781,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           targetProject = requestedTarget;
         }
 
-        const targetRole = await resolveActorProjectRole(
-          repos,
-          actor.userId,
-          targetProject,
-        );
+        const targetRole = await resolveActorProjectRole(repos, actor.userId, targetProject);
         if (!canReadProject(targetRole)) {
           await appendOutbox(repos, {
             workspaceId: targetProject.workspaceId,
@@ -3352,9 +3827,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         }
 
         const storedProjectId =
-          parentTaskId && input.inheritParentProject !== false
-            ? null
-            : targetProject.id;
+          parentTaskId && input.inheritParentProject !== false ? null : targetProject.id;
 
         if (storedProjectId === null && parentDepth + 1 >= MAX_PARENT_HOPS) {
           return fail(400, "VALIDATION_ERROR", "error.validation");
@@ -3374,8 +3847,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           storedProjectId,
           parentTaskId,
           statusId: resolvedStatusId,
-          title:
-            typeof input.title === "string" ? input.title.trim() : sourceTask.title,
+          title: typeof input.title === "string" ? input.title.trim() : sourceTask.title,
           description: sourceTask.description,
           assigneeId: sourceTask.assigneeId,
           dueOn: sourceTask.dueOn,
@@ -3513,10 +3985,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           return fail(404, "NOT_FOUND", "error.notFound");
         }
         const membership = actor.userId
-          ? await repos.memberships.findByWorkspaceAndUser(
-              workspaceId,
-              actor.userId,
-            )
+          ? await repos.memberships.findByWorkspaceAndUser(workspaceId, actor.userId)
           : null;
         if (!membership) {
           await appendOutbox(repos, {
@@ -3539,11 +4008,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           ok: true,
           data: {
             contractVersion: CONTRACT_VERSION,
-            settings: toWorkspaceSettingsDto(
-              workspaceId,
-              record,
-              workspace.updatedAt,
-            ),
+            settings: toWorkspaceSettingsDto(workspaceId, record, workspace.updatedAt),
           },
         };
       });
@@ -3567,8 +4032,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       }
       if (
         hasLocale &&
-        (typeof input.defaultLocale !== "string" ||
-          input.defaultLocale.trim() === "")
+        (typeof input.defaultLocale !== "string" || input.defaultLocale.trim() === "")
       ) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
@@ -3579,10 +4043,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           return fail(404, "NOT_FOUND", "error.notFound");
         }
         const membership = actor.userId
-          ? await repos.memberships.findByWorkspaceAndUser(
-              workspaceId,
-              actor.userId,
-            )
+          ? await repos.memberships.findByWorkspaceAndUser(workspaceId, actor.userId)
           : null;
         if (!membership || membership.role !== "admin") {
           await appendOutbox(repos, {
@@ -3606,9 +4067,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           ...(hasLocale
             ? { defaultLocale: (input.defaultLocale as string).trim() as LocaleCode }
             : {}),
-          ...(hasEnabled
-            ? { devProjectsEnabled: input.devProjectsEnabled as boolean }
-            : {}),
+          ...(hasEnabled ? { devProjectsEnabled: input.devProjectsEnabled as boolean } : {}),
           updatedAt: nowIso,
         });
 
@@ -3669,9 +4128,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           project.workspaceId,
         );
         const statuses = await repos.statuses.listByProject(project.id);
-        const namespace = await repos.issueKeys.findNamespaceByProjectId(
-          project.id,
-        );
+        const namespace = await repos.issueKeys.findNamespaceByProjectId(project.id);
         const prefixes = namespace
           ? await repos.issueKeys.listPrefixesByNamespace(namespace.id)
           : [];
@@ -3768,9 +4225,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           return fail(403, "FORBIDDEN", "error.devProjectsDisabled");
         }
 
-        const existingNamespace = await repos.issueKeys.findNamespaceByProjectId(
-          project.id,
-        );
+        const existingNamespace = await repos.issueKeys.findNamespaceByProjectId(project.id);
         if (existingNamespace) {
           return fail(409, "CONFLICT", "error.devProjectAlreadyEnabled");
         }
@@ -3779,9 +4234,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         let resolvedStartStatusId: StatusId | null = null;
         if (input.startStatusId !== undefined) {
           if (input.startStatusId !== null) {
-            const matched = projectStatuses.find(
-              (s) => s.id === input.startStatusId,
-            );
+            const matched = projectStatuses.find((s) => s.id === input.startStatusId);
             if (!matched) {
               return fail(400, "VALIDATION_ERROR", "error.validation");
             }
@@ -3789,8 +4242,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           }
         } else {
           resolvedStartStatusId =
-            projectStatuses.find((s) => s.category === "in_progress")?.id ??
-            null;
+            projectStatuses.find((s) => s.category === "in_progress")?.id ?? null;
         }
 
         const prefixOwner = await repos.issueKeys.findPrefixOwner(
@@ -3977,17 +4429,16 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           return fail(403, "FORBIDDEN", "error.devProjectsDisabled");
         }
 
-        const currentNamespace =
-          await repos.issueKeys.findNamespaceByProjectIdForUpdate(project.id);
+        const currentNamespace = await repos.issueKeys.findNamespaceByProjectIdForUpdate(
+          project.id,
+        );
         if (!currentNamespace) {
           return fail(409, "CONFLICT", "error.devProjectNotEnabled");
         }
 
         const projectStatuses = await repos.statuses.listByProject(project.id);
         if (hasStart && input.startStatusId !== null) {
-          const matched = projectStatuses.find(
-            (s) => s.id === input.startStatusId,
-          );
+          const matched = projectStatuses.find((s) => s.id === input.startStatusId);
           if (!matched) {
             return fail(400, "VALIDATION_ERROR", "error.validation");
           }
@@ -3995,10 +4446,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
 
         const nowIso = deps.clock.now().toISOString();
         let prefixChanged = false;
-        if (
-          nextPrefix !== undefined &&
-          nextPrefix !== currentNamespace.currentPrefix
-        ) {
+        if (nextPrefix !== undefined && nextPrefix !== currentNamespace.currentPrefix) {
           const owner = await repos.issueKeys.findPrefixOwner(
             project.workspaceId,
             nextPrefix,
@@ -4022,14 +4470,11 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           prefixChanged = true;
         }
 
-        const updatedNamespace = await repos.issueKeys.updateNamespace(
-          currentNamespace.id,
-          {
-            ...(prefixChanged ? { currentPrefix: nextPrefix } : {}),
-            ...(hasStart ? { startStatusId: input.startStatusId ?? null } : {}),
-            updatedAt: nowIso,
-          },
-        );
+        const updatedNamespace = await repos.issueKeys.updateNamespace(currentNamespace.id, {
+          ...(prefixChanged ? { currentPrefix: nextPrefix } : {}),
+          ...(hasStart ? { startStatusId: input.startStatusId ?? null } : {}),
+          updatedAt: nowIso,
+        });
         if (!updatedNamespace) {
           return fail(404, "NOT_FOUND", "error.notFound");
         }

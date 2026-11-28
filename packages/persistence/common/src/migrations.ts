@@ -39,3 +39,11 @@ export const automationMigration: MigrationDefinition = {
     "CREATE INDEX automation_pending ON automation_deliveries(workspace,expires,event,rule) WHERE run IS NULL AND reason IS NULL",
   ],
 };
+
+export const effectMigration: MigrationDefinition = {
+  version: 9,
+  name: "0009_automation_operation_receipts",
+  statements: [
+    "CREATE TABLE automation_receipts(workspace TEXT NOT NULL, run TEXT NOT NULL, event TEXT NOT NULL, rule TEXT NOT NULL, result TEXT NOT NULL, decision TEXT, PRIMARY KEY(workspace,run), UNIQUE(event,rule), FOREIGN KEY(event,rule) REFERENCES automation_deliveries(event,rule))",
+  ],
+};

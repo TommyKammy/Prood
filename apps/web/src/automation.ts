@@ -83,7 +83,9 @@ form.onsubmit = async (e) => {
     pending = { url, body };
     panel.hidden = false;
     publish.focus();
-    feedback.textContent = "Review the rule before publishing. Actions are prepared only.";
+    feedback.textContent = result.definition.apply
+      ? "Review the rule before enabling task changes."
+      : "Review the rule before publishing. Actions are prepared only.";
   } catch (error) {
     if (current === generation)
       feedback.textContent = error instanceof Error ? error.message : "Preview failed.";

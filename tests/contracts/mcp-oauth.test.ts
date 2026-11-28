@@ -384,7 +384,7 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
     });
 
     const v4 = await db.migrate();
-    expect(v4).toEqual({ appliedVersions: [4, 5, 6, 7, 8], currentVersion: 8 });
+    expect(v4).toEqual({ appliedVersions: [4, 5, 6, 7, 8, 9], currentVersion: 9 });
 
     const loaded = await db.uow.run(async (repos) => ({
       workspace: await repos.workspaces.findById(wksId),

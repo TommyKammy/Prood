@@ -38,6 +38,7 @@ import {
 } from "@prood/domain";
 
 export interface AppDeps {
+  operatorConsole?: string;
   clock: Clock;
   dbHealth: DatabaseHealthPort;
   locale?: LocaleCode;
@@ -308,6 +309,63 @@ export function createApp(deps: AppDeps): Hono {
       const body = await parseJsonBody<Record<string, unknown>>(c);
       if (!isValidEntityId("prj", project) || !body)
         return c.json(errorBody("VALIDATION_ERROR", "error.validation"), 400);
+      if (
+        body.op === "options" ||
+        body.op === "history" ||
+        body.op === "simulate" ||
+        body.op === "keep" ||
+        body.op === "undo"
+      ) {
+        if (
+          body.task !== undefined &&
+          (typeof body.task !== "string" || !isValidEntityId("tsk", body.task))
+        )
+          return c.json(errorBody("VALIDATION_ERROR", "error.validation"), 400);
+        const task =
+          typeof body.task === "string" && isValidEntityId("tsk", body.task)
+            ? body.task
+            : undefined;
+        const response =
+          body.op === "options"
+            ? await workUseCases.automationOptions(actor.actor, project)
+            : body.op === "history"
+              ? await workUseCases.automationHistory(
+                  actor.actor,
+                  project,
+                  task,
+                  task ? undefined : rule,
+                )
+              : body.op === "simulate" && task
+                ? await workUseCases.simulateAutomation(
+                    actor.actor,
+                    project,
+                    rule,
+                    task,
+                    body.definition,
+                  )
+                : (body.op === "undo" || body.op === "keep") && typeof body.run === "string"
+                  ? await workUseCases.decideAutomation(
+                      actor.actor,
+                      project,
+                      rule,
+                      body.run,
+                      body.op,
+                    )
+                  : null;
+        if (!response) return c.json(errorBody("VALIDATION_ERROR", "error.validation"), 400);
+        if (!response.ok)
+          return c.json(errorBody(response.code, response.messageKey), response.status);
+        if (
+          body.op === "options" &&
+          deps.operatorConsole &&
+          response.data &&
+          typeof response.data === "object" &&
+          "manage" in response.data &&
+          response.data.manage
+        )
+          return c.json({ ...response.data, operatorConsole: deps.operatorConsole });
+        return c.json(response.data);
+      }
       const result =
         body.op === "start" &&
         typeof body.task === "string" &&

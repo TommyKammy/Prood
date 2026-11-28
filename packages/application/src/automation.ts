@@ -13,6 +13,8 @@ export interface RuleDefinition {
   from?: string | null;
   to?: string | null;
   ifUnassigned?: boolean;
+  apply?: boolean;
+  reversible?: boolean;
   action: { field: TaskField; value: string | null | { event: TaskField } };
 }
 export interface Subscription {
@@ -43,7 +45,44 @@ export interface Delivery {
   revision: number;
   proposal: Proposal;
 }
+export type EffectStatus = "applied" | "skipped" | "denied";
+export interface EffectReceipt {
+  input: string;
+  workspace: string;
+  project: string;
+  event: string;
+  rule: string;
+  run: string;
+  revision: number;
+  task: TaskPublicId;
+  field: TaskField;
+  before: string | null;
+  after: string | null;
+  version: number;
+  status: EffectStatus;
+  decision: "keep" | "undo" | null;
+  reason: string;
+}
 export interface AutomationRepository {
+  lockOperation(workspace: string, run: string): Promise<void>;
+  routed(
+    project: ProjectId,
+    task?: TaskPublicId,
+    rule?: string,
+  ): Promise<{ delivery: Delivery; run: string | null; reason: string | null; at: string }[]>;
+  members(workspace: WorkspaceId): Promise<{ id: UserId; name: string }[]>;
+  events(
+    project: ProjectId,
+    task?: TaskPublicId,
+    rule?: string,
+    sampleType?: "task.created" | "task.updated",
+  ): Promise<OutboxEventRecord[]>;
+  operationRun(event: string, rule: string): Promise<string | null>;
+  receipt(workspace: string, run: string): Promise<EffectReceipt | null>;
+  record(effect: EffectReceipt): Promise<void>;
+  decide(workspace: string, run: string, decision: "keep" | "undo"): Promise<boolean>;
+  confirmed(workspace: string, event: string, rule: string): Promise<string | null>;
+
   rules(project: ProjectId): Promise<Subscription[]>;
   save(rule: Subscription, expected: number): Promise<boolean>;
   enqueue(d: Delivery, reason: string | null): Promise<void>;
@@ -59,8 +98,38 @@ export interface AutomationRepository {
   lookup(workspace: WorkspaceId, run: string): Promise<Delivery | null>;
 }
 
+export function matchesTrigger(
+  def: RuleDefinition,
+  rule: string,
+  eventType: string,
+  p: Record<string, unknown>,
+) {
+  const before = p.before as Record<TaskField, string | null> | undefined;
+  const after = p.after as Record<TaskField, string | null> | undefined;
+
+  if (def.when === "manual") {
+    if (eventType !== "task.manual" || p.rule !== rule) return false;
+  } else if (def.when === "task.created") {
+    if (eventType !== "task.created") return false;
+  } else {
+    if ((eventType !== "task.updated" && eventType !== "task.started") || !before || !after)
+      return false;
+    const field = def.when === "status.changed" ? "statusId" : "assigneeId";
+    if (
+      before[field] === after[field] ||
+      (def.from !== undefined && def.from !== before[field]) ||
+      (def.to !== undefined && def.to !== after[field])
+    )
+      return false;
+  }
+  if (def.ifUnassigned && (after ? after.assigneeId : p.assigneeId) !== null) return false;
+  return true;
+}
 export async function routeTaskEvent(
-  repos: TransactionRepositories, e: OutboxEventRecord, manualSubscription?: Subscription,
+  repos: TransactionRepositories,
+  e: OutboxEventRecord,
+  manualSubscription?: Subscription,
+  parentDelivery?: Delivery,
 ) {
   if (
     !e.projectId ||
@@ -79,9 +148,11 @@ export async function routeTaskEvent(
   let origin = e.actorUserId;
   if (e.channel === "automation") {
     if (typeof p.parentRun !== "string") throw Error("Missing automation parent");
-    const parent = await repos.automation.lookup(e.workspaceId, p.parentRun);
+    const parent =
+      parentDelivery ?? (await repos.automation.lookup(e.workspaceId, p.parentRun));
     if (
       !parent ||
+      parent.organization !== e.workspaceId ||
       parent.project !== e.projectId ||
       parent.proposal.delegate !== e.actorUserId
     )
@@ -98,21 +169,14 @@ export async function routeTaskEvent(
   for (const r of subscriptions) {
     if (!r.enabled || r.project !== e.projectId) continue;
     const def = r.definition;
-    if (def.when === "manual") {
-      if (e.eventType !== "task.manual" || p.rule !== r.rule) continue;
-    } else if (def.when === "task.created") {
-      if (e.eventType !== "task.created") continue;
-    } else {
-      if ((e.eventType !== "task.updated" && e.eventType !== "task.started") || !before || !after) continue;
-      const field = def.when === "status.changed" ? "statusId" : "assigneeId";
-      if (
-        before[field] === after[field] ||
-        (def.from !== undefined && def.from !== before[field]) ||
-        (def.to !== undefined && def.to !== after[field])
-      )
-        continue;
-    }
-    if (def.ifUnassigned && (after ? after.assigneeId : p.assigneeId) !== null) continue;
+    const matches = matchesTrigger(def, r.rule, e.eventType, p);
+    if (
+      !matches &&
+      (!def.apply ||
+        !def.ifUnassigned ||
+        !matchesTrigger({ ...def, ifUnassigned: false }, r.rule, e.eventType, p))
+    )
+      continue;
     const d: Delivery = {
       organization: e.workspaceId,
       project: e.projectId,
@@ -137,7 +201,10 @@ export async function routeTaskEvent(
         cause,
       },
     };
-    await repos.automation.enqueue(d, ancestry.includes(r.rule) ? "cycle" : null);
+    await repos.automation.enqueue(
+      d,
+      ancestry.includes(r.rule) ? "cycle" : !matches ? "condition" : null,
+    );
   }
 }
 
@@ -152,12 +219,7 @@ export async function deliverNext(
   const token = deps.idGenerator.next("out");
   const now = deps.clock.now();
   const delivery = await deps.uow.run((r) =>
-    r.automation.claim(
-      workspace,
-      token,
-      now.toISOString(),
-      new Date(+now + leaseMs).toISOString(),
-    ),
+    r.automation.claim(workspace, token, now.toISOString(), new Date(+now + leaseMs).toISOString()),
   );
   if (!delivery) return false;
   const run = await accept(delivery);
@@ -178,9 +240,11 @@ function onlyKeys(value: unknown, allowed: string[]): value is Record<string, un
 // Closed vocabulary shared by preview, publication and import. No executable graph is accepted.
 export function parseRule(value: unknown): RuleDefinition | null {
   if (
-    !onlyKeys(value, ["when", "from", "to", "ifUnassigned", "action"]) ||
+    !onlyKeys(value, ["when", "from", "to", "ifUnassigned", "action", "apply", "reversible"]) ||
     typeof value.when !== "string" ||
     !["task.created", "status.changed", "assignee.changed", "manual"].includes(value.when) ||
+    (value.apply !== undefined && typeof value.apply !== "boolean") ||
+    (value.reversible !== undefined && (typeof value.reversible !== "boolean" || !value.apply)) ||
     (value.ifUnassigned !== undefined && typeof value.ifUnassigned !== "boolean") ||
     !onlyKeys(value.action, ["field", "value"]) ||
     typeof value.action.field !== "string" ||

@@ -994,20 +994,31 @@ export class ProodShellElement extends BaseElement {
       "nav",
       { cls: "prood-nav", attrs: { "aria-label": t("aria.mainNavigation") } },
       ...(this.authState === "authenticated" && !isConsent && memberships.length > 0
-        ? (["list", "settings"] as const).map((view) =>
-            el("button", {
-              cls:
-                this.activeView === view
-                  ? "prood-nav-btn is-active"
-                  : "prood-nav-btn",
+        ? [
+            ...(["list", "settings"] as const).map((view) =>
+              el("button", {
+                cls:
+                  this.activeView === view
+                    ? "prood-nav-btn is-active"
+                    : "prood-nav-btn",
+                attrs: {
+                  "data-nav-view": view,
+                  ...(this.activeView === view ? { "aria-current": "page" } : {}),
+                },
+                text: t(`nav.${view}`),
+                on: { click: () => this.switchView(view) },
+              }),
+            ),
+            el("a", {
+              cls: "prood-nav-btn",
               attrs: {
-                "data-nav-view": view,
-                ...(this.activeView === view ? { "aria-current": "page" } : {}),
+                href: this.activeProjectId
+                  ? `/projects/${encodeURIComponent(this.activeProjectId)}/automation`
+                  : `/automation?workspace=${encodeURIComponent(this.activeWorkspaceId ?? "")}`,
               },
-              text: t(`nav.${view}`),
-              on: { click: () => this.switchView(view) },
+              text: "Automation",
             }),
-          )
+          ]
         : (["nav.list", "nav.board", "nav.search"] as const).map((k) =>
             el("span", { cls: "prood-nav-item", text: t(k) }),
           )),

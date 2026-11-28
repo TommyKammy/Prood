@@ -134,15 +134,15 @@ describe(`DB migrations, UnitOfWork, error mapping & concurrency (${targetDb})`,
 
     const first = await db.migrate();
     expect(first).toEqual({
-      appliedVersions: [1, 2, 3, 4, 5, 6, 7, 8],
-      currentVersion: 8,
+      appliedVersions: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+      currentVersion: 9,
     });
     expect(await db.getAppliedMigrationVersions()).toEqual([
-      1, 2, 3, 4, 5, 6, 7, 8,
+      1, 2, 3, 4, 5, 6, 7, 8, 9,
     ]);
 
     const second = await db.migrate();
-    expect(second).toEqual({ appliedVersions: [], currentVersion: 8 });
+    expect(second).toEqual({ appliedVersions: [], currentVersion: 9 });
   });
 
   it("serializes concurrent migrate() calls on a fresh DB without duplicate application", async () => {
@@ -157,14 +157,14 @@ describe(`DB migrations, UnitOfWork, error mapping & concurrency (${targetDb})`,
       (a, b) => a - b,
     );
 
-    expect(allApplied).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
-    expect(resA.currentVersion).toBe(8);
-    expect(resB.currentVersion).toBe(8);
+    expect(allApplied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(resA.currentVersion).toBe(9);
+    expect(resB.currentVersion).toBe(9);
     expect(await clientA.getAppliedMigrationVersions()).toEqual([
-      1, 2, 3, 4, 5, 6, 7, 8,
+      1, 2, 3, 4, 5, 6, 7, 8, 9,
     ]);
     expect(await clientB.getAppliedMigrationVersions()).toEqual([
-      1, 2, 3, 4, 5, 6, 7, 8,
+      1, 2, 3, 4, 5, 6, 7, 8, 9,
     ]);
   });
 
@@ -189,8 +189,8 @@ describe(`DB migrations, UnitOfWork, error mapping & concurrency (${targetDb})`,
 
     const v2Result = await db.migrate();
     expect(v2Result).toEqual({
-      appliedVersions: [2, 3, 4, 5, 6, 7, 8],
-      currentVersion: 8,
+      appliedVersions: [2, 3, 4, 5, 6, 7, 8, 9],
+      currentVersion: 9,
     });
 
     const verify = await db.uow.run(async (repos) => ({

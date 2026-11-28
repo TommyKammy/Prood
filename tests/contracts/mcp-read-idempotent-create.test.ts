@@ -544,7 +544,7 @@ describe(`MCP read tools & idempotent task creation (${targetDb})`, () => {
     };
 
     const upgrade = await db.migrate();
-    expect(upgrade).toEqual({ appliedVersions: [7, 8], currentVersion: 8 });
+    expect(upgrade).toEqual({ appliedVersions: [7, 8, 9], currentVersion: 9 });
 
     const fetched = await work.getTask(actor, "LEG-1", { workspaceId: wksId });
     expect(fetched.ok).toBe(true);

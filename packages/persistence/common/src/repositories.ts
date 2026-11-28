@@ -2101,6 +2101,159 @@ export function createKyselyRepositories(
       );
       return !!row;
     },
+    async routed(project, task, rule) {
+      let query = executor
+        .selectFrom("automation_deliveries as d")
+        .leftJoin("automation_receipts as a", (j) =>
+          j.onRef("a.event", "=", "d.event").onRef("a.rule", "=", "d.rule"),
+        )
+        .select(["d.envelope", "d.reason", "d.run"])
+        .where("d.project", "=", project)
+        .where("a.run", "is", null);
+      if (rule) query = query.where("d.rule", "=", rule);
+      if (task)
+        query = query.where(
+          driver === "postgres"
+            ? sql<string>`d.envelope::jsonb #>> '{proposal,task}'`
+            : sql<string>`json_extract(d.envelope,'$.proposal.task')`,
+          "=",
+          task,
+        );
+      return (
+        await query
+          .innerJoin("outbox_events as e", "e.event_id", "d.event")
+          .select("e.occurred_at as at")
+          .orderBy("e.occurred_at", "desc")
+          .orderBy("d.event", "desc")
+          .limit(100)
+          .execute()
+      ).map((r) => ({ delivery: JSON.parse(r.envelope), run: r.run, reason: r.reason, at: r.at }));
+    },
+    async members(workspace) {
+      const rows = await executor
+        .selectFrom("workspace_memberships as m")
+        .innerJoin("users as u", "u.id", "m.user_id")
+        .select(["u.id", "u.display_name as name"])
+        .where("m.workspace_id", "=", workspace)
+        .orderBy("u.display_name")
+        .execute();
+      return rows.map((r) => ({ ...r, id: r.id as UserId }));
+    },
+    async events(project, task, rule, sampleType) {
+      let query = executor
+        .selectFrom("outbox_events")
+        .selectAll()
+        .where("project_id", "=", project)
+        .where("event_type", "in", [
+          "task.created",
+          "task.updated",
+          "task.started",
+          "task.manual",
+          "automation.applied",
+          "automation.denied",
+          "automation.skipped",
+          "automation.keep",
+          "automation.undo",
+          "automation.prepared",
+          "automation.review",
+          "automation.rule.publish",
+          "automation.rule.stop",
+        ]);
+      if (sampleType) {
+        query =
+          sampleType === "task.updated"
+            ? query.where("event_type", "in", ["task.updated", "task.started"])
+            : query.where("event_type", "=", sampleType);
+        query = query.where("target_type", "=", "task").where("outcome", "=", "succeeded");
+      }
+      if (task) query = query.where("target_id", "=", task);
+      if (rule)
+        query = query.where((eb) =>
+          eb.or([
+            eb("target_id", "=", rule),
+            eb(
+              driver === "postgres"
+                ? sql<string>`payload_json::jsonb ->> 'rule'`
+                : sql<string>`json_extract(payload_json,'$.rule')`,
+              "=",
+              rule,
+            ),
+          ]),
+        );
+      return (
+        await query
+          .orderBy("occurred_at", "desc")
+          .orderBy("id", "desc")
+          .limit(sampleType ? 1 : 100)
+          .execute()
+      ).map(toOutboxEventRecord);
+    },
+    async lockOperation(workspace, run) {
+      // SQLite already owns the immediate transaction. PG also serializes requests that reuse
+      // one operation key with different target tasks, which would otherwise lock different rows.
+      if (driver === "postgres")
+        await sql`SELECT pg_advisory_xact_lock(hashtextextended(${JSON.stringify([workspace, run])},0))`.execute(
+          executor,
+        );
+    },
+    async operationRun(event, rule) {
+      return (
+        (
+          await executor
+            .selectFrom("automation_receipts")
+            .select("run")
+            .where("event", "=", event)
+            .where("rule", "=", rule)
+            .executeTakeFirst()
+        )?.run ?? null
+      );
+    },
+    async confirmed(workspace, event, rule) {
+      return (
+        (
+          await executor
+            .selectFrom("automation_deliveries")
+            .select("run")
+            .where("workspace", "=", workspace)
+            .where("event", "=", event)
+            .where("rule", "=", rule)
+            .executeTakeFirst()
+        )?.run ?? null
+      );
+    },
+    async receipt(workspace, run) {
+      const row = await executor
+        .selectFrom("automation_receipts")
+        .select(["result", "decision"])
+        .where("workspace", "=", workspace)
+        .where("run", "=", run)
+        .executeTakeFirst();
+      return row ? { ...JSON.parse(row.result), decision: row.decision } : null;
+    },
+    async record(effect) {
+      await executor
+        .insertInto("automation_receipts")
+        .values({
+          workspace: effect.workspace,
+          run: effect.run,
+          event: effect.event,
+          rule: effect.rule,
+          result: JSON.stringify(effect),
+          decision: null,
+        })
+        .executeTakeFirstOrThrow();
+    },
+    async decide(workspace, run, decision) {
+      const row = await executor
+        .updateTable("automation_receipts")
+        .set({ decision })
+        .where("workspace", "=", workspace)
+        .where("run", "=", run)
+        .where("decision", "is", null)
+        .returning("run")
+        .executeTakeFirst();
+      return !!row;
+    },
     async firstCheck(d, run, status) {
       return !!(await runQuery(
         () =>

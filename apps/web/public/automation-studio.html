@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Automation · Prood</title>
+    <link rel="stylesheet" href="/shell.css" />
+    <script type="module" src="/automation/studio.js"></script>
+  </head>
+  <body>
+    <main>
+      <h1>Automation</h1>
+      <label
+        ><span data-label="project"></span>
+        <select id="project"></select
+      ></label>
+      <form id="editor">
+        <fieldset id="settings">
+          <legend data-label="rule"></legend>
+          <p>
+            <label
+              ><span data-label="name"></span>
+              <input
+                id="rule"
+                required
+                maxlength="80"
+                pattern="[A-Za-z0-9_\-]+"
+                list="rules" /></label
+            ><datalist id="rules"></datalist>
+          </p>
+          <p>
+            <label
+              ><span data-label="template"></span>
+              <select id="template">
+                <option value="review" data-label="review"></option>
+                <option value="manual" data-label="manual"></option></select
+            ></label>
+          </p>
+          <p>
+            <label
+              ><span data-label="when"></span>
+              <select id="when">
+                <option value="status.changed" data-label="status.changed"></option>
+                <option value="assignee.changed" data-label="assignee.changed"></option>
+                <option value="task.created" data-label="task.created"></option>
+                <option value="manual" data-label="task.manual"></option></select
+            ></label>
+          </p>
+          <p id="previous">
+            <label
+              ><span data-label="from"></span>
+              <select id="from"></select
+            ></label>
+          </p>
+          <p id="status-trigger">
+            <label
+              ><span data-label="status"></span>
+              <select id="state"></select
+            ></label>
+          </p>
+          <p id="assignee-trigger">
+            <label
+              ><span data-label="toMember"></span>
+              <select id="to-member"></select
+            ></label>
+          </p>
+          <p>
+            <label
+              ><span data-label="if"></span>
+              <select id="condition">
+                <option value="empty" data-label="emptyAssignee"></option>
+                <option value="always" data-label="always"></option></select
+            ></label>
+          </p>
+          <p>
+            <label
+              ><span data-label="action"></span>
+              <select id="action">
+                <option value="assigneeId" data-label="assign"></option>
+                <option value="statusId" data-label="move"></option></select
+            ></label>
+          </p>
+          <p id="status-action">
+            <label
+              ><span data-label="toStatus"></span>
+              <select id="to-state"></select
+            ></label>
+          </p>
+
+          <p id="assignment">
+            <label
+              ><span data-label="assignee"></span>
+              <select id="member"></select
+            ></label>
+          </p>
+          <label
+            ><input type="checkbox" id="reversible" /> <span data-label="reversible"></span
+          ></label>
+        </fieldset>
+        <p>
+          <label
+            ><span data-label="task"></span>
+            <select id="task" required></select
+          ></label>
+        </p>
+        <button id="simulate" data-label="simulate"></button>
+        <button type="button" id="stop" data-label="stop"></button>
+      </form>
+      <section id="preview" hidden>
+        <h2 data-label="proposal"></h2>
+        <p id="summary"></p>
+        <button id="publish" data-label="publish"></button>
+      </section>
+      <section>
+        <h2 data-label="history"></h2>
+        <button id="by-task" data-label="byTask"></button>
+        <button id="by-rule" data-label="byRule"></button>
+        <ol id="entries"></ol>
+        <a id="operator" data-label="operator" hidden></a>
+      </section>
+      <p role="status" id="feedback"></p>
+    </main>
+  </body>
+</html>

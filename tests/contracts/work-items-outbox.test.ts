@@ -259,7 +259,7 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
     });
 
     const v5 = await db.migrate();
-    expect(v5).toEqual({ appliedVersions: [5, 6, 7, 8], currentVersion: 8 });
+    expect(v5).toEqual({ appliedVersions: [5, 6, 7, 8, 9], currentVersion: 9 });
 
     const loaded = await db.uow.run(async (repos) => ({
       ws: await repos.workspaces.findById(wksId),
@@ -1420,6 +1420,245 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
     );
     expect(stopped.ok && stopped.data.delegateName).toBe(user.userId);
   });
+  it("commits automation receipts, task changes and derived events together across replay and decisions", async () => {
+    const ctx = await createIsolatedDb(),
+      db = ctx.openClient();
+    await db.migrate({targetVersion:8});
+    const h = createServerHarness(db),
+      ids = createSystemIdGenerator();
+    const owner = await h.signUpUser("effects@example.com", "Manager"),
+      workspace = ids.next("wks");
+    const actor = { userId: owner.userId, actorType: "user", channel: "web" } as const;
+    const deps = { uow: db.uow, idGenerator: ids, clock: { now: () => new Date() } };
+    await db.uow.run(async (r) => {
+      const createdAt = new Date().toISOString();
+      await r.workspaces.create({
+        id: workspace,
+        slug: "effects",
+        name: "Effects",
+        createdAt,
+      });
+      await r.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: workspace,
+        userId: owner.userId,
+        role: "admin",
+        createdAt,
+      });
+    });
+    const w = h.workUseCases;
+    const projectResult = await w.createProject(actor, workspace, {
+      name: "Board",
+      kind: "general",
+      visibility: "private",
+    });
+    if (!projectResult.ok) throw Error("project");
+    const project = projectResult.data.project;
+    const made = await w.createTask(actor, project.id, { title: "Review" });
+    if (!made.ok) throw Error("task");
+    const task = made.data.task;
+    const legacy = await w.manageAutomation(actor,project.id,"legacy",{op:"publish",revision:0,delegate:owner.userId,
+      definition:{when:"manual",action:{field:"assigneeId",value:owner.userId}}});
+    expect(legacy.ok).toBe(true);
+    const pending=await w.manualAutomation(actor,project.id,"legacy",task.id);
+    if(!pending.ok) throw Error("legacy start");
+    expect((await db.migrate()).appliedVersions).toEqual([9]);
+    expect(await deliverNext(deps,workspace,()=>"legacy-run")).toBe(true);
+    expect((await w.prepareAutomation(workspace,pending.data.event,"legacy","legacy-run",project.id,1)).status).toBe("prepared");
+    expect((await w.executeAutomation(workspace,pending.data.event,"legacy","legacy-run",project.id,1)).status).toBe("prepared");
+    expect(await db.uow.run(r=>r.automation.receipt(workspace,"legacy-run"))).toBeNull();
+    const definition = {
+      when: "manual",
+      apply: true,
+      reversible: true,
+      ifUnassigned: true,
+      action: { field: "assigneeId", value: owner.userId },
+    };
+    expect(
+      (
+        await w.manageAutomation(actor, project.id, "assign", {
+          op: "publish",
+          revision: 0,
+          definition,
+          delegate: owner.userId,
+        })
+      ).ok,
+    ).toBe(true);
+    async function start() {
+      const result = await w.manualAutomation(actor, project.id, "assign", task.id);
+      if (!result.ok) throw Error("start");
+      const run = ids.next("evt");
+      expect(await deliverNext(deps, workspace, () => run)).toBe(true);
+      return [workspace, result.data.event, "assign", run, project.id, 1] as const;
+    }
+    // A long stream of unrelated manual events must not hide the task's creation.
+    const sampleTask = await w.createTask(actor, project.id, { title: "Busy sample" });
+    if (!sampleTask.ok) throw Error("sample task");
+    const sampleId = sampleTask.data.task.id;
+    const created = await db.kysely
+      .selectFrom("outbox_events")
+      .selectAll()
+      .where("target_id", "=", sampleId)
+      .where("event_type", "=", "task.created")
+      .executeTakeFirstOrThrow();
+    await db.kysely
+      .insertInto("outbox_events")
+      .values(
+        Array.from({ length: 101 }, () => ({
+          ...created,
+          id: ids.next("evt"),
+          event_id: ids.next("evt"),
+          event_type: "task.manual",
+          occurred_at: new Date(Date.parse(created.occurred_at) + 1).toISOString(),
+        })),
+      )
+      .execute();
+    const creationTrial = await w.simulateAutomation(actor, project.id, "assign", sampleId, {
+      ...definition,
+      when: "task.created",
+    });
+    expect(creationTrial.ok && creationTrial.data.status).toBe("prepared");
+    const beforeTrial = await db.uow.run((r) => r.outbox.listByWorkspace(workspace));
+    const trial = await w.simulateAutomation(
+      actor,
+      project.id,
+      "assign",
+      task.id,
+      definition,
+    );
+    expect(trial.ok && trial.data).toMatchObject({
+      status: "prepared",
+      before: null,
+      after: owner.userId,
+    });
+    expect(await db.uow.run((r) => r.outbox.listByWorkspace(workspace))).toEqual(beforeTrial);
+    expect(
+      await db.kysely.selectFrom("automation_deliveries").where("rule","=","assign").selectAll().execute(),
+    ).toHaveLength(0);
+    const args = await start();
+    const pendingHistory = await w.automationHistory(actor, project.id, task.id, "assign");
+    expect(
+      pendingHistory.ok &&
+        pendingHistory.data.entries.find((e) => e.event === "automation.pending")?.at,
+    ).toBeTruthy();
+    expect((await w.executeAutomation(...args, true, () => false)).status).toBe("canceled");
+    const broken = createWorkUseCases({
+      ...deps,
+      uow: {
+        run: (fn) =>
+          db.uow.run((r) =>
+            fn({
+              ...r,
+              automation: {
+                ...r.automation,
+                record: async () => {
+                  throw Error("before commit");
+                },
+              },
+            }),
+          ),
+      },
+    });
+    await expect(broken.executeAutomation(...args)).rejects.toThrow("before commit");
+    const events = () => db.uow.run((r) => r.outbox.listByWorkspace(workspace));
+    expect(
+      (await events()).filter(
+        (e) => e.channel === "automation" && e.eventType === "task.updated",
+      ),
+    ).toHaveLength(0);
+    const other = createWorkUseCases({ ...deps, uow: ctx.openClient().uow });
+    expect(
+      (
+        await Promise.all([w.executeAutomation(...args), other.executeAutomation(...args)])
+      ).map((r) => r.status),
+    ).toEqual(["applied", "applied"]);
+    expect(
+      (await events()).filter(
+        (e) => e.channel === "automation" && e.eventType === "task.updated",
+      ),
+    ).toHaveLength(1);
+    await w.updateTask(actor, task.id, { assigneeId: null });
+    expect((await other.executeAutomation(...args, true)).status).toBe("applied");
+    expect((await w.decideAutomation(actor, project.id, "assign", args[3], "undo")).ok).toBe(
+      false,
+    );
+    expect(
+      (await w.executeAutomation(workspace, args[1], "assign", args[3], project.id, 2))
+        .status,
+    ).toBe("conflict");
+    const changedInput = createWorkUseCases({
+      ...deps,
+      uow: {
+        run: (fn) =>
+          db.uow.run((r) =>
+            fn({
+              ...r,
+              automation: {
+                ...r.automation,
+                intent: async (...key) => {
+                  const d = await r.automation.intent(...key);
+                  if (d) d.proposal.definition.action.value = null;
+                  return d;
+                },
+              },
+            }),
+          ),
+      },
+    });
+    expect((await changedInput.executeAutomation(...args)).status).toBe("conflict");
+    const delayed = await start();
+    await w.updateTask(actor, task.id, { assigneeId: owner.userId });
+    expect((await w.executeAutomation(...delayed)).status).toBe("skipped");
+    await w.updateTask(actor, task.id, { assigneeId: null });
+    const fresh = await start();
+    expect((await w.executeAutomation(...fresh, false, () => false)).status).toBe("canceled");
+    expect((await w.executeAutomation(...fresh, true)).status).toBe("review");
+    expect((await w.executeAutomation(...fresh)).status).toBe("applied");
+    const viewer = await h.signUpUser("observer@example.com", "Observer");
+    await db.uow.run(async (r) => {
+      const createdAt = new Date().toISOString();
+      await r.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: workspace,
+        userId: viewer.userId,
+        role: "viewer",
+        createdAt,
+      });
+      await r.projects.upsertMembership({
+        id: ids.next("mbr"),
+        projectId: project.id,
+        userId: viewer.userId,
+        role: "viewer",
+        createdAt,
+      });
+    });
+    const readActor = { ...actor, userId: viewer.userId };
+    const history = await w.automationHistory(readActor, project.id, task.id);
+    expect(
+      history.ok && history.data.entries.some((e) => e.event === "automation.applied"),
+    ).toBe(true);
+    expect(history.ok && history.data.entries.every((e) => e.actions.length === 0)).toBe(
+      true,
+    );
+    expect(
+      (await w.decideAutomation(readActor, project.id, "assign", fresh[3], "undo")).ok,
+    ).toBe(false);
+    const decisions = await Promise.all([
+      w.decideAutomation(actor, project.id, "assign", fresh[3], "undo"),
+      other.decideAutomation(actor, project.id, "assign", fresh[3], "keep"),
+    ]);
+    expect(decisions.filter((r) => r.ok)).toHaveLength(1);
+    const winner = decisions[0]!.ok ? "undo" : "keep";
+    expect(
+      (await other.decideAutomation(actor, project.id, "assign", fresh[3], winner)).ok,
+    ).toBe(true);
+    await db.kysely
+      .deleteFrom("workspace_memberships")
+      .where("workspace_id", "=", workspace)
+      .where("user_id", "=", owner.userId)
+      .execute();
+    expect((await other.executeAutomation(...args, true)).status).toBe("denied");
+  });
 
   it("upgrades from v7 preserving tasks and idempotency records, and invalidates automation on status deletion", async () => {
     const ctx = await createIsolatedDb();
@@ -1541,8 +1780,8 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
     });
 
     expect(await db.migrate()).toEqual({
-      appliedVersions: [8],
-      currentVersion: 8,
+      appliedVersions: [8, 9],
+      currentVersion: 9,
     });
 
     const loaded = await db.uow.run(async (repos) => ({

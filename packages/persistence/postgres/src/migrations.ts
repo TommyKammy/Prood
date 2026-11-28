@@ -1,4 +1,8 @@
-import { automationMigration, type MigrationDefinition } from "@prood/persistence-common";
+import {
+  effectMigration,
+  automationMigration,
+  type MigrationDefinition,
+} from "@prood/persistence-common";
 
 export const POSTGRES_MIGRATIONS: readonly MigrationDefinition[] = [
   {
@@ -397,4 +401,5 @@ export const POSTGRES_MIGRATIONS: readonly MigrationDefinition[] = [
     ],
   },
   automationMigration,
+  effectMigration,
 ];
