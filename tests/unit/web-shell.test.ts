@@ -2,8 +2,15 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Window } from "happy-dom";
-import { CONTRACT_VERSION, type MeResponse } from "@prood/contracts";
-import { generateEntityId } from "@prood/domain";
+import {
+  CONTRACT_VERSION,
+  type MeResponse,
+  type ProjectDevSettingsResponse,
+  type ProjectDto,
+  type TaskDto,
+  type WorkspaceSettingsDto,
+} from "@prood/contracts";
+import { generateEntityId, type ProjectId, type StatusId, type WorkspaceId } from "@prood/domain";
 import {
   copyFromTarget,
   createCopyControl,
@@ -317,6 +324,433 @@ describe("@prood/web i18n error translation & accessible copy control", () => {
     expect(btn.hasAttribute("data-failed")).toBe(true);
     expect(btn.disabled).toBe(false);
     expect(tip.textContent).toBe("Copy failed");
+  });
+});
+
+async function flushUiTicks(ticks = 6): Promise<void> {
+  for (let i = 0; i < ticks; i += 1) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+async function waitForCondition(predicate: () => boolean, label: string): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < 4000) {
+    if (predicate()) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error(`Timed out waiting for: ${label}`);
+}
+
+async function mountMockedShell(
+  fetchImpl: (url: string, init?: RequestInit) => Promise<Response> | Response,
+) {
+  vi.resetModules();
+  const win = new Window({ url: "http://127.0.0.1:3000/" });
+  const doc = win.document as unknown as Document;
+
+  vi.stubGlobal("window", win);
+  vi.stubGlobal("document", doc);
+  vi.stubGlobal("HTMLElement", win.HTMLElement);
+  vi.stubGlobal("HTMLInputElement", win.HTMLInputElement);
+  vi.stubGlobal("HTMLTextAreaElement", win.HTMLTextAreaElement);
+  vi.stubGlobal("HTMLSelectElement", win.HTMLSelectElement);
+  vi.stubGlobal("HTMLDialogElement", win.HTMLDialogElement);
+  vi.stubGlobal("Element", win.Element);
+  vi.stubGlobal("Node", win.Node);
+  vi.stubGlobal("Event", win.Event);
+  vi.stubGlobal("KeyboardEvent", win.KeyboardEvent);
+  vi.stubGlobal("CustomEvent", win.CustomEvent);
+  vi.stubGlobal("customElements", win.customElements);
+  vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+    cb(0);
+    return 1;
+  });
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+    const raw = typeof input === "string" ? input : input.toString();
+    return await fetchImpl(new URL(raw, "http://127.0.0.1:3000").pathname + new URL(raw, "http://127.0.0.1:3000").search, init);
+  });
+
+  const web = await import("@prood/web");
+  const shell = doc.createElement("prood-shell") as unknown as InstanceType<
+    typeof web.ProodShellElement
+  >;
+  doc.body.appendChild(shell as unknown as Node);
+  return { win, doc, shell };
+}
+
+function makeProject(
+  workspaceId: WorkspaceId,
+  projectId: ProjectId,
+  statusId: StatusId,
+  name: string,
+): ProjectDto {
+  const now = "2026-11-28T12:00:00.000Z";
+  return {
+    id: projectId,
+    workspaceId,
+    name,
+    description: "",
+    visibility: "workspace",
+    kind: "general",
+    createdAt: now,
+    updatedAt: now,
+    myRole: "admin",
+    devSettings: null,
+    statuses: [
+      {
+        id: statusId,
+        projectId,
+        name: "To Do",
+        category: "todo",
+        position: 0,
+      },
+    ],
+  };
+}
+
+function makeTask(
+  workspaceId: WorkspaceId,
+  projectId: ProjectId,
+  statusId: StatusId,
+  byte: number,
+  title: string,
+): TaskDto {
+  const now = "2026-11-28T12:00:00.000Z";
+  return {
+    id: generateEntityId("tsk", 1_795_000_000_000 + byte, new Uint8Array(10).fill(byte)),
+    workspaceId,
+    projectId,
+    effectiveProjectId: projectId,
+    title,
+    description: "",
+    statusId,
+    issueKey: null,
+    branchName: null,
+    parentTaskId: null,
+    assigneeId: null,
+    createdBy: null,
+    dueOn: null,
+    completedAt: null,
+    position: byte,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function makeMembershipId(byte: number) {
+  return generateEntityId("mbr", 1_795_000_000_000 + byte, new Uint8Array(10).fill(byte));
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+describe("@prood/web async race regressions", () => {
+  it("ignores late task-creation completions after switching projects (4725269036)", async () => {
+    const userId = generateEntityId("usr", 1_795_000_000_000, new Uint8Array(10).fill(1));
+    const wksA = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(2));
+    const projA = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(3));
+    const projB = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(4));
+    const statusA = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(5));
+    const statusB = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(6));
+
+    const projectA = makeProject(wksA, projA, statusA, "Project Alpha");
+    const projectB = makeProject(wksA, projB, statusB, "Project Beta");
+    const taskA = makeTask(wksA, projA, statusA, 10, "Existing Alpha Task");
+    const lateCreatedInA = makeTask(wksA, projA, statusA, 11, "Late Alpha Task");
+    const taskB = makeTask(wksA, projB, statusB, 12, "Existing Beta Task");
+
+    let resolveCreateA!: (res: Response) => void;
+    const createADeferred = new Promise<Response>((resolve) => {
+      resolveCreateA = resolve;
+    });
+    let projATaskFetchCount = 0;
+
+    const { win, doc, shell } = await mountMockedShell(async (path, init) => {
+      if (path === "/api/v1/me") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          user: { id: userId, email: "alice@example.com", displayName: "Alice" },
+          memberships: [
+            {
+              membershipId: makeMembershipId(101),
+              workspaceId: wksA,
+              workspaceSlug: "ws-a",
+              workspaceName: "WS A",
+              role: "admin",
+            },
+          ],
+        } satisfies MeResponse);
+      }
+      if (path === `/api/v1/workspaces/${wksA}/projects`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, projects: [projectA, projectB] });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/settings`) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          settings: {
+            workspaceId: wksA,
+            defaultLocale: "en",
+            devProjectsEnabled: false,
+            updatedAt: "2026-11-28T12:00:00.000Z",
+          } satisfies WorkspaceSettingsDto,
+        });
+      }
+      if (path === `/api/v1/projects/${projA}/tasks` && (init?.method ?? "GET") === "GET") {
+        projATaskFetchCount += 1;
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, tasks: [taskA] });
+      }
+      if (path === `/api/v1/projects/${projB}/tasks` && (init?.method ?? "GET") === "GET") {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, tasks: [taskB] });
+      }
+      if (path.endsWith("/dev-settings")) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          allowed: false,
+          canManage: true,
+          dev: null,
+          statuses: path.includes(projA) ? projectA.statuses : projectB.statuses,
+        } satisfies ProjectDevSettingsResponse);
+      }
+      if (path === `/api/v1/projects/${projA}/tasks` && init?.method === "POST") {
+        return createADeferred;
+      }
+      throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${path}`);
+    });
+
+    await waitForCondition(
+      () => doc.body.textContent?.includes("Existing Alpha Task") ?? false,
+      "project A initial task rendered",
+    );
+
+    const titleInput = doc.querySelector<HTMLInputElement>("[data-task-title-input]")!;
+    titleInput.value = "Late Alpha Task";
+    titleInput.dispatchEvent(new win.Event("input") as unknown as Event);
+    doc
+      .querySelector<HTMLFormElement>("[data-create-task-form]")!
+      .dispatchEvent(new win.Event("submit", { cancelable: true }) as unknown as Event);
+
+    doc.querySelector<HTMLButtonElement>(`[data-project-id="${projB}"]`)!.click();
+    await waitForCondition(
+      () => doc.body.textContent?.includes("Existing Beta Task") ?? false,
+      "switched to project B",
+    );
+
+    const bTitleInput = doc.querySelector<HTMLInputElement>("[data-task-title-input]")!;
+    bTitleInput.value = "Draft in Beta";
+    bTitleInput.dispatchEvent(new win.Event("input") as unknown as Event);
+    expect(doc.querySelector<HTMLButtonElement>("[data-create-task-submit]")!.disabled).toBe(false);
+
+    resolveCreateA(jsonResponse({ contractVersion: CONTRACT_VERSION, task: lateCreatedInA }, 201));
+    await flushUiTicks(8);
+
+    expect(shell.getActiveProjectId()).toBe(projB);
+    expect(doc.body.textContent).toContain("Existing Beta Task");
+    expect(doc.body.textContent).not.toContain("Late Alpha Task");
+    expect(doc.body.textContent).not.toContain("Task created.");
+    expect(doc.querySelector<HTMLInputElement>("[data-task-title-input]")!.value).toBe("Draft in Beta");
+    expect(projATaskFetchCount).toBe(1);
+  });
+
+  it("discards stale workspace-setting responses after switching workspaces (4725269038)", async () => {
+    const userId = generateEntityId("usr", 1_795_000_000_000, new Uint8Array(10).fill(1));
+    const wksA = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(2));
+    const wksB = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(3));
+
+    let resolveWsASave!: (res: Response) => void;
+    const wsASaveDeferred = new Promise<Response>((resolve) => {
+      resolveWsASave = resolve;
+    });
+
+    const { win, doc, shell } = await mountMockedShell(async (path, init) => {
+      if (path === "/api/v1/me") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          user: { id: userId, email: "alice@example.com", displayName: "Alice" },
+          memberships: [
+            {
+              membershipId: makeMembershipId(102),
+              workspaceId: wksA,
+              workspaceSlug: "ws-a",
+              workspaceName: "WS Alpha",
+              role: "admin",
+            },
+            {
+              membershipId: makeMembershipId(103),
+              workspaceId: wksB,
+              workspaceSlug: "ws-b",
+              workspaceName: "WS Beta",
+              role: "admin",
+            },
+          ],
+        } satisfies MeResponse);
+      }
+      if (path.endsWith("/projects")) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, projects: [] });
+      }
+      if (
+        (path === `/api/v1/workspaces/${wksA}/settings` ||
+          path === `/api/v1/workspaces/${wksB}/settings`) &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        const wsId = path.includes(wksA) ? wksA : wksB;
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          settings: {
+            workspaceId: wsId,
+            defaultLocale: "en",
+            devProjectsEnabled: false,
+            updatedAt: "2026-11-28T12:00:00.000Z",
+          } satisfies WorkspaceSettingsDto,
+        });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/settings` && init?.method === "PATCH") {
+        return wsASaveDeferred;
+      }
+      throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${path}`);
+    });
+
+    await waitForCondition(
+      () => doc.querySelector('[data-nav-view="settings"]') !== null,
+      "settings nav ready",
+    );
+    doc.querySelector<HTMLButtonElement>('[data-nav-view="settings"]')!.click();
+    await waitForCondition(
+      () => doc.querySelector("[data-ws-dev-toggle]") !== null,
+      "workspace A settings loaded",
+    );
+
+    const toggleA = doc.querySelector<HTMLInputElement>("[data-ws-dev-toggle]")!;
+    toggleA.checked = true;
+    doc
+      .querySelector<HTMLFormElement>("[data-workspace-settings-form]")!
+      .dispatchEvent(new win.Event("submit", { cancelable: true }) as unknown as Event);
+
+    const wsSelect = doc.querySelector<HTMLSelectElement>("[data-workspace-select]")!;
+    wsSelect.value = wksB;
+    wsSelect.dispatchEvent(new win.Event("change") as unknown as Event);
+
+    await waitForCondition(
+      () =>
+        shell.getActiveWorkspaceId() === wksB &&
+        doc.querySelector<HTMLInputElement>("[data-ws-dev-toggle]")?.disabled === false,
+      "switched to workspace B settings",
+    );
+    expect(doc.querySelector<HTMLInputElement>("[data-ws-dev-toggle]")!.checked).toBe(false);
+
+    resolveWsASave(
+      jsonResponse({
+        contractVersion: CONTRACT_VERSION,
+        settings: {
+          workspaceId: wksA,
+          defaultLocale: "en",
+          devProjectsEnabled: true,
+          updatedAt: "2026-11-28T12:01:00.000Z",
+        } satisfies WorkspaceSettingsDto,
+      }),
+    );
+    await flushUiTicks(8);
+
+    expect(shell.getActiveWorkspaceId()).toBe(wksB);
+    expect(doc.querySelector<HTMLInputElement>("[data-ws-dev-toggle]")!.checked).toBe(false);
+    expect(doc.body.textContent).not.toContain("Settings saved");
+  });
+
+  it("invalidates in-flight searches when the search query is cleared (4725269040)", async () => {
+    const userId = generateEntityId("usr", 1_795_000_000_000, new Uint8Array(10).fill(1));
+    const wksA = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(2));
+    const projA = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(3));
+    const statusA = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(5));
+    const projectA = makeProject(wksA, projA, statusA, "Project Alpha");
+    const matchedTask = makeTask(wksA, projA, statusA, 20, "Stale Search Result");
+
+    let resolveSearch!: (res: Response) => void;
+    const searchDeferred = new Promise<Response>((resolve) => {
+      resolveSearch = resolve;
+    });
+    let searchCalls = 0;
+
+    const { win, doc, shell } = await mountMockedShell(async (path) => {
+      if (path === "/api/v1/me") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          user: { id: userId, email: "alice@example.com", displayName: "Alice" },
+          memberships: [
+            {
+              membershipId: makeMembershipId(101),
+              workspaceId: wksA,
+              workspaceSlug: "ws-a",
+              workspaceName: "WS A",
+              role: "admin",
+            },
+          ],
+        } satisfies MeResponse);
+      }
+      if (path === `/api/v1/workspaces/${wksA}/projects`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, projects: [projectA] });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/settings`) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          settings: {
+            workspaceId: wksA,
+            defaultLocale: "en",
+            devProjectsEnabled: false,
+            updatedAt: "2026-11-28T12:00:00.000Z",
+          } satisfies WorkspaceSettingsDto,
+        });
+      }
+      if (path === `/api/v1/projects/${projA}/tasks`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, tasks: [] });
+      }
+      if (path.endsWith("/dev-settings")) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          allowed: false,
+          canManage: true,
+          dev: null,
+          statuses: projectA.statuses,
+        } satisfies ProjectDevSettingsResponse);
+      }
+      if (path.startsWith(`/api/v1/workspaces/${wksA}/tasks/search`)) {
+        searchCalls += 1;
+        return searchDeferred;
+      }
+      throw new Error(`Unexpected request: GET ${path}`);
+    });
+
+    await waitForCondition(
+      () => shell.getActiveProjectId() === projA,
+      "initial project loaded",
+    );
+
+    await shell.openSearch();
+    const searchInput = doc.querySelector<HTMLInputElement>("[data-search-input]")!;
+    searchInput.value = "Stale";
+    searchInput.dispatchEvent(new win.Event("input") as unknown as Event);
+    await waitForCondition(() => searchCalls === 1, "debounced search started");
+
+    searchInput.value = "";
+    searchInput.dispatchEvent(new win.Event("input") as unknown as Event);
+    await flushUiTicks(4);
+
+    resolveSearch(
+      jsonResponse({
+        contractVersion: CONTRACT_VERSION,
+        items: [{ matchKind: "title", task: matchedTask }],
+        nextCursor: null,
+      }),
+    );
+    await flushUiTicks(6);
+
+    expect(doc.querySelectorAll("[data-search-result-id]").length).toBe(0);
+    expect(doc.querySelector("[data-search-dialog]")?.textContent).toContain(
+      "Type a task ID",
+    );
   });
 });
 

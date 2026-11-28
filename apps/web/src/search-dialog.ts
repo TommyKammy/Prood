@@ -103,6 +103,7 @@ export class SearchPaletteController {
           close: () => {
             dialog.returnValue = "";
             this.clearDebounce();
+            this.searchSeq += 1;
           },
         },
       },
@@ -195,6 +196,7 @@ export class SearchPaletteController {
     if (this.searchInput.value.trim()) {
       void this.executeSearch();
     } else {
+      this.searchSeq += 1;
       this.items = [];
       this.activeIndex = -1;
       this.statusEl.textContent =
@@ -205,6 +207,7 @@ export class SearchPaletteController {
 
   close(): void {
     this.clearDebounce();
+    this.searchSeq += 1;
     if (typeof this.element.close === "function") {
       this.element.close();
     } else {
@@ -221,12 +224,18 @@ export class SearchPaletteController {
 
   private scheduleSearch(): void {
     this.clearDebounce();
+    this.searchSeq += 1;
+    if (!this.searchInput.value.trim()) {
+      void this.executeSearch();
+      return;
+    }
     this.debounceTimer = setTimeout(() => {
       void this.executeSearch();
     }, 150);
   }
 
   async executeSearch(): Promise<void> {
+    const seq = ++this.searchSeq;
     const { workspaceId, activeProjectId, i18n } = this.callbacks.getContext();
     const { t } = i18n;
     const query = this.searchInput.value.trim();
@@ -238,7 +247,6 @@ export class SearchPaletteController {
       return;
     }
 
-    const seq = ++this.searchSeq;
     this.statusEl.textContent = t("search.loading");
 
     const res = await searchTasks(workspaceId, {

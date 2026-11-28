@@ -11,6 +11,8 @@ import type {
   ApiErrorResponse,
   DbDriverKind,
   MeResponse,
+  ProjectDevSettingsResponse,
+  ProjectListResponse,
   ProjectResponse,
   TaskResponse,
   TaskSearchResponse,
@@ -751,4 +753,155 @@ describe(`PR 09: Web List, Dev Settings & ⌘K Search (${targetDb})`, () => {
     expect(genTaskGet.status).toBe(200);
     expect(((await genTaskGet.json()) as TaskResponse).task.issueKey).toBeNull();
   }, 25_000);
+
+  it("reuses created project when dev activation fails and persists explicit null startStatusId on enable", async () => {
+    const isolated = await createIsolatedDb();
+    const db = isolated.openClient();
+    await db.migrate();
+    const ids = createSystemIdGenerator();
+    const harness = createServerHarness(db);
+
+    const wksId = ids.next("wks");
+    const now = "2026-11-28T12:15:00.000Z";
+    await db.uow.run(async (repos) => {
+      await repos.workspaces.create({
+        id: wksId,
+        slug: "retry-null-ws",
+        name: "Retry & Null Workspace",
+        createdAt: now,
+      });
+      await repos.workspaceSettings.upsert({
+        workspaceId: wksId,
+        defaultLocale: "en",
+        devProjectsEnabled: true,
+        updatedAt: now,
+      });
+    });
+
+    const admin = await harness.signUpUser("retry-admin@example.com", "Admin");
+    await db.uow.run(async (repos) => {
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: admin.userId,
+        role: "admin",
+        createdAt: now,
+      });
+    });
+
+    // Seed an existing dev project reserving prefix DUP
+    const seedRes = await harness.apiRequest(`/api/v1/workspaces/${wksId}/projects`, {
+      method: "POST",
+      jar: admin.jar,
+      json: { name: "Seed Dev", visibility: "workspace" },
+    });
+    expect(seedRes.status).toBe(201);
+    const seedProjId = ((await seedRes.json()) as ProjectResponse).project.id;
+    const enableSeedRes = await harness.apiRequest(
+      `/api/v1/projects/${seedProjId}/dev-settings/enable`,
+      { method: "POST", jar: admin.jar, json: { prefix: "DUP" } },
+    );
+    expect(enableSeedRes.status).toBe(200);
+
+    // 1. Finding 4725269046: duplicate prefix failure retains project and reuses it on retry
+    const browser = await harness.setupBrowserSession(admin.jar);
+    await waitFor(
+      () => browser.doc.querySelector("[data-toggle-new-project]") !== null,
+      "authenticated workspace ready",
+    );
+
+    browser.doc.querySelector<HTMLButtonElement>("[data-toggle-new-project]")!.click();
+    const nameInput = browser.doc.querySelector<HTMLInputElement>("[data-new-project-name]")!;
+    nameInput.value = "Retry Target";
+    nameInput.dispatchEvent(new browser.win.Event("input") as unknown as Event);
+    const devCheck = browser.doc.querySelector<HTMLInputElement>("[data-new-project-dev-toggle]")!;
+    devCheck.checked = true;
+    devCheck.dispatchEvent(new browser.win.Event("change") as unknown as Event);
+    const prefixInput = browser.doc.querySelector<HTMLInputElement>("[data-new-project-prefix]")!;
+    prefixInput.value = "DUP";
+    prefixInput.dispatchEvent(new browser.win.Event("input") as unknown as Event);
+    browser.doc
+      .querySelector<HTMLFormElement>("[data-new-project-form]")!
+      .dispatchEvent(new browser.win.Event("submit", { cancelable: true }) as unknown as Event);
+
+    await waitFor(
+      () =>
+        browser.doc
+          .querySelector('.prood-sidebar-form [role="alert"]')
+          ?.textContent?.includes("already reserved") ?? false,
+      "duplicate prefix error displayed",
+    );
+    expect(
+      browser.doc.querySelector<HTMLInputElement>("[data-new-project-name]")!.disabled,
+    ).toBe(true);
+
+    // Fix prefix and re-submit: must reuse the created project without creating a duplicate
+    const retryPrefix = browser.doc.querySelector<HTMLInputElement>("[data-new-project-prefix]")!;
+    retryPrefix.value = "RETRY";
+    retryPrefix.dispatchEvent(new browser.win.Event("input") as unknown as Event);
+    browser.doc
+      .querySelector<HTMLFormElement>("[data-new-project-form]")!
+      .dispatchEvent(new browser.win.Event("submit", { cancelable: true }) as unknown as Event);
+
+    await waitFor(
+      () =>
+        browser.doc.querySelector("[data-new-project-form]") === null &&
+        browser.doc.querySelector("[data-project-prefix]")?.textContent?.trim() === "RETRY",
+      "retry succeeded with RETRY prefix",
+    );
+
+    const listRes = await harness.apiRequest(`/api/v1/workspaces/${wksId}/projects`, {
+      jar: admin.jar,
+    });
+    expect(listRes.status).toBe(200);
+    const allProjects = ((await listRes.json()) as ProjectListResponse).projects;
+    expect(allProjects.filter((p) => p.name === "Retry Target")).toHaveLength(1);
+
+    // 2. Finding 4725269042: enabling dev mode via Settings with "Default (keep current status)" sends explicit null
+    const genRes = await harness.apiRequest(`/api/v1/workspaces/${wksId}/projects`, {
+      method: "POST",
+      jar: admin.jar,
+      json: { name: "Keep Status Board", visibility: "workspace" },
+    });
+    expect(genRes.status).toBe(201);
+    const keepProjId = ((await genRes.json()) as ProjectResponse).project.id;
+
+    browser.doc.querySelector<HTMLButtonElement>('[data-nav-view="settings"]')!.click();
+    await waitFor(
+      () => browser.doc.querySelector(`[data-project-id="${keepProjId}"]`) !== null,
+      "Keep Status Board listed in sidebar",
+    );
+    browser.doc.querySelector<HTMLButtonElement>(`[data-project-id="${keepProjId}"]`)!.click();
+
+    await waitFor(
+      () =>
+        browser.getShell().getActiveProjectId() === keepProjId &&
+        browser.doc.querySelector("[data-proj-dev-enable]") !== null,
+      "Keep Status Board dev settings ready to enable",
+    );
+
+    const settingsPrefix = browser.doc.querySelector<HTMLInputElement>("[data-proj-prefix-input]")!;
+    settingsPrefix.value = "KEEP";
+    settingsPrefix.dispatchEvent(new browser.win.Event("input") as unknown as Event);
+    const startSelect = browser.doc.querySelector<HTMLSelectElement>(
+      "[data-proj-start-status-select]",
+    )!;
+    expect(startSelect.value).toBe("");
+    browser.doc
+      .querySelector<HTMLFormElement>("[data-project-dev-settings-form]")!
+      .dispatchEvent(new browser.win.Event("submit", { cancelable: true }) as unknown as Event);
+
+    await waitFor(
+      () => browser.doc.querySelector("[data-proj-dev-save]") !== null,
+      "Keep Status Board enabled as dev project",
+    );
+
+    const devGet = await harness.apiRequest(`/api/v1/projects/${keepProjId}/dev-settings`, {
+      jar: admin.jar,
+    });
+    expect(devGet.status).toBe(200);
+    const devData = (await devGet.json()) as ProjectDevSettingsResponse;
+    expect(devData.dev?.prefix).toBe("KEEP");
+    expect(devData.dev?.startStatusId).toBeNull();
+  }, 20_000);
 });

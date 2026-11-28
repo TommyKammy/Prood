@@ -82,6 +82,12 @@ export class ProodShellElement extends BaseElement {
   private sessionRequestSeq = 0;
   private workspaceDataSeq = 0;
   private projectDataSeq = 0;
+  private createProjectSeq = 0;
+  private createTaskSeq = 0;
+  private workspaceSettingsSaveSeq = 0;
+  private projectSettingsSaveSeq = 0;
+  private pendingDevProjectId: ProjectId | null = null;
+  private pendingDevWorkspaceId: WorkspaceId | null = null;
   private listenersController: AbortController | null = null;
 
   private activeWorkspaceId: WorkspaceId | null = null;
@@ -269,6 +275,23 @@ export class ProodShellElement extends BaseElement {
     return this.searchPalettePromise;
   }
 
+  private cancelPendingProjectMutations(): void {
+    this.createTaskSeq += 1;
+    this.projectSettingsSaveSeq += 1;
+    this.creatingTask = false;
+    this.savingProjectSettings = false;
+  }
+
+  private cancelPendingWorkspaceMutations(): void {
+    this.cancelPendingProjectMutations();
+    this.workspaceSettingsSaveSeq += 1;
+    this.createProjectSeq += 1;
+    this.savingWorkspaceSettings = false;
+    this.creatingProject = false;
+    this.pendingDevProjectId = null;
+    this.pendingDevWorkspaceId = null;
+  }
+
   private clearFeedback(): void {
     this.taskCreateError = "";
     this.taskCreateNotice = "";
@@ -280,6 +303,7 @@ export class ProodShellElement extends BaseElement {
   }
 
   private resetWorkspaceState(): void {
+    this.cancelPendingWorkspaceMutations();
     this.workspaceDataSeq += 1;
     this.projectDataSeq += 1;
     this.activeWorkspaceId = null;
@@ -391,6 +415,7 @@ export class ProodShellElement extends BaseElement {
       memberships[0]!.workspaceId;
     this.activeView = route.view;
     if (targetWs !== this.activeWorkspaceId) {
+      this.cancelPendingWorkspaceMutations();
       this.activeWorkspaceId = targetWs;
       this.activeProjectId = route.projectId;
       void this.loadWorkspaceData(targetWs);
@@ -457,6 +482,7 @@ export class ProodShellElement extends BaseElement {
     this.projects = projRes.data.projects;
     this.workspaceSettings = wsSettingsRes.ok ? wsSettingsRes.data.settings : null;
     if (!this.projects.some((p) => p.id === this.activeProjectId)) {
+      this.cancelPendingProjectMutations();
       this.activeProjectId = this.projects[0]?.id ?? null;
       this.tasks = [];
       this.activeDevSettings = null;
@@ -502,6 +528,7 @@ export class ProodShellElement extends BaseElement {
 
   private async selectWorkspace(workspaceId: WorkspaceId): Promise<void> {
     if (workspaceId === this.activeWorkspaceId) return;
+    this.cancelPendingWorkspaceMutations();
     this.activeWorkspaceId = workspaceId;
     this.activeProjectId = null;
     this.tasks = [];
@@ -519,6 +546,7 @@ export class ProodShellElement extends BaseElement {
     preserveHighlight = false,
   ): Promise<void> {
     if (projectId !== this.activeProjectId) {
+      this.cancelPendingProjectMutations();
       this.tasks = [];
       this.activeDevSettings = null;
       if (!preserveHighlight) this.highlightedTaskId = null;
@@ -548,15 +576,17 @@ export class ProodShellElement extends BaseElement {
   private async handleCreateProject(): Promise<void> {
     const workspaceId = this.activeWorkspaceId;
     if (!workspaceId || this.creatingProject) return;
+    const reusableProjectId =
+      this.pendingDevWorkspaceId === workspaceId ? this.pendingDevProjectId : null;
     const name = this.newProjectName.trim();
-    if (!name) {
+    if (!reusableProjectId && !name) {
       this.newProjectError = this.i18n.t("error.validation");
       this.render();
       return;
     }
 
     let normalizedPrefix: string | null = null;
-    if (this.newProjectEnableDev) {
+    if (this.newProjectEnableDev || reusableProjectId !== null) {
       normalizedPrefix = normalizeDevPrefix(this.newProjectPrefix);
       if (!normalizedPrefix) {
         this.newProjectError = this.i18n.t("error.invalidDevPrefix");
@@ -565,30 +595,42 @@ export class ProodShellElement extends BaseElement {
       }
     }
 
+    const seq = ++this.createProjectSeq;
     this.creatingProject = true;
     this.newProjectError = "";
     this.render();
 
-    const createRes = await createProject(workspaceId, {
-      name,
-      visibility: this.newProjectVisibility,
-      kind: "general",
-    });
-    if (!createRes.ok) {
-      this.creatingProject = false;
-      this.newProjectError = translateApiError(this.i18n, createRes.messageKey);
-      this.render();
-      return;
+    let targetProjectId = reusableProjectId;
+    if (!targetProjectId) {
+      const createRes = await createProject(workspaceId, {
+        name,
+        visibility: this.newProjectVisibility,
+        kind: "general",
+      });
+      if (seq !== this.createProjectSeq || this.activeWorkspaceId !== workspaceId) {
+        return;
+      }
+      if (!createRes.ok) {
+        this.creatingProject = false;
+        this.newProjectError = translateApiError(this.i18n, createRes.messageKey);
+        this.render();
+        return;
+      }
+      targetProjectId = createRes.data.project.id;
     }
 
-    const created = createRes.data.project;
     if (normalizedPrefix) {
-      const enableRes = await enableDevProject(created.id, {
+      const enableRes = await enableDevProject(targetProjectId, {
         prefix: normalizedPrefix,
       });
+      if (seq !== this.createProjectSeq || this.activeWorkspaceId !== workspaceId) {
+        return;
+      }
       if (!enableRes.ok) {
         this.creatingProject = false;
-        this.activeProjectId = created.id;
+        this.pendingDevProjectId = targetProjectId;
+        this.pendingDevWorkspaceId = workspaceId;
+        this.activeProjectId = targetProjectId;
         this.newProjectError = translateApiError(this.i18n, enableRes.messageKey);
         this.syncUrlState();
         await this.loadWorkspaceData(workspaceId);
@@ -597,12 +639,14 @@ export class ProodShellElement extends BaseElement {
     }
 
     this.creatingProject = false;
+    this.pendingDevProjectId = null;
+    this.pendingDevWorkspaceId = null;
     this.newProjectOpen = false;
     this.newProjectName = "";
     this.newProjectPrefix = "";
     this.newProjectEnableDev = false;
     this.newProjectVisibility = "workspace";
-    this.activeProjectId = created.id;
+    this.activeProjectId = targetProjectId;
     this.activeView = "list";
     this.tasks = [];
     this.activeDevSettings = null;
@@ -615,8 +659,10 @@ export class ProodShellElement extends BaseElement {
     title: string,
     statusId: StatusId | null,
   ): Promise<void> {
+    const workspaceId = this.activeWorkspaceId;
     const projectId = this.activeProjectId;
-    if (!projectId || this.creatingTask) return;
+    if (!workspaceId || !projectId || this.creatingTask) return;
+    const seq = ++this.createTaskSeq;
     this.creatingTask = true;
     this.taskCreateError = "";
     this.taskCreateNotice = "";
@@ -626,6 +672,13 @@ export class ProodShellElement extends BaseElement {
       title: title.trim(),
       ...(statusId ? { statusId } : {}),
     });
+    if (
+      seq !== this.createTaskSeq ||
+      this.activeWorkspaceId !== workspaceId ||
+      this.activeProjectId !== projectId
+    ) {
+      return;
+    }
     this.creatingTask = false;
     if (!res.ok) {
       this.taskCreateError = translateApiError(this.i18n, res.messageKey);
@@ -642,11 +695,18 @@ export class ProodShellElement extends BaseElement {
   private async handleSaveWorkspaceSettings(devProjectsEnabled: boolean): Promise<void> {
     const workspaceId = this.activeWorkspaceId;
     if (!workspaceId || this.savingWorkspaceSettings) return;
+    const seq = ++this.workspaceSettingsSaveSeq;
     this.savingWorkspaceSettings = true;
     this.clearFeedback();
     this.render();
 
     const res = await updateWorkspaceSettings(workspaceId, { devProjectsEnabled });
+    if (
+      seq !== this.workspaceSettingsSaveSeq ||
+      this.activeWorkspaceId !== workspaceId
+    ) {
+      return;
+    }
     this.savingWorkspaceSettings = false;
     if (!res.ok) {
       this.workspaceSettingsError = translateApiError(this.i18n, res.messageKey);
@@ -668,17 +728,22 @@ export class ProodShellElement extends BaseElement {
     const workspaceId = this.activeWorkspaceId;
     const projectId = this.activeProjectId;
     if (!workspaceId || !projectId || this.savingProjectSettings) return;
+    const seq = ++this.projectSettingsSaveSeq;
     this.savingProjectSettings = true;
     this.clearFeedback();
     this.render();
 
     const res =
       mode === "enable"
-        ? await enableDevProject(projectId, {
-            prefix,
-            ...(startStatusId ? { startStatusId } : {}),
-          })
+        ? await enableDevProject(projectId, { prefix, startStatusId })
         : await updateDevProjectSettings(projectId, { prefix, startStatusId });
+    if (
+      seq !== this.projectSettingsSaveSeq ||
+      this.activeWorkspaceId !== workspaceId ||
+      this.activeProjectId !== projectId
+    ) {
+      return;
+    }
     this.savingProjectSettings = false;
     if (!res.ok) {
       this.projectSettingsError = translateApiError(this.i18n, res.messageKey);
@@ -1062,6 +1127,9 @@ export class ProodShellElement extends BaseElement {
 
   private renderSidebar(wsRole: WorkspaceRole | null): HTMLElement {
     const { t } = this.i18n;
+    const isPendingDevRetry =
+      this.pendingDevProjectId !== null &&
+      this.pendingDevWorkspaceId === this.activeWorkspaceId;
     const sidebar = el(
       "aside",
       { cls: "prood-sidebar", attrs: { "aria-label": t("aria.projectList") } },
@@ -1078,6 +1146,10 @@ export class ProodShellElement extends BaseElement {
                 click: () => {
                   this.newProjectOpen = !this.newProjectOpen;
                   this.newProjectError = "";
+                  if (!this.newProjectOpen) {
+                    this.pendingDevProjectId = null;
+                    this.pendingDevWorkspaceId = null;
+                  }
                   this.render();
                 },
               },
@@ -1090,7 +1162,8 @@ export class ProodShellElement extends BaseElement {
       const nameInput = el("input", {
         id: "prood-new-project-name",
         type: "text",
-        required: true,
+        required: !isPendingDevRetry,
+        disabled: isPendingDevRetry,
         cls: "prood-input",
         placeholder: t("project.namePlaceholder"),
         val: this.newProjectName,
@@ -1106,6 +1179,7 @@ export class ProodShellElement extends BaseElement {
         {
           id: "prood-new-project-vis",
           cls: "prood-select",
+          disabled: isPendingDevRetry,
           attrs: { "data-new-project-visibility": true },
         },
         ...(["workspace", "private"] as const).map((v) =>
@@ -1122,15 +1196,15 @@ export class ProodShellElement extends BaseElement {
 
       let devToggleRow: HTMLElement | null = null;
       let prefixRow: HTMLElement | null = null;
-      if (this.workspaceSettings?.devProjectsEnabled) {
+      if (this.workspaceSettings?.devProjectsEnabled || isPendingDevRetry) {
         const prefixInput = el("input", {
           id: "prood-new-project-prefix",
           type: "text",
           cls: "prood-input prood-mono",
           placeholder: t("settings.prefixPlaceholder"),
           val: this.newProjectPrefix,
-          disabled: !this.newProjectEnableDev,
-          required: this.newProjectEnableDev,
+          disabled: !isPendingDevRetry && !this.newProjectEnableDev,
+          required: isPendingDevRetry || this.newProjectEnableDev,
           attrs: { minlength: 2, maxlength: 10, "data-new-project-prefix": true },
           on: {
             input: () => {
@@ -1140,7 +1214,8 @@ export class ProodShellElement extends BaseElement {
         });
         const devCheck = el("input", {
           type: "checkbox",
-          checked: this.newProjectEnableDev,
+          checked: isPendingDevRetry || this.newProjectEnableDev,
+          disabled: isPendingDevRetry,
           attrs: { "data-new-project-dev-toggle": true },
           on: {
             change: () => {
@@ -1202,6 +1277,12 @@ export class ProodShellElement extends BaseElement {
                 click: () => {
                   this.newProjectOpen = false;
                   this.newProjectError = "";
+                  this.pendingDevProjectId = null;
+                  this.pendingDevWorkspaceId = null;
+                  this.newProjectName = "";
+                  this.newProjectPrefix = "";
+                  this.newProjectEnableDev = false;
+                  this.newProjectVisibility = "workspace";
                   this.render();
                 },
               },
