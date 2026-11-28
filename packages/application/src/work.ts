@@ -163,6 +163,7 @@ function toProjectDto(
   project: ProjectRecord,
   statuses: ProjectStatusRecord[],
   devSettings: DevProjectSettingsDto | null = null,
+  myRole?: ProjectRole,
 ): ProjectDto {
   return {
     id: project.id,
@@ -173,6 +174,7 @@ function toProjectDto(
     description: project.description,
     statuses: statuses.map(toStatusDto),
     devSettings,
+    ...(myRole ? { myRole } : {}),
     createdAt: project.createdAt,
     updatedAt: project.updatedAt,
   };
@@ -1054,7 +1056,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           ok: true,
           data: {
             contractVersion: CONTRACT_VERSION,
-            project: toProjectDto(project, defaultStatuses),
+            project: toProjectDto(project, defaultStatuses, null, "admin"),
           },
         };
       });
@@ -1085,16 +1087,16 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         }
 
         const allProjects = await repos.projects.listByWorkspace(workspaceId);
-        const visibleProjects: ProjectRecord[] = [];
+        const visibleProjects: Array<{ project: ProjectRecord; role: ProjectRole }> = [];
         for (const project of allProjects) {
           const role = await resolveActorProjectRole(repos, actor.userId, project);
-          if (canReadProject(role)) {
-            visibleProjects.push(project);
+          if (canReadProject(role) && role !== null) {
+            visibleProjects.push({ project, role });
           }
         }
 
         const namespaces = await repos.issueKeys.findNamespacesByProjectIds(
-          visibleProjects.map((p) => p.id),
+          visibleProjects.map((entry) => entry.project.id),
         );
         const namespaceByProjectId = new Map<ProjectId, IssueKeyNamespaceRecord>();
         for (const ns of namespaces) {
@@ -1113,13 +1115,13 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         }
 
         const visible: ProjectDto[] = [];
-        for (const project of visibleProjects) {
+        for (const { project, role } of visibleProjects) {
           const statuses = await repos.statuses.listByProject(project.id);
           const ns = namespaceByProjectId.get(project.id) ?? null;
           const devSettings = ns
             ? toDevProjectSettingsDto(ns, prefixesByNamespaceId.get(ns.id) ?? [])
             : null;
-          visible.push(toProjectDto(project, statuses, devSettings));
+          visible.push(toProjectDto(project, statuses, devSettings, role));
         }
         return {
           ok: true,
@@ -1176,6 +1178,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
               project,
               statuses,
               ns ? toDevProjectSettingsDto(ns, prefixes) : null,
+              role ?? undefined,
             ),
           },
         };
@@ -2476,6 +2479,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           data: {
             contractVersion: CONTRACT_VERSION,
             allowed: wsSettings?.devProjectsEnabled ?? false,
+            canManage: canManageProject(role),
             dev: namespace ? toDevProjectSettingsDto(namespace, prefixes) : null,
             statuses: statuses.map(toStatusDto),
           },
@@ -2856,6 +2860,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
           data: {
             contractVersion: CONTRACT_VERSION,
             allowed: true,
+            canManage: true,
             dev: toDevProjectSettingsDto(updatedNamespace, allPrefixes),
             statuses: projectStatuses.map(toStatusDto),
           },

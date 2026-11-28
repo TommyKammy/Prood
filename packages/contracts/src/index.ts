@@ -9,6 +9,7 @@ import type {
   OutboxId,
   ProjectId,
   ProjectKind,
+  ProjectRole,
   ProjectVisibility,
   StatusCategory,
   StatusId,
@@ -120,6 +121,7 @@ export interface ProjectDto {
   description: string;
   statuses: ProjectStatusDto[];
   devSettings: DevProjectSettingsDto | null;
+  myRole?: ProjectRole;
   createdAt: string;
   updatedAt: string;
 }
@@ -144,6 +146,7 @@ export interface UpdateWorkspaceSettingsRequest {
 export interface ProjectDevSettingsResponse {
   contractVersion: typeof CONTRACT_VERSION;
   allowed: boolean;
+  canManage?: boolean;
   dev: DevProjectSettingsDto | null;
   statuses: ProjectStatusDto[];
 }
