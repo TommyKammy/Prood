@@ -798,6 +798,8 @@ export class ProodShellElement extends BaseElement {
       return;
     }
 
+    this.workspaceDataSeq += 1;
+    this.loadingWorkspace = false;
     this.workspaceSettings = res.data.settings;
     this.wsDevEnabledDraft = null;
     this.workspaceSettingsNotice = this.i18n.t("settings.saved");
@@ -836,6 +838,7 @@ export class ProodShellElement extends BaseElement {
       return;
     }
 
+    this.projectDataSeq += 1;
     this.devPrefixDirty = false;
     this.devStartStatusDirty = false;
     this.projectSettingsNotice =

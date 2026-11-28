@@ -1775,5 +1775,142 @@ describe("@prood/web async race regressions", () => {
     await flushUiTicks(4);
     expect(doc.querySelector<HTMLInputElement>("[data-ws-dev-toggle]")!.checked).toBe(true);
   });
+
+  it("rejects workspace-settings reads that predate a successful save (4725907331)", async () => {
+    const userId = generateEntityId("usr", 1_795_000_000_000, new Uint8Array(10).fill(1));
+    const wksA = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(2));
+    const projA = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(3));
+    const statusA = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(4));
+    const projectA = makeProject(wksA, projA, statusA, "Project Alpha");
+    const now = "2026-11-28T12:00:00.000Z";
+
+    let delayWsSettings = false;
+    let resolveDelayedWsSettings: ((res: Response) => void) | null = null;
+    let currentEnabled = false;
+
+    const { win, doc } = await mountMockedShell(async (path, init) => {
+      if (path === "/api/v1/me") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          user: { id: userId, email: "alice@example.com", displayName: "Alice" },
+          memberships: [
+            {
+              membershipId: makeMembershipId(200),
+              workspaceId: wksA,
+              workspaceSlug: "ws-a",
+              workspaceName: "WS Alpha",
+              role: "admin",
+            },
+          ],
+        } satisfies MeResponse);
+      }
+      if (path === `/api/v1/workspaces/${wksA}/projects`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, projects: [projectA] });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/settings` && (init?.method ?? "GET") === "GET") {
+        if (delayWsSettings) {
+          return new Promise<Response>((resolve) => {
+            resolveDelayedWsSettings = resolve;
+          });
+        }
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          settings: {
+            workspaceId: wksA,
+            defaultLocale: "en",
+            devProjectsEnabled: currentEnabled,
+            updatedAt: now,
+          } satisfies WorkspaceSettingsDto,
+        });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/settings` && init?.method === "PATCH") {
+        const parsed = JSON.parse(String(init.body ?? "{}")) as {
+          devProjectsEnabled?: boolean;
+        };
+        currentEnabled = parsed.devProjectsEnabled ?? currentEnabled;
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          settings: {
+            workspaceId: wksA,
+            defaultLocale: "en",
+            devProjectsEnabled: currentEnabled,
+            updatedAt: now,
+          } satisfies WorkspaceSettingsDto,
+        });
+      }
+      if (path.endsWith("/tasks")) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, tasks: [] });
+      }
+      if (path.endsWith("/dev-settings")) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          allowed: currentEnabled,
+          canManage: true,
+          dev: null,
+          statuses: projectA.statuses,
+        } satisfies ProjectDevSettingsResponse);
+      }
+      throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${path}`);
+    });
+
+    await waitForCondition(
+      () => doc.querySelector('[data-nav-view="settings"]') !== null,
+      "initial shell loaded",
+    );
+    doc.querySelector<HTMLButtonElement>('[data-nav-view="settings"]')!.click();
+    await waitForCondition(
+      () => doc.querySelector("[data-ws-dev-toggle]") !== null,
+      "initial settings loaded",
+    );
+
+    doc.querySelector<HTMLButtonElement>('[data-nav-view="list"]')!.click();
+    await waitForCondition(
+      () => doc.querySelector("[data-create-task-form]") !== null,
+      "returned to list",
+    );
+
+    delayWsSettings = true;
+    doc.querySelector<HTMLButtonElement>('[data-nav-view="settings"]')!.click();
+    await waitForCondition(
+      () =>
+        doc.querySelector("[data-ws-dev-toggle]") !== null &&
+        resolveDelayedWsSettings !== null,
+      "settings rendered while pre-save GET is pending",
+    );
+
+    // Toggle to true and save immediately BEFORE the older background GET finishes
+    const toggle = doc.querySelector<HTMLInputElement>("[data-ws-dev-toggle]")!;
+    toggle.checked = true;
+    toggle.dispatchEvent(new win.Event("change") as unknown as Event);
+    doc
+      .querySelector<HTMLFormElement>("[data-workspace-settings-form]")!
+      .dispatchEvent(new win.Event("submit", { cancelable: true }) as unknown as Event);
+
+    await waitForCondition(
+      () =>
+        doc
+          .querySelector(".prood-status-banner")
+          ?.textContent?.includes("Settings saved") ?? false,
+      "workspace settings saved",
+    );
+    expect(doc.querySelector<HTMLInputElement>("[data-ws-dev-toggle]")!.checked).toBe(true);
+
+    // Older background GET finally arrives with pre-save false -> must be rejected
+    delayWsSettings = false;
+    resolveDelayedWsSettings!(
+      jsonResponse({
+        contractVersion: CONTRACT_VERSION,
+        settings: {
+          workspaceId: wksA,
+          defaultLocale: "en",
+          devProjectsEnabled: false,
+          updatedAt: now,
+        } satisfies WorkspaceSettingsDto,
+      }),
+    );
+    await flushUiTicks(6);
+
+    expect(doc.querySelector<HTMLInputElement>("[data-ws-dev-toggle]")!.checked).toBe(true);
+  });
 });
 
