@@ -124,6 +124,8 @@ export class ProodShellElement extends BaseElement {
   private projectSettingsError = "";
   private devPrefixDraft = "";
   private devStartStatusDraft: StatusId | "" = "";
+  private devPrefixDirty = false;
+  private devStartStatusDirty = false;
 
   private shellRoot: HTMLDivElement | null = null;
   private searchPalette: SearchPaletteController | null = null;
@@ -324,6 +326,13 @@ export class ProodShellElement extends BaseElement {
     this.newProjectError = "";
   }
 
+  private resetDevSettingsDrafts(): void {
+    this.devPrefixDraft = "";
+    this.devStartStatusDraft = "";
+    this.devPrefixDirty = false;
+    this.devStartStatusDirty = false;
+  }
+
   private clearWorkspaceScopedData(): void {
     this.projectDataSeq += 1;
     this.activeProjectId = null;
@@ -342,8 +351,7 @@ export class ProodShellElement extends BaseElement {
     this.taskTitleDraft = "";
     this.taskStatusDraft = "";
     this.highlightedTaskId = null;
-    this.devPrefixDraft = "";
-    this.devStartStatusDraft = "";
+    this.resetDevSettingsDrafts();
     this.clearFeedback();
     this.searchPalette?.reset();
   }
@@ -507,6 +515,7 @@ export class ProodShellElement extends BaseElement {
       this.tasks = [];
       this.activeDevSettings = null;
       this.taskLoadError = "";
+      this.resetDevSettingsDrafts();
       this.workspaceLoadError = translateApiError(this.i18n, projRes.messageKey);
       this.render();
       return;
@@ -529,6 +538,7 @@ export class ProodShellElement extends BaseElement {
       this.tasks = [];
       this.activeDevSettings = null;
       this.taskLoadError = "";
+      this.resetDevSettingsDrafts();
     }
     this.syncUrlState();
     this.render();
@@ -539,6 +549,7 @@ export class ProodShellElement extends BaseElement {
       this.tasks = [];
       this.activeDevSettings = null;
       this.taskLoadError = "";
+      this.resetDevSettingsDrafts();
       this.render();
     }
   }
@@ -566,13 +577,17 @@ export class ProodShellElement extends BaseElement {
     }
     if (devRes.ok) {
       this.activeDevSettings = devRes.data;
-      this.devPrefixDraft = devRes.data.dev?.prefix ?? "";
-      this.devStartStatusDraft = devRes.data.dev?.startStatusId ?? "";
+      if (!this.devPrefixDirty) {
+        this.devPrefixDraft = devRes.data.dev?.prefix ?? "";
+      }
+      if (!this.devStartStatusDirty) {
+        this.devStartStatusDraft = devRes.data.dev?.startStatusId ?? "";
+      }
       this.projectSettingsError = "";
     } else {
       this.activeDevSettings = null;
-      this.devPrefixDraft = "";
-      this.devStartStatusDraft = "";
+      if (!this.devPrefixDirty) this.devPrefixDraft = "";
+      if (!this.devStartStatusDirty) this.devStartStatusDraft = "";
       this.projectSettingsError = translateApiError(this.i18n, devRes.messageKey);
     }
     this.searchPalette?.syncLabels();
@@ -598,6 +613,7 @@ export class ProodShellElement extends BaseElement {
       this.tasks = [];
       this.activeDevSettings = null;
       this.taskLoadError = "";
+      this.resetDevSettingsDrafts();
       if (!preserveHighlight) this.highlightedTaskId = null;
     }
     this.activeProjectId = projectId;
@@ -686,6 +702,7 @@ export class ProodShellElement extends BaseElement {
           this.tasks = [];
           this.activeDevSettings = null;
           this.taskLoadError = "";
+          this.resetDevSettingsDrafts();
         }
         this.activeProjectId = targetProjectId;
         this.newProjectError = translateApiError(this.i18n, enableRes.messageKey);
@@ -709,6 +726,7 @@ export class ProodShellElement extends BaseElement {
     this.tasks = [];
     this.activeDevSettings = null;
     this.taskLoadError = "";
+    this.resetDevSettingsDrafts();
     this.highlightedTaskId = null;
     this.syncUrlState();
     await this.loadWorkspaceData(workspaceId);
@@ -813,6 +831,8 @@ export class ProodShellElement extends BaseElement {
       return;
     }
 
+    this.devPrefixDirty = false;
+    this.devStartStatusDirty = false;
     this.projectSettingsNotice =
       mode === "enable" && "keyedCount" in res.data
         ? this.i18n.t("settings.enabledSummary", { count: res.data.keyedCount })
@@ -1132,9 +1152,11 @@ export class ProodShellElement extends BaseElement {
               startStatusDraft: this.devStartStatusDraft,
               onPrefixDraftChange: (v) => {
                 this.devPrefixDraft = v;
+                this.devPrefixDirty = true;
               },
               onStartStatusDraftChange: (v) => {
                 this.devStartStatusDraft = v;
+                this.devStartStatusDirty = true;
               },
               onSaveWorkspaceSettings: (v) => void this.handleSaveWorkspaceSettings(v),
               onEnableDevProject: (p, s) =>

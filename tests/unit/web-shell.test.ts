@@ -1484,5 +1484,184 @@ describe("@prood/web async race regressions", () => {
       "PRD-2 selected on Enter",
     );
   });
+
+  it("preserves project dev settings drafts edited during background reloads and workspace saves (4725756197)", async () => {
+    const userId = generateEntityId("usr", 1_795_000_000_000, new Uint8Array(10).fill(1));
+    const wksA = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(2));
+    const projA = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(3));
+    const nspA = generateEntityId("ins", 1_795_000_000_000, new Uint8Array(10).fill(4));
+    const statusTodo = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(5));
+    const statusInProgress = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(6));
+    const now = "2026-11-28T12:00:00.000Z";
+
+    const projectA: ProjectDto = {
+      ...makeProject(wksA, projA, statusTodo, "Dev Project"),
+      kind: "development",
+      statuses: [
+        {
+          id: statusTodo,
+          projectId: projA,
+          name: "To Do",
+          category: "todo",
+          position: 0,
+        },
+        {
+          id: statusInProgress,
+          projectId: projA,
+          name: "In Progress",
+          category: "in_progress",
+          position: 1,
+        },
+      ],
+      devSettings: {
+        namespaceId: nspA,
+        projectId: projA,
+        prefix: "PRD",
+        branchPrefix: "prd",
+        startStatusId: null,
+        oldPrefixes: [],
+        enabledAt: now,
+        updatedAt: now,
+      },
+    };
+
+    const devSettingsBody: ProjectDevSettingsResponse = {
+      contractVersion: CONTRACT_VERSION,
+      allowed: true,
+      canManage: true,
+      dev: projectA.devSettings,
+      statuses: projectA.statuses,
+    };
+
+    let delayReload = false;
+    let resolveDelayedDevGet: ((res: Response) => void) | null = null;
+    let wsDevEnabled = true;
+
+    const { win, doc } = await mountMockedShell(async (path, init) => {
+      if (path === "/api/v1/me") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          user: { id: userId, email: "alice@example.com", displayName: "Alice" },
+          memberships: [
+            {
+              membershipId: makeMembershipId(180),
+              workspaceId: wksA,
+              workspaceSlug: "ws-a",
+              workspaceName: "WS Alpha",
+              role: "admin",
+            },
+          ],
+        } satisfies MeResponse);
+      }
+      if (path === `/api/v1/workspaces/${wksA}/projects`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, projects: [projectA] });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/settings` && (init?.method ?? "GET") === "GET") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          settings: {
+            workspaceId: wksA,
+            defaultLocale: "en",
+            devProjectsEnabled: wsDevEnabled,
+            updatedAt: now,
+          } satisfies WorkspaceSettingsDto,
+        });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/settings` && init?.method === "PATCH") {
+        const parsed = JSON.parse(String(init.body ?? "{}")) as {
+          devProjectsEnabled?: boolean;
+        };
+        wsDevEnabled = parsed.devProjectsEnabled ?? wsDevEnabled;
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          settings: {
+            workspaceId: wksA,
+            defaultLocale: "en",
+            devProjectsEnabled: wsDevEnabled,
+            updatedAt: now,
+          } satisfies WorkspaceSettingsDto,
+        });
+      }
+      if (path === `/api/v1/projects/${projA}/tasks`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, tasks: [] });
+      }
+      if (path === `/api/v1/projects/${projA}/dev-settings`) {
+        if (delayReload) {
+          return new Promise<Response>((resolve) => {
+            resolveDelayedDevGet = resolve;
+          });
+        }
+        return jsonResponse(devSettingsBody);
+      }
+      throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${path}`);
+    });
+
+    await waitForCondition(
+      () => doc.querySelector('[data-nav-view="settings"]') !== null,
+      "initial shell loaded",
+    );
+    doc.querySelector<HTMLButtonElement>('[data-nav-view="settings"]')!.click();
+    await waitForCondition(
+      () => doc.querySelector<HTMLInputElement>("[data-proj-prefix-input]")?.value === "PRD",
+      "initial dev settings loaded",
+    );
+
+    // Return to List, then re-enter Settings with a deferred background reload
+    doc.querySelector<HTMLButtonElement>('[data-nav-view="list"]')!.click();
+    await waitForCondition(
+      () => doc.querySelector("[data-create-task-form]") !== null,
+      "returned to list",
+    );
+
+    delayReload = true;
+    doc.querySelector<HTMLButtonElement>('[data-nav-view="settings"]')!.click();
+    await waitForCondition(
+      () =>
+        doc.querySelector("[data-proj-prefix-input]") !== null &&
+        resolveDelayedDevGet !== null,
+      "settings rendered immediately while background reload is in flight",
+    );
+
+    const prefixInput = doc.querySelector<HTMLInputElement>("[data-proj-prefix-input]")!;
+    prefixInput.value = "CUSTOM";
+    prefixInput.dispatchEvent(new win.Event("input") as unknown as Event);
+
+    const startSelect = doc.querySelector<HTMLSelectElement>(
+      "[data-proj-start-status-select]",
+    )!;
+    startSelect.value = statusInProgress;
+    startSelect.dispatchEvent(new win.Event("change") as unknown as Event);
+
+    // Finish background reload -> unsaved edits must survive
+    delayReload = false;
+    resolveDelayedDevGet!(jsonResponse(devSettingsBody));
+    await flushUiTicks(6);
+
+    expect(doc.querySelector<HTMLInputElement>("[data-proj-prefix-input]")!.value).toBe(
+      "CUSTOM",
+    );
+    expect(
+      doc.querySelector<HTMLSelectElement>("[data-proj-start-status-select]")!.value,
+    ).toBe(statusInProgress);
+
+    // Saving workspace settings triggers loadProjectData(), which must also keep those drafts
+    doc
+      .querySelector<HTMLFormElement>("[data-workspace-settings-form]")!
+      .dispatchEvent(new win.Event("submit", { cancelable: true }) as unknown as Event);
+    await waitForCondition(
+      () =>
+        doc
+          .querySelector(".prood-status-banner")
+          ?.textContent?.includes("Settings saved") ?? false,
+      "workspace settings saved",
+    );
+
+    expect(doc.querySelector<HTMLInputElement>("[data-proj-prefix-input]")!.value).toBe(
+      "CUSTOM",
+    );
+    expect(
+      doc.querySelector<HTMLSelectElement>("[data-proj-start-status-select]")!.value,
+    ).toBe(statusInProgress);
+  });
 });
 

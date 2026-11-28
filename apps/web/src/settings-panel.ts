@@ -196,6 +196,7 @@ export function renderSettingsPanel(opts: SettingsPanelOptions): HTMLElement {
       }),
     ),
   );
+  startSelect.value = opts.startStatusDraft || "";
   startSelect.addEventListener("change", () =>
     opts.onStartStatusDraftChange((startSelect.value as StatusId | "") || ""),
   );
