@@ -9,6 +9,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   createSystemIdGenerator,
   createWorkUseCases,
+  type TransactionRepositories,
+  type UnitOfWork,
 } from "@prood/application";
 import {
   MCP_READ_SCOPE,
@@ -1074,6 +1076,282 @@ describe(`Atomic start_task & status transition contracts (${targetDb})`, () => 
     );
     expect(httpDelete.status).toBe(200);
     expect(httpDelete.data.deletedStatusId).toBe(todoStatus.id);
+
+    if (ctx.sqliteFilePath) {
+      const raw = await openSqliteConnection(ctx.sqliteFilePath);
+      try {
+        expect(raw.pragma("foreign_key_check")).toEqual([]);
+      } finally {
+        raw.close();
+      }
+    }
+  });
+
+  it("serializes status deletion with concurrent default/explicit createTask, updateTask, and copyTask without FK violations", async () => {
+    const ctx = await createIsolatedDb();
+    const db = ctx.openClient();
+    await db.migrate();
+    const server = await startTestHttpServer(db);
+    const ids = createSystemIdGenerator();
+    const now = "2026-11-28T10:00:00.000Z";
+
+    const admin = await server.signUpUser("delrace-admin@example.com", "DelRace Admin");
+    const member = await server.signUpUser("delrace-member@example.com", "DelRace Member");
+    const wksId = ids.next("wks");
+
+    await db.uow.run(async (repos) => {
+      await repos.workspaces.create({
+        id: wksId,
+        slug: "delrace-ws",
+        name: "Delete Race WS",
+        createdAt: now,
+      });
+      for (const [userId, role] of [
+        [admin.userId, "admin"],
+        [member.userId, "member"],
+      ] as const) {
+        await repos.memberships.create({
+          id: ids.next("mbr"),
+          workspaceId: wksId,
+          userId,
+          role,
+          createdAt: now,
+        });
+      }
+    });
+
+    const makeWorkerClient = () =>
+      targetDb === "sqlite"
+        ? ctx.openClient({
+            busyTimeoutMs: 25,
+            maxRetryAttempts: 60,
+            retryBaseDelayMs: 5,
+          })
+        : ctx.openClient({ maxPoolSize: 2, maxRetryAttempts: 12 });
+
+    // 1. Gated test on PostgreSQL reproducing the exact Codex P2 race:
+    // deleteProjectStatus holds `projects FOR UPDATE` after deleting default To Do status,
+    // while createTask (default status) & updateTask attempt to select/validate that status.
+    if (targetDb === "postgres") {
+      const gatedProj = (
+        await server.webJson<{ project: ProjectDto }>(
+          `/api/v1/workspaces/${wksId}/projects`,
+          admin.jar,
+          { method: "POST", json: { name: "Gated Delete Race", visibility: "workspace" } },
+        )
+      ).data.project;
+      const todoStatus = gatedProj.statuses.find((s) => s.category === "todo")!;
+      const existingTask = (
+        await server.webJson<TaskResponse>(
+          `/api/v1/projects/${gatedProj.id}/tasks`,
+          admin.jar,
+          { method: "POST", json: { title: "Existing before delete" } },
+        )
+      ).data.task;
+
+      let signalAfterDelete!: () => void;
+      const afterDelete = new Promise<void>((res) => {
+        signalAfterDelete = res;
+      });
+      let releaseCommit!: () => void;
+      const allowCommit = new Promise<void>((res) => {
+        releaseCommit = res;
+      });
+
+      const deleteWorkerDb = makeWorkerClient();
+      const gatedUow: UnitOfWork = {
+        run<T>(fn: (repos: TransactionRepositories) => Promise<T>): Promise<T> {
+          return deleteWorkerDb.uow.run(async (repos) => {
+            const wrappedStatuses = {
+              ...repos.statuses,
+              async deleteById(id: Parameters<typeof repos.statuses.deleteById>[0]) {
+                const deleted = await repos.statuses.deleteById(id);
+                signalAfterDelete();
+                await allowCommit;
+                return deleted;
+              },
+            };
+            return fn({ ...repos, statuses: wrappedStatuses });
+          });
+        },
+      };
+      const gatedDeleteWork = createWorkUseCases({
+        uow: gatedUow,
+        idGenerator: createSystemIdGenerator(),
+        clock: { now: () => new Date() },
+      });
+
+      const delPromise = gatedDeleteWork.deleteProjectStatus(
+        { userId: admin.userId, actorType: "user", channel: "web" },
+        gatedProj.id,
+        todoStatus.id,
+      );
+      await afterDelete;
+
+      const createDefaultWork = createWorkUseCases({
+        uow: makeWorkerClient().uow,
+        idGenerator: createSystemIdGenerator(),
+        clock: { now: () => new Date() },
+      });
+      const updateWork = createWorkUseCases({
+        uow: makeWorkerClient().uow,
+        idGenerator: createSystemIdGenerator(),
+        clock: { now: () => new Date() },
+      });
+
+      let createSettled = false;
+      const createPromise = createDefaultWork
+        .createTask(
+          { userId: member.userId, actorType: "user", channel: "web" },
+          gatedProj.id,
+          { title: "Created during status delete" },
+        )
+        .finally(() => {
+          createSettled = true;
+        });
+      const updateExplicitPromise = updateWork.updateTask(
+        { userId: member.userId, actorType: "user", channel: "web" },
+        existingTask.id,
+        { statusId: todoStatus.id },
+      );
+
+      // Both must wait on the shared project lock rather than reading the stale status
+      await new Promise((r) => setTimeout(r, 80));
+      expect(createSettled).toBe(false);
+
+      releaseCommit();
+      const [delRes, createdRes, updatedRes] = await Promise.all([
+        delPromise,
+        createPromise,
+        updateExplicitPromise,
+      ]);
+      expect(delRes.ok).toBe(true);
+      expect(createdRes.ok).toBe(true);
+      if (createdRes.ok) {
+        expect(createdRes.data.task.statusId).not.toBe(todoStatus.id);
+      }
+      expect(updatedRes.ok).toBe(false);
+      if (!updatedRes.ok) {
+        expect(updatedRes.status).toBe(400);
+      }
+    }
+
+    // 2. Dual-DB start-barrier race: delete default status concurrently with
+    // default createTask, explicit-status createTask, copyTask, and updateTask
+    const barrierProj = (
+      await server.webJson<{ project: ProjectDto }>(
+        `/api/v1/workspaces/${wksId}/projects`,
+        admin.jar,
+        { method: "POST", json: { name: "Barrier Delete Race", visibility: "workspace" } },
+      )
+    ).data.project;
+    const defaultTodo = barrierProj.statuses.find((s) => s.category === "todo")!;
+    const sourceForCopy = (
+      await server.webJson<TaskResponse>(
+        `/api/v1/projects/${barrierProj.id}/tasks`,
+        admin.jar,
+        { method: "POST", json: { title: "Source task to copy" } },
+      )
+    ).data.task;
+    const taskForUpdate = (
+      await server.webJson<TaskResponse>(
+        `/api/v1/projects/${barrierProj.id}/tasks`,
+        admin.jar,
+        {
+          method: "POST",
+          json: {
+            title: "Task to update status",
+            statusId: barrierProj.statuses.find((s) => s.category === "in_progress")!.id,
+          },
+        },
+      )
+    ).data.task;
+
+    const makeWork = () =>
+      createWorkUseCases({
+        uow: makeWorkerClient().uow,
+        idGenerator: createSystemIdGenerator(),
+        clock: { now: () => new Date() },
+      });
+
+    const raceBarrier = createBarrier(5);
+    const adminWork = makeWork();
+    const wCreateDefault = makeWork();
+    const wCreateExplicit = makeWork();
+    const wCopy = makeWork();
+    const wUpdate = makeWork();
+
+    const adminActor = {
+      userId: admin.userId,
+      actorType: "user" as const,
+      channel: "web" as const,
+    };
+    const memberActor = {
+      userId: member.userId,
+      actorType: "user" as const,
+      channel: "web" as const,
+    };
+
+    const [delOut, defCreateOut, expCreateOut, copyOut, updOut] =
+      await Promise.all([
+        (async () => {
+          await raceBarrier();
+          return adminWork.deleteProjectStatus(
+            adminActor,
+            barrierProj.id,
+            defaultTodo.id,
+          );
+        })(),
+        (async () => {
+          await raceBarrier();
+          return wCreateDefault.createTask(memberActor, barrierProj.id, {
+            title: "Concurrent default status create",
+          });
+        })(),
+        (async () => {
+          await raceBarrier();
+          return wCreateExplicit.createTask(memberActor, barrierProj.id, {
+            title: "Concurrent explicit deleted status create",
+            statusId: defaultTodo.id,
+          });
+        })(),
+        (async () => {
+          await raceBarrier();
+          return wCopy.copyTask(memberActor, sourceForCopy.id, {
+            title: "Copied during status delete",
+          });
+        })(),
+        (async () => {
+          await raceBarrier();
+          return wUpdate.updateTask(memberActor, taskForUpdate.id, {
+            statusId: defaultTodo.id,
+          });
+        })(),
+      ]);
+
+    expect(delOut.ok).toBe(true);
+    expect(defCreateOut.ok).toBe(true);
+    expect(copyOut.ok).toBe(true);
+    if (!expCreateOut.ok) {
+      expect(expCreateOut.status).toBe(400);
+    }
+    if (!updOut.ok) {
+      expect(updOut.status).toBe(400);
+    }
+
+    const postRaceState = await db.uow.run(async (repos) => {
+      const remaining = await repos.statuses.listByProject(barrierProj.id);
+      const validIds = new Set(remaining.map((s) => s.id));
+      const allTasks = await repos.tasks.listByProject(barrierProj.id);
+      return { validIds, allTasks };
+    });
+
+    expect(postRaceState.validIds.has(defaultTodo.id)).toBe(false);
+    for (const task of postRaceState.allTasks) {
+      if (task.statusId !== null) {
+        expect(postRaceState.validIds.has(task.statusId)).toBe(true);
+      }
+    }
 
     if (ctx.sqliteFilePath) {
       const raw = await openSqliteConnection(ctx.sqliteFilePath);

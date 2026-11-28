@@ -1468,6 +1468,15 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
             initialRole = resolvedProject.role;
           }
 
+          // Acquire shared project lock BEFORE locking tasks or reading/validating statuses
+          // so concurrent deleteProjectStatus() cannot drop a selected status mid-flight.
+          const lockedProject = await repos.projects.lockForTaskWrite(
+            effectiveProject.id,
+          );
+          if (!lockedProject) {
+            return fail(404, "NOT_FOUND", "error.notFound");
+          }
+
           let resolvedParentTaskId: TaskPublicId | null = explicitParentTaskId;
           let parentLocked: {
             task: TaskRecord;
@@ -2280,39 +2289,128 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
 
-      return deps.uow.run(async (repos) => {
-        const resolvedRef = await resolveTaskRefInTx<TaskResponse>(
-          repos,
-          actor,
-          taskRef,
-          { ...options, lockForWrite: true },
-        );
-        if (!resolvedRef.found) {
-          if (resolvedRef.deniedTarget) {
-            await appendOutbox(repos, {
-              workspaceId: resolvedRef.deniedTarget.effectiveProject.workspaceId,
-              projectId: resolvedRef.deniedTarget.effectiveProject.id,
-              eventType: "task.update.denied",
-              action: "task.update",
-              outcome: "denied",
-              actor,
-              targetType: "task",
-              targetId: resolvedRef.deniedTarget.task.id,
-              reasonCode: "FORBIDDEN",
-              payload: {
-                taskId: resolvedRef.deniedTarget.task.id,
-                projectId: resolvedRef.deniedTarget.effectiveProject.id,
-              },
-            });
-          }
-          return resolvedRef.failure;
-        }
+      const needsStatusOrProjectLock =
+        patch.statusId !== undefined || patch.projectId !== undefined;
 
-        const {
-          task: existing,
-          effectiveProject: sourceProject,
-          role: sourceRole,
-        } = resolvedRef.ctx;
+      for (
+        let attempt = 0;
+        attempt < (needsStatusOrProjectLock ? MAX_START_LOCK_RETRIES : 1);
+        attempt += 1
+      ) {
+        try {
+          return await deps.uow.run(async (repos) => {
+            let resolvedCtx: ResolvedTaskContext;
+            if (needsStatusOrProjectLock) {
+              const discovered = await resolveTaskRefInTx<TaskResponse>(
+                repos,
+                actor,
+                taskRef,
+                { ...options, lockForWrite: false },
+              );
+              if (!discovered.found) {
+                if (discovered.deniedTarget) {
+                  await appendOutbox(repos, {
+                    workspaceId:
+                      discovered.deniedTarget.effectiveProject.workspaceId,
+                    projectId: discovered.deniedTarget.effectiveProject.id,
+                    eventType: "task.update.denied",
+                    action: "task.update",
+                    outcome: "denied",
+                    actor,
+                    targetType: "task",
+                    targetId: discovered.deniedTarget.task.id,
+                    reasonCode: "FORBIDDEN",
+                    payload: {
+                      taskId: discovered.deniedTarget.task.id,
+                      projectId: discovered.deniedTarget.effectiveProject.id,
+                    },
+                  });
+                }
+                return discovered.failure;
+              }
+              if (!canReadProject(discovered.ctx.role)) {
+                await appendOutbox(repos, {
+                  workspaceId: discovered.ctx.effectiveProject.workspaceId,
+                  projectId: discovered.ctx.effectiveProject.id,
+                  eventType: "task.update.denied",
+                  action: "task.update",
+                  outcome: "denied",
+                  actor,
+                  targetType: "task",
+                  targetId: discovered.ctx.task.id,
+                  reasonCode: "FORBIDDEN",
+                  payload: {
+                    taskId: discovered.ctx.task.id,
+                    projectId: discovered.ctx.effectiveProject.id,
+                  },
+                });
+                return fail(404, "NOT_FOUND", "error.notFound");
+              }
+
+              const projectIdsToLock = [discovered.ctx.effectiveProject.id];
+              if (
+                patch.projectId !== undefined &&
+                patch.projectId !== discovered.ctx.effectiveProject.id
+              ) {
+                projectIdsToLock.push(patch.projectId);
+              }
+              projectIdsToLock.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+              for (const pid of projectIdsToLock) {
+                await repos.projects.lockForTaskWrite(pid);
+              }
+
+              const locked = await loadTaskContextInTx(
+                repos,
+                actor,
+                discovered.ctx.task.id,
+                options?.workspaceId,
+                { lockForWrite: true },
+              );
+              if (!locked) {
+                return fail(404, "NOT_FOUND", "error.notFound");
+              }
+              if (
+                locked.effectiveProject.id !== discovered.ctx.effectiveProject.id
+              ) {
+                throw new StartLockOrderRetryError();
+              }
+              resolvedCtx = locked;
+            } else {
+              const resolvedRef = await resolveTaskRefInTx<TaskResponse>(
+                repos,
+                actor,
+                taskRef,
+                { ...options, lockForWrite: true },
+              );
+              if (!resolvedRef.found) {
+                if (resolvedRef.deniedTarget) {
+                  await appendOutbox(repos, {
+                    workspaceId:
+                      resolvedRef.deniedTarget.effectiveProject.workspaceId,
+                    projectId: resolvedRef.deniedTarget.effectiveProject.id,
+                    eventType: "task.update.denied",
+                    action: "task.update",
+                    outcome: "denied",
+                    actor,
+                    targetType: "task",
+                    targetId: resolvedRef.deniedTarget.task.id,
+                    reasonCode: "FORBIDDEN",
+                    payload: {
+                      taskId: resolvedRef.deniedTarget.task.id,
+                      projectId: resolvedRef.deniedTarget.effectiveProject.id,
+                    },
+                  });
+                }
+                return resolvedRef.failure;
+              }
+              resolvedCtx = resolvedRef.ctx;
+            }
+
+            const {
+              task: existing,
+              effectiveProject: sourceProject,
+              role: sourceRole,
+            } = resolvedCtx;
         if (!canReadProject(sourceRole)) {
           await appendOutbox(repos, {
             workspaceId: sourceProject.workspaceId,
@@ -2520,7 +2618,16 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
             ),
           },
         };
-      });
+          });
+        } catch (error) {
+          if (error instanceof StartLockOrderRetryError) {
+            continue;
+          }
+          throw error;
+        }
+      }
+
+      throw new Error("Task update lock-order retry budget exceeded");
     },
 
     async moveTask(
@@ -2793,38 +2900,88 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
         return fail(400, "VALIDATION_ERROR", "error.validation");
       }
 
-      return deps.uow.run(async (repos) => {
-        const resolvedRef = await resolveTaskRefInTx<TaskResponse>(
-          repos,
-          actor,
-          sourceTaskRef,
-          { ...options, lockForWrite: true },
-        );
-        if (!resolvedRef.found) {
-          if (resolvedRef.deniedTarget) {
-            await appendOutbox(repos, {
-              workspaceId: resolvedRef.deniedTarget.effectiveProject.workspaceId,
-              projectId: resolvedRef.deniedTarget.effectiveProject.id,
-              eventType: "task.copy.denied",
-              action: "task.copy",
-              outcome: "denied",
+      for (let attempt = 0; attempt < MAX_START_LOCK_RETRIES; attempt += 1) {
+        try {
+          return await deps.uow.run(async (repos) => {
+            const discovered = await resolveTaskRefInTx<TaskResponse>(
+              repos,
               actor,
-              targetType: "task",
-              targetId: resolvedRef.deniedTarget.task.id,
-              reasonCode: "FORBIDDEN",
-              payload: {
-                taskId: resolvedRef.deniedTarget.task.id,
-                projectId: resolvedRef.deniedTarget.effectiveProject.id,
-              },
-            });
-          }
-          return resolvedRef.failure;
-        }
-        const {
-          task: sourceTask,
-          effectiveProject: sourceProject,
-          role: sourceRole,
-        } = resolvedRef.ctx;
+              sourceTaskRef,
+              { ...options, lockForWrite: false },
+            );
+            if (!discovered.found) {
+              if (discovered.deniedTarget) {
+                await appendOutbox(repos, {
+                  workspaceId:
+                    discovered.deniedTarget.effectiveProject.workspaceId,
+                  projectId: discovered.deniedTarget.effectiveProject.id,
+                  eventType: "task.copy.denied",
+                  action: "task.copy",
+                  outcome: "denied",
+                  actor,
+                  targetType: "task",
+                  targetId: discovered.deniedTarget.task.id,
+                  reasonCode: "FORBIDDEN",
+                  payload: {
+                    taskId: discovered.deniedTarget.task.id,
+                    projectId: discovered.deniedTarget.effectiveProject.id,
+                  },
+                });
+              }
+              return discovered.failure;
+            }
+            if (!canReadProject(discovered.ctx.role)) {
+              await appendOutbox(repos, {
+                workspaceId: discovered.ctx.effectiveProject.workspaceId,
+                projectId: discovered.ctx.effectiveProject.id,
+                eventType: "task.copy.denied",
+                action: "task.copy",
+                outcome: "denied",
+                actor,
+                targetType: "task",
+                targetId: discovered.ctx.task.id,
+                reasonCode: "FORBIDDEN",
+                payload: {
+                  taskId: discovered.ctx.task.id,
+                  projectId: discovered.ctx.effectiveProject.id,
+                },
+              });
+              return fail(404, "NOT_FOUND", "error.notFound");
+            }
+
+            const projectIdsToLock = [discovered.ctx.effectiveProject.id];
+            if (
+              input.projectId !== undefined &&
+              input.projectId !== discovered.ctx.effectiveProject.id
+            ) {
+              projectIdsToLock.push(input.projectId);
+            }
+            projectIdsToLock.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+            for (const pid of projectIdsToLock) {
+              await repos.projects.lockForTaskWrite(pid);
+            }
+
+            const locked = await loadTaskContextInTx(
+              repos,
+              actor,
+              discovered.ctx.task.id,
+              options?.workspaceId,
+              { lockForWrite: true },
+            );
+            if (!locked) {
+              return fail(404, "NOT_FOUND", "error.notFound");
+            }
+            if (
+              locked.effectiveProject.id !== discovered.ctx.effectiveProject.id
+            ) {
+              throw new StartLockOrderRetryError();
+            }
+
+            const {
+              task: sourceTask,
+              effectiveProject: sourceProject,
+              role: sourceRole,
+            } = locked;
         if (!canReadProject(sourceRole)) {
           await appendOutbox(repos, {
             workspaceId: sourceProject.workspaceId,
@@ -2941,7 +3098,16 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
             task: toTaskDto(task, targetProject.id, issueKey),
           },
         };
-      });
+          });
+        } catch (error) {
+          if (error instanceof StartLockOrderRetryError) {
+            continue;
+          }
+          throw error;
+        }
+      }
+
+      throw new Error("Task copy lock-order retry budget exceeded");
     },
 
     async deleteTask(
@@ -3462,7 +3628,7 @@ export function createWorkUseCases(deps: WorkUseCaseDeps) {
       }
 
       return runWorkTx(deps.uow, async (repos) => {
-        const project = await repos.projects.findById(projectId);
+        const project = await repos.projects.findByIdForUpdate(projectId);
         if (!project) {
           return fail(404, "NOT_FOUND", "error.notFound");
         }
