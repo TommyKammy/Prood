@@ -384,7 +384,7 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
     });
 
     const v4 = await db.migrate();
-    expect(v4).toEqual({ appliedVersions: [4, 5, 6, 7], currentVersion: 7 });
+    expect(v4).toEqual({ appliedVersions: [4, 5, 6, 7, 8], currentVersion: 8 });
 
     const loaded = await db.uow.run(async (repos) => ({
       workspace: await repos.workspaces.findById(wksId),
@@ -462,7 +462,7 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
     const { accessToken, clientId } = await issueOAuthAccessToken({
       baseURL: server.baseURL,
       cookieJar: jar,
-      scope: `openid profile email ${MCP_REQUIRED_WHOAMI_SCOPE}`,
+      scope: `openid profile email ${MCP_REQUIRED_WHOAMI_SCOPE} prood:write`,
       resource: server.mcpResource,
     });
 
@@ -506,6 +506,128 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
       expect(whoami.workspaces).toHaveLength(1);
       expect(whoami.workspaces[0]?.workspaceId).toBe(wksId);
       expect(server.getWhoamiExecutedCount()).toBe(1);
+
+      const req = async (path: string, body: unknown, method = "POST") =>
+        fetch(server.baseURL + path, {
+          method,
+          headers: {
+            "content-type": "application/json",
+            cookie: jar.toHeader(),
+            origin: server.baseURL,
+          },
+          body: JSON.stringify(body),
+        });
+      const pr = await req("/api/v1/workspaces/" + wksId + "/projects", {
+        name: "Automation",
+        kind: "general",
+        visibility: "private",
+      });
+      expect(pr.status).toBe(201);
+      const { project } = await pr.json();
+      for (const [id, when] of [
+        ["create", "task.created"],
+        ["assigned", "assignee.changed"],
+        ["status", "status.changed"],
+      ]) {
+        const rule = await req("/api/v1/projects/" + project.id + "/automation/" + id, {
+          op: "publish",
+          revision: 0,
+          delegate: me.user.id,
+          definition: { when, action: { field: "assigneeId", value: me.user.id } },
+        });
+        expect(rule.status).toBe(200);
+      }
+      const result = await client.callTool({
+        name: "create_task",
+        arguments: {
+          projectRef: project.id,
+          title: "From MCP",
+          idempotencyKey: "mcp-auto-create-1",
+        },
+      });
+      expect(result.isError).not.toBe(true);
+      const createdBody = JSON.parse((result.content as { text: string }[])[0]!.text);
+      expect(createdBody.idempotentReplay).toBe(false);
+      const task = createdBody.task;
+      const replayResult = await client.callTool({
+        name: "create_task",
+        arguments: {
+          projectRef: project.id,
+          title: "From MCP",
+          idempotencyKey: "mcp-auto-create-1",
+        },
+      });
+      expect(replayResult.isError).not.toBe(true);
+      expect(JSON.parse((replayResult.content as { text: string }[])[0]!.text).idempotentReplay).toBe(true);
+      expect(
+        (
+          await client.callTool({
+            name: "update_task",
+            arguments: {
+              taskId: task.id,
+              assigneeId: me.user.id,
+              statusId: project.statuses[1].id,
+            },
+          })
+        ).isError,
+      ).not.toBe(true);
+      const path = "/api/v1/projects/" + project.id + "/tasks";
+      const web = await req(path, { title: "From Web" });
+      expect(web.status).toBe(201);
+      const webTask = (await web.json()).task;
+      expect(
+        (
+          await req(
+            "/api/v1/tasks/" + webTask.id,
+            { assigneeId: me.user.id, statusId: project.statuses[1].id },
+            "PATCH",
+          )
+        ).status,
+      ).toBe(200);
+      // Atomic start_task transition also triggers status.changed & assignee.changed once, and no-ops on replay.
+      const startCandidateRes = await req(path, { title: "Start via MCP" });
+      expect(startCandidateRes.status).toBe(201);
+      const startCandidate = (await startCandidateRes.json()).task;
+      const startRes = await client.callTool({
+        name: "start_task",
+        arguments: { taskRef: startCandidate.id },
+      });
+      expect(startRes.isError).not.toBe(true);
+      expect(JSON.parse((startRes.content as { text: string }[])[0]!.text).changed).toBe(true);
+      const startReplay = await client.callTool({
+        name: "start_task",
+        arguments: { taskRef: startCandidate.id },
+      });
+      expect(startReplay.isError).not.toBe(true);
+      expect(JSON.parse((startReplay.content as { text: string }[])[0]!.text).changed).toBe(false);
+      const envelopes = await db.kysely
+        .selectFrom("automation_deliveries")
+        .selectAll()
+        .where("workspace", "=", wksId)
+        .execute();
+      expect(envelopes.map((r) => r.rule).sort()).toEqual([
+        "assigned",
+        "assigned",
+        "assigned",
+        "create",
+        "create",
+        "create",
+        "status",
+        "status",
+        "status",
+      ]);
+      const audit = await db.uow.run((r) => r.outbox.listByWorkspace(wksId));
+      expect(
+        audit
+          .filter((e) => e.eventType === "task.updated")
+          .map((e) => e.channel)
+          .sort(),
+      ).toEqual(["mcp", "web"]);
+      expect(
+        audit
+          .filter((e) => e.eventType === "task.started")
+          .map((e) => e.channel),
+      ).toEqual(["mcp"]);
     } finally {
       await client.close();
     }
@@ -517,7 +639,7 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
     await db.migrate();
 
     const server = await startTestHttpServer(db, {
-      accessTokenExpiresIn: 1,
+      accessTokenExpiresIn: 5,
     });
 
     const jar = new CookieJar();
@@ -587,14 +709,18 @@ describe(`MCP OAuth 2.1 interoperability with Better Auth & FastMCP (${targetDb}
       await lowScopeClient.close();
     }
 
-    // 3. Expired token: issue valid token with 1s TTL, wait > 1s, then attempt connect/call
+    // Keep the scope assertion independent of sub-second JWT rounding; wait for this token to expire.
     const shortLivedToken = await issueOAuthAccessToken({
       baseURL: server.baseURL,
       cookieJar: jar,
       scope: `openid profile ${MCP_REQUIRED_WHOAMI_SCOPE}`,
       resource: server.mcpResource,
     });
-    await sleep(1200);
+    const { exp } = JSON.parse(
+      Buffer.from(shortLivedToken.accessToken.split(".")[1]!, "base64url").toString(),
+    );
+    expect(typeof exp).toBe("number");
+    await sleep(Math.max(0, exp * 1000 - Date.now() + 50));
 
     const expiredClient = new Client({
       name: "expired-client",

@@ -64,6 +64,16 @@ describe("@prood/server Web-Standard app", () => {
     const mockUow: UnitOfWork = {
       run: async (fn) =>
         fn({
+          automation: {
+            rules: async () => [],
+            save: async () => false,
+            enqueue: async () => {},
+            claim: async () => null,
+            confirm: async () => false,
+            firstCheck: async () => false,
+            intent: async () => null,
+            lookup: async () => null,
+          },
           workspaces: {
             create: async () => {
               throw new Error("not implemented");

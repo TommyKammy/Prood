@@ -41,3 +41,5 @@ export function createHealthCheckUseCase(deps: HealthCheckDeps) {
     };
   };
 }
+
+export * from "./automation.js";

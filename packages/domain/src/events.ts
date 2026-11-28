@@ -11,4 +11,6 @@ export interface AuditActorContext {
   actorType: ActorType;
   channel: EventChannel;
   clientId?: string;
+  /** Trusted automation worker context; never read from a Web or MCP task patch. */
+  parentRun?: string;
 }

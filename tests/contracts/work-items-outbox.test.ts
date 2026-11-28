@@ -4,6 +4,9 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createSystemIdGenerator,
+  deliverNext,
+  routeTaskEvent,
+  type Delivery,
   createWorkUseCases,
   type UnitOfWork,
 } from "@prood/application";
@@ -256,7 +259,7 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
     });
 
     const v5 = await db.migrate();
-    expect(v5).toEqual({ appliedVersions: [5, 6, 7], currentVersion: 7 });
+    expect(v5).toEqual({ appliedVersions: [5, 6, 7, 8], currentVersion: 8 });
 
     const loaded = await db.uow.run(async (repos) => ({
       ws: await repos.workspaces.findById(wksId),
@@ -1094,5 +1097,532 @@ describe(`Work items, authorization & versioned outbox (${targetDb})`, () => {
       grandchild.data.task.id,
     ].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
     expect(batchRows.map((t) => t.id)).toEqual(expectedOrder);
+  });
+  it("pins both subscribers at commit, fences leases and filters real transitions across Web and MCP operations", async () => {
+    const ctx = await createIsolatedDb();
+    const db = ctx.openClient();
+    await db.migrate();
+    const ids = createSystemIdGenerator();
+    const h = createServerHarness(db);
+    const workspace = ids.next("wks");
+    const user = await h.signUpUser("flow@example.com", "Owner");
+    let now = Date.now();
+    const clock = { now: () => new Date(now) };
+    await db.uow.run(async (r) => {
+      await r.workspaces.create({
+        id: workspace,
+        slug: "business",
+        name: "Business",
+        createdAt: clock.now().toISOString(),
+      });
+      await r.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: workspace,
+        userId: user.userId,
+        role: "admin",
+        createdAt: clock.now().toISOString(),
+      });
+    });
+    const actor = { userId: user.userId, actorType: "user", channel: "mcp" } as const;
+    const created = await h.workUseCases.createProject(actor, workspace, {
+      name: "Board",
+      kind: "general",
+      visibility: "private",
+    });
+    if (!created.ok) throw Error("project");
+    const project = created.data.project;
+    const definition = {
+      when: "assignee.changed",
+      from: null,
+      to: user.userId,
+      action: { field: "statusId", value: project.statuses[0]!.id },
+    } as const;
+    for (const rule of ["one", "two"])
+      await db.uow.run((r) =>
+        r.automation.save(
+          {
+            project: project.id,
+            rule,
+            actor: user.userId,
+            enabled: true,
+            revision: 1,
+            delegation: 1,
+            definition,
+          },
+          0,
+        ),
+      );
+    const task = await h.workUseCases.createTask(actor, project.id, { title: "Review" });
+    if (!task.ok) throw Error("task");
+    const id = task.data.task.id;
+    const web = await h.request("/api/v1/tasks/" + id, {
+      method: "PATCH",
+      cookieHeader: user.jar.toHeader(),
+      json: { assigneeId: user.userId },
+    });
+    expect(web.status).toBe(200);
+    expect((await h.workUseCases.updateTask(actor, id, { assigneeId: user.userId })).ok).toBe(
+      true,
+    );
+    expect(
+      (await h.workUseCases.updateTask(actor, id, { description: "ordinary edit" })).ok,
+    ).toBe(true);
+    const deps = { uow: db.uow, idGenerator: ids, clock };
+    const original = (await db.uow.run((r) => r.outbox.listByWorkspace(workspace))).find(
+      (e) => e.eventType === "task.updated",
+    )!;
+    // Historical patches lack a preimage. A matching event in a rolled-back transaction is invisible too.
+    await db.uow.run((r) =>
+      routeTaskEvent(r, {
+        ...original,
+        eventId: ids.next("evt"),
+        payload: { changes: { assigneeId: user.userId } },
+      }),
+    );
+    await expect(
+      db.uow.run(async (r) => {
+        const e = await r.outbox.append({
+          ...original,
+          id: ids.next("out"),
+          eventId: ids.next("evt"),
+          payload: {
+            before: { assigneeId: null },
+            after: { assigneeId: user.userId },
+            taskVersion: 2,
+          },
+        });
+        await routeTaskEvent(r, e);
+        throw Error("abort task change");
+      }),
+    ).rejects.toThrow("abort task change");
+    const seen: Delivery[] = [];
+    await expect(
+      deliverNext(
+        deps,
+        workspace,
+        (d) => {
+          seen.push(d);
+          throw Error("lost acknowledgement");
+        },
+        10,
+      ),
+    ).rejects.toThrow("lost acknowledgement");
+    await db.uow.run((r) =>
+      r.automation.save(
+        {
+          project: project.id,
+          rule: "one",
+          revision: 2,
+          delegation: 1,
+          actor: user.userId,
+          enabled: true,
+          definition,
+        },
+        1,
+      ),
+    );
+    expect(
+      await deliverNext(deps, workspace, (d) => {
+        seen.push(d);
+        return "second";
+      }),
+    ).toBe(true);
+    expect(
+      await deliverNext(deps, ids.next("wks"), () => {
+        throw Error("crossed workspace");
+      }),
+    ).toBe(false);
+    now += 11;
+    const reopened = ctx.openClient();
+    expect(
+      await deliverNext({ ...deps, uow: reopened.uow }, workspace, (d) => {
+        seen.push(d);
+        return "first";
+      }),
+    ).toBe(true);
+    expect(seen.map((d) => [d.rule, d.revision])).toEqual([
+      ["one", 1],
+      ["two", 1],
+      ["one", 1],
+    ]);
+    expect(seen[2]).toEqual(seen[0]);
+    expect(seen[0]!.proposal.version).toBe(2);
+    expect(
+      await deliverNext(deps, workspace, () => {
+        throw Error("extra delivery");
+      }),
+    ).toBe(false);
+    await h.workUseCases.updateTask(actor, id, { assigneeId: null });
+    await h.workUseCases.updateTask(actor, id, { assigneeId: user.userId });
+    expect(
+      await deliverNext(deps, workspace, (d) => {
+        expect(d.revision).toBe(2);
+        expect(d.proposal.version).toBe(6);
+        return "next";
+      }),
+    ).toBe(true);
+    // Leave the second subscriber with a live, then expired owner while another client confirms.
+    let release!: (id: string) => void, entered!: () => void;
+    const receiving = new Promise<void>((r) => {
+      entered = r;
+    });
+    const waiting = deliverNext(
+      deps,
+      workspace,
+      () => {
+        entered();
+        return new Promise<string>((r) => {
+          release = r;
+        });
+      },
+      5,
+    );
+    await receiving;
+    now += 10;
+    expect(await deliverNext({ ...deps, uow: reopened.uow }, workspace, () => "winner")).toBe(
+      true,
+    );
+    release("obsolete");
+    expect(await waiting).toBe(false);
+    expect(await deps.uow.run((r) => r.automation.lookup(workspace, "obsolete"))).toBeNull();
+    const manualDefinition = { when: "manual", action: definition.action };
+    expect(
+      (
+        await h.workUseCases.manageAutomation(actor, project.id, "manual", {
+          op: "publish",
+          revision: 0,
+          delegate: user.userId,
+          definition: manualDefinition,
+        })
+      ).ok,
+    ).toBe(true);
+    // Stop at the selection boundary. On PG use a second connection for a real concurrent commit.
+    let selected = false;
+    const racingWork = createWorkUseCases({
+      ...deps,
+      uow: {
+        run: (fn) =>
+          db.uow.run((repos) =>
+            fn({
+              ...repos,
+              automation: {
+                ...repos.automation,
+                rules: async (projectId) => {
+                  const rules = await repos.automation.rules(projectId);
+                  if (!selected) {
+                    selected = true;
+                    const rule = rules.find((r) => r.rule === "manual")!;
+                    const stopped = { ...rule, enabled: false, revision: 2, delegation: 2 };
+                    const saved =
+                      targetDb === "postgres"
+                        ? await reopened.uow.run((r) => r.automation.save(stopped, 1))
+                        : await repos.automation.save(stopped, 1);
+                    expect(saved).toBe(true);
+                  }
+                  return rules;
+                },
+              },
+            }),
+          ),
+      },
+    });
+    const started = await racingWork.manualAutomation(actor, project.id, "manual", id);
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw Error("manual start");
+    expect(
+      await deliverNext(deps, workspace, (d) => {
+        expect([d.event, d.rule, d.revision]).toEqual([started.data.event, "manual", 1]);
+        return "manual-run";
+      }),
+    ).toBe(true);
+    expect(
+      (
+        await h.workUseCases.prepareAutomation(
+          workspace,
+          started.data.event,
+          "manual",
+          "manual-run",
+          project.id,
+          1,
+        )
+      ).status,
+    ).toBe("denied");
+    // The recipient in a trigger filter can disappear even while the proposed status stays valid.
+    const candidate = await h.signUpUser("reviewer@example.com", "Reviewer");
+    const createdAt = clock.now().toISOString();
+    await db.uow.run(async (r) => {
+      await r.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: workspace,
+        userId: candidate.userId,
+        role: "member",
+        createdAt,
+      });
+      await r.projects.upsertMembership({
+        id: ids.next("mbr"),
+        projectId: project.id,
+        userId: candidate.userId,
+        role: "admin",
+        createdAt,
+      });
+    });
+    const publish = await h.workUseCases.manageAutomation(actor, project.id, "review", {
+      op: "publish",
+      revision: 0,
+      delegate: user.userId,
+      definition: { ...definition, from: user.userId, to: candidate.userId },
+    });
+    expect(publish.ok).toBe(true);
+    expect(
+      (await h.workUseCases.updateTask(actor, id, { assigneeId: candidate.userId })).ok,
+    ).toBe(true);
+    let matched!: Delivery;
+    expect(
+      await deliverNext(deps, workspace, (d) => {
+        matched = d;
+        return "review-run";
+      }),
+    ).toBe(true);
+    expect(matched.rule).toBe("review");
+    await db.kysely
+      .deleteFrom("project_memberships")
+      .where("project_id", "=", project.id)
+      .where("user_id", "=", candidate.userId)
+      .execute();
+    expect(
+      (
+        await h.workUseCases.prepareAutomation(
+          workspace,
+          matched.event,
+          matched.rule,
+          "review-run",
+          project.id,
+          1,
+        )
+      ).status,
+    ).toBe("denied");
+    await db.kysely
+      .deleteFrom("workspace_memberships")
+      .where("workspace_id", "=", workspace)
+      .where("user_id", "=", user.userId)
+      .execute();
+    await db.kysely
+      .updateTable("workspace_memberships")
+      .set({ role: "admin" })
+      .where("workspace_id", "=", workspace)
+      .where("user_id", "=", candidate.userId)
+      .execute();
+    const stopped = await h.workUseCases.manageAutomation(
+      { ...actor, userId: candidate.userId },
+      project.id,
+      "review",
+      { op: "stop", revision: 1 },
+    );
+    expect(stopped.ok && stopped.data.delegateName).toBe(user.userId);
+  });
+
+  it("upgrades from v7 preserving tasks and idempotency records, and invalidates automation on status deletion", async () => {
+    const ctx = await createIsolatedDb();
+    const db = ctx.openClient();
+    expect(await db.migrate({ targetVersion: 7 })).toEqual({
+      appliedVersions: [1, 2, 3, 4, 5, 6, 7],
+      currentVersion: 7,
+    });
+
+    const ids = createSystemIdGenerator();
+    const now = "2026-11-28T10:00:00.000Z";
+    const wksId = ids.next("wks");
+    const usrId = ids.next("usr");
+    const prjId = ids.next("prj");
+    const stsTodo = ids.next("sts");
+    const stsDone = ids.next("sts");
+    const tskId = ids.next("tsk");
+    const outId = ids.next("out");
+    const evtId = ids.next("evt");
+
+    await db.uow.run(async (repos) => {
+      await repos.users.create({
+        id: usrId,
+        email: "v7-upgrade@example.com",
+        displayName: "V7 User",
+        createdAt: now,
+      });
+      await repos.workspaces.create({
+        id: wksId,
+        slug: "v7-upgrade",
+        name: "V7 Upgrade",
+        createdAt: now,
+      });
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: usrId,
+        role: "admin",
+        createdAt: now,
+      });
+      await repos.projects.create({
+        id: prjId,
+        workspaceId: wksId,
+        kind: "general",
+        visibility: "private",
+        name: "Legacy Board",
+        description: "",
+        createdAt: now,
+      });
+      await repos.projects.upsertMembership({
+        id: ids.next("mbr"),
+        projectId: prjId,
+        userId: usrId,
+        role: "admin",
+        createdAt: now,
+      });
+      await repos.statuses.create({
+        id: stsTodo,
+        workspaceId: wksId,
+        projectId: prjId,
+        name: "To Do",
+        category: "todo",
+        position: 0,
+        createdAt: now,
+      });
+      await repos.statuses.create({
+        id: stsDone,
+        workspaceId: wksId,
+        projectId: prjId,
+        name: "Done",
+        category: "done",
+        position: 1,
+        createdAt: now,
+      });
+      await repos.tasks.create({
+        id: tskId,
+        workspaceId: wksId,
+        projectId: prjId,
+        parentTaskId: null,
+        statusId: stsDone,
+        title: "Pre-v8 task",
+        description: "",
+        assigneeId: null,
+        createdBy: usrId,
+        dueOn: null,
+        position: 0,
+        createdAt: now,
+      });
+      await repos.idempotency.createIfAbsent({
+        actorUserId: usrId,
+        operation: "task.create",
+        idempotencyKey: "pre-v8-key",
+        requestFingerprint: "fp-v7",
+        workspaceId: wksId,
+        projectId: prjId,
+        targetType: "task",
+        targetId: tskId,
+        responseJson: JSON.stringify({ taskId: tskId }),
+        createdAt: now,
+      });
+      await repos.outbox.append({
+        id: outId,
+        eventId: evtId,
+        schemaVersion: 1,
+        workspaceId: wksId,
+        projectId: prjId,
+        eventType: "task.created",
+        action: "task.create",
+        outcome: "succeeded",
+        actorUserId: usrId,
+        actorType: "user",
+        channel: "web",
+        targetType: "task",
+        targetId: tskId,
+        reasonCode: null,
+        payload: { taskId: tskId },
+        occurredAt: now,
+      });
+    });
+
+    expect(await db.migrate()).toEqual({
+      appliedVersions: [8],
+      currentVersion: 8,
+    });
+
+    const loaded = await db.uow.run(async (repos) => ({
+      task: await repos.tasks.findById(tskId),
+      idem: await repos.idempotency.findByKey(usrId, "task.create", "pre-v8-key"),
+    }));
+    expect(loaded.task?.version).toBe(1);
+    expect(loaded.task?.title).toBe("Pre-v8 task");
+    expect(loaded.idem?.targetId).toBe(tskId);
+
+    const h = createServerHarness(db);
+    const actor = { userId: usrId, actorType: "user", channel: "web" } as const;
+    const work = h.workUseCases;
+    const deps = {
+      uow: db.uow,
+      idGenerator: ids,
+      clock: { now: () => new Date() },
+    };
+
+    const pubRes = await work.manageAutomation(actor, prjId, "on-done", {
+      op: "publish",
+      revision: 0,
+      delegate: usrId,
+      definition: {
+        when: "manual",
+        action: { field: "statusId", value: stsDone },
+      },
+    });
+    expect(pubRes.ok).toBe(true);
+
+    const pubUnassign = await work.manageAutomation(actor, prjId, "assign-me", {
+      op: "publish",
+      revision: 0,
+      delegate: usrId,
+      definition: {
+        when: "manual",
+        action: { field: "assigneeId", value: usrId },
+      },
+    });
+    expect(pubUnassign.ok).toBe(true);
+
+    const startTarget = await work.manualAutomation(actor, prjId, "on-done", tskId);
+    const startVersioned = await work.manualAutomation(actor, prjId, "assign-me", tskId);
+    expect(startTarget.ok && startVersioned.ok).toBe(true);
+    if (!startTarget.ok || !startVersioned.ok) throw new Error("expected manual starts");
+
+    expect(await deliverNext(deps, wksId, () => "run-done")).toBe(true);
+    expect(await deliverNext(deps, wksId, () => "run-assign")).toBe(true);
+
+    const deleted = await work.deleteProjectStatus(actor, prjId, stsDone, {
+      replacementStatusId: stsTodo,
+    });
+    expect(deleted.ok).toBe(true);
+
+    const refreshed = await db.uow.run((repos) => repos.tasks.findById(tskId));
+    expect(refreshed?.version).toBe(2);
+
+    expect(
+      (
+        await work.prepareAutomation(
+          wksId,
+          startTarget.data.event,
+          "on-done",
+          "run-done",
+          prjId,
+          1,
+        )
+      ).status,
+    ).toBe("denied");
+    expect(
+      (
+        await work.prepareAutomation(
+          wksId,
+          startVersioned.data.event,
+          "assign-me",
+          "run-assign",
+          prjId,
+          1,
+        )
+      ).status,
+    ).toBe("skipped");
   });
 });

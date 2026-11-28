@@ -1,4 +1,4 @@
-import type { MigrationDefinition } from "@prood/persistence-common";
+import { automationMigration, type MigrationDefinition } from "@prood/persistence-common";
 
 export const POSTGRES_MIGRATIONS: readonly MigrationDefinition[] = [
   {
@@ -396,4 +396,5 @@ export const POSTGRES_MIGRATIONS: readonly MigrationDefinition[] = [
       `CREATE INDEX IF NOT EXISTS idempotency_records_target_idx ON idempotency_records (target_type, target_id)`,
     ],
   },
+  automationMigration,
 ];

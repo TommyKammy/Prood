@@ -134,13 +134,15 @@ describe(`DB migrations, UnitOfWork, error mapping & concurrency (${targetDb})`,
 
     const first = await db.migrate();
     expect(first).toEqual({
-      appliedVersions: [1, 2, 3, 4, 5, 6, 7],
-      currentVersion: 7,
+      appliedVersions: [1, 2, 3, 4, 5, 6, 7, 8],
+      currentVersion: 8,
     });
-    expect(await db.getAppliedMigrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(await db.getAppliedMigrationVersions()).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8,
+    ]);
 
     const second = await db.migrate();
-    expect(second).toEqual({ appliedVersions: [], currentVersion: 7 });
+    expect(second).toEqual({ appliedVersions: [], currentVersion: 8 });
   });
 
   it("serializes concurrent migrate() calls on a fresh DB without duplicate application", async () => {
@@ -155,11 +157,15 @@ describe(`DB migrations, UnitOfWork, error mapping & concurrency (${targetDb})`,
       (a, b) => a - b,
     );
 
-    expect(allApplied).toEqual([1, 2, 3, 4, 5, 6, 7]);
-    expect(resA.currentVersion).toBe(7);
-    expect(resB.currentVersion).toBe(7);
-    expect(await clientA.getAppliedMigrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7]);
-    expect(await clientB.getAppliedMigrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(allApplied).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(resA.currentVersion).toBe(8);
+    expect(resB.currentVersion).toBe(8);
+    expect(await clientA.getAppliedMigrationVersions()).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8,
+    ]);
+    expect(await clientB.getAppliedMigrationVersions()).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8,
+    ]);
   });
 
   it("upgrades from v1 with existing workspace rows and backfills workspace_settings", async () => {
@@ -183,8 +189,8 @@ describe(`DB migrations, UnitOfWork, error mapping & concurrency (${targetDb})`,
 
     const v2Result = await db.migrate();
     expect(v2Result).toEqual({
-      appliedVersions: [2, 3, 4, 5, 6, 7],
-      currentVersion: 7,
+      appliedVersions: [2, 3, 4, 5, 6, 7, 8],
+      currentVersion: 8,
     });
 
     const verify = await db.uow.run(async (repos) => ({

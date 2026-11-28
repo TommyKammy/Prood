@@ -189,7 +189,7 @@ describe(`Better Auth, Prood users & workspace memberships (${targetDb})`, () =>
     );
 
     const v3 = await db.migrate();
-    expect(v3).toEqual({ appliedVersions: [3, 4, 5, 6, 7], currentVersion: 7 });
+    expect(v3).toEqual({ appliedVersions: [3, 4, 5, 6, 7, 8], currentVersion: 8 });
 
     const loaded = await db.uow.run((repos) => repos.workspaces.findById(wksId));
     expect(loaded?.slug).toBe("legacy-v2");

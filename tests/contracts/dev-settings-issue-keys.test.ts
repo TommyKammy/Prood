@@ -295,8 +295,8 @@ describe(`Dev settings & issue key issuance (${targetDb})`, () => {
       });
     });
 
-    const v6 = await db.migrate();
-    expect(v6).toEqual({ appliedVersions: [6, 7], currentVersion: 7 });
+    const upgraded = await db.migrate();
+    expect(upgraded).toEqual({ appliedVersions: [6, 7, 8], currentVersion: 8 });
 
     const harness = createServerHarness(db);
     const admin1 = await harness.signUpUser("admin1@example.com", "Admin One");
@@ -468,6 +468,13 @@ describe(`Dev settings & issue key issuance (${targetDb})`, () => {
     ).json()) as TaskResponse).task;
     expect(createdRoot.issueKey).toBe("PRD-4");
     expect(createdRoot.branchName).toBe("prd-4");
+    const automation = { actorType: "user", channel: "automation", userId: member1.userId } as const;
+    expect((await harness.workUseCases.copyTask(automation, createdRoot.id, {})).ok).toBe(false);
+    expect((await harness.workUseCases.deleteTask(automation, createdRoot.id)).ok).toBe(false);
+    const createdEvent = await db.uow.run(async (repos) =>
+      (await repos.outbox.listByWorkspace(wks1)).find((e) => e.eventType === "task.created" && e.targetId === createdRoot.id),
+    );
+    expect(createdEvent?.payload).toMatchObject({ taskVersion: 1, issueKey: "PRD-4" });
 
     const createdSub = ((await (
       await harness.request(`/api/v1/projects/${platformProj.id}/tasks`, {

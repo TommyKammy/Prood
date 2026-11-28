@@ -21,7 +21,13 @@ import {
   type ApiErrorCode,
   type McpToolErrorPayload,
 } from "@prood/contracts";
-import type { AuditActorContext, StatusId, UserId, WorkspaceId } from "@prood/domain";
+import {
+  isValidEntityId,
+  type AuditActorContext,
+  type StatusId,
+  type UserId,
+  type WorkspaceId,
+} from "@prood/domain";
 
 const DEFAULT_SESSION_IDLE_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_ACTIVE_SESSIONS = 1000;
@@ -66,6 +72,7 @@ const TOOL_REQUIRED_SCOPES = new Map<string, readonly string[]>([
   ["get_task", [MCP_READ_SCOPE]],
   ["search_tasks", [MCP_READ_SCOPE]],
   ["create_task", [MCP_WRITE_SCOPE]],
+  ["update_task", [MCP_WRITE_SCOPE]],
   ["start_task", [MCP_WRITE_SCOPE]],
 ]);
 
@@ -429,6 +436,41 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
             : {}),
         },
       );
+      return unwrapWorkResult(result);
+    },
+  });
+
+  server.addTool({
+    name: "update_task",
+    description: "Update a task's status or assignee.",
+    parameters: z
+      .object({
+        taskId: z.string().min(1),
+        statusId: z.string().nullable().optional(),
+        assigneeId: z.string().nullable().optional(),
+      })
+      .strict(),
+    scopes: [MCP_WRITE_SCOPE],
+    annotations: {
+      readOnlyHint: false,
+      title: "Update task",
+    },
+    execute: async (args, context) => {
+      const actor = await resolveMcpToolActor(context.session, MCP_WRITE_SCOPE);
+      if (
+        !isValidEntityId("tsk", args.taskId) ||
+        (args.statusId === undefined && args.assigneeId === undefined)
+      ) {
+        throwMcpToolError(400, "VALIDATION_ERROR", "error.validation");
+      }
+      const result = await workUseCases.updateTask(actor, args.taskId, {
+        ...(args.statusId !== undefined
+          ? { statusId: args.statusId as StatusId | null }
+          : {}),
+        ...(args.assigneeId !== undefined
+          ? { assigneeId: args.assigneeId as UserId | null }
+          : {}),
+      });
       return unwrapWorkResult(result);
     },
   });

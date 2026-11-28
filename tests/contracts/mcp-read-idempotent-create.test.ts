@@ -476,6 +476,62 @@ describe(`MCP read tools & idempotent task creation (${targetDb})`, () => {
       });
     });
 
+    const prjId = ids.next("prj");
+    const nsId = ids.next("ins");
+    const tskId = ids.next("tsk");
+    await db.uow.run(async (repos) => {
+      await repos.projects.create({
+        id: prjId,
+        workspaceId: wksId,
+        kind: "development",
+        visibility: "workspace",
+        name: "Legacy App",
+        description: "",
+        createdAt: now,
+      });
+      await repos.projects.upsertMembership({
+        id: ids.next("mbr"),
+        projectId: prjId,
+        userId: usrId,
+        role: "admin",
+        createdAt: now,
+      });
+      await repos.issueKeys.createNamespace({
+        id: nsId,
+        workspaceId: wksId,
+        projectId: prjId,
+        currentPrefix: "LEG",
+        branchPrefix: "leg",
+        startStatusId: null,
+        enabledBy: usrId,
+        enabledAt: now,
+      });
+      await repos.issueKeys.reservePrefix({
+        workspaceId: wksId,
+        prefix: "LEG",
+        namespaceId: nsId,
+        createdAt: now,
+      });
+      await repos.issueKeys.initCounter(nsId, 2);
+      await repos.tasks.create({
+        id: tskId,
+        workspaceId: wksId,
+        projectId: prjId,
+        parentTaskId: null,
+        statusId: null,
+        title: "Pre-v7 task",
+        description: "",
+        assigneeId: null,
+        createdBy: usrId,
+        dueOn: null,
+        position: 0,
+        createdAt: now,
+      });
+      await repos.issueKeys.createTaskKeys([
+        { taskId: tskId, namespaceId: nsId, issueNumber: 1, createdAt: now },
+      ]);
+    });
+
     const work = createWorkUseCases({
       uow: db.uow,
       idGenerator: ids,
@@ -486,26 +542,14 @@ describe(`MCP read tools & idempotent task creation (${targetDb})`, () => {
       actorType: "user" as const,
       channel: "web" as const,
     };
-    const prjRes = await work.createProject(actor, wksId, { name: "Legacy App" });
-    expect(prjRes.ok).toBe(true);
-    if (!prjRes.ok) throw new Error("expected project creation");
-    const devRes = await work.enableDevProject(actor, prjRes.data.project.id, {
-      prefix: "LEG",
-    });
-    expect(devRes.ok).toBe(true);
-    const tskRes = await work.createTask(actor, prjRes.data.project.id, {
-      title: "Pre-v7 task",
-    });
-    expect(tskRes.ok).toBe(true);
-    if (!tskRes.ok) throw new Error("expected task creation");
 
     const upgrade = await db.migrate();
-    expect(upgrade).toEqual({ appliedVersions: [7], currentVersion: 7 });
+    expect(upgrade).toEqual({ appliedVersions: [7, 8], currentVersion: 8 });
 
     const fetched = await work.getTask(actor, "LEG-1", { workspaceId: wksId });
     expect(fetched.ok).toBe(true);
     if (fetched.ok) {
-      expect(fetched.data.task.id).toBe(tskRes.data.task.id);
+      expect(fetched.data.task.id).toBe(tskId);
       expect(fetched.data.task.issueKey).toBe("LEG-1");
     }
 

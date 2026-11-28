@@ -92,6 +92,7 @@ export interface ProjectStatusRecord {
 }
 
 export interface TaskRecord {
+  version: number;
   id: TaskPublicId;
   workspaceId: WorkspaceId;
   projectId: ProjectId | null;
@@ -411,7 +412,7 @@ export interface ProjectStatusRepository {
 
 export interface TaskRepository {
   create(input: CreateTaskInput): Promise<TaskRecord>;
-  findById(id: TaskPublicId): Promise<TaskRecord | null>;
+  findById(id: TaskPublicId, forUpdate?: boolean): Promise<TaskRecord | null>;
   lockByIdsForUpdate(ids: readonly TaskPublicId[]): Promise<TaskRecord[]>;
   listByProject(projectId: ProjectId): Promise<TaskRecord[]>;
   listSubtasks(parentTaskId: TaskPublicId): Promise<TaskRecord[]>;
@@ -519,6 +520,7 @@ export interface IdempotencyRepository {
 }
 
 export interface TransactionRepositories {
+  readonly automation: import("./automation.js").AutomationRepository;
   readonly driver?: DbDriverKind;
   readonly workspaces: WorkspaceRepository;
   readonly workspaceSettings: WorkspaceSettingsRepository;
