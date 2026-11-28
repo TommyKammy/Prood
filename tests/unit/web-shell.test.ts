@@ -1241,5 +1241,99 @@ describe("@prood/web async race regressions", () => {
 
     expect(patchCalls).toBe(0);
   });
+
+  it("preserves a newer task draft edited while task creation is pending (4725624219)", async () => {
+    const userId = generateEntityId("usr", 1_795_000_000_000, new Uint8Array(10).fill(1));
+    const wksA = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(2));
+    const projA = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(3));
+    const statusA = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(4));
+    const projectA = makeProject(wksA, projA, statusA, "Project Alpha");
+    const firstTask = makeTask(wksA, projA, statusA, 40, "First task");
+
+    let created = false;
+    let resolveCreate!: (res: Response) => void;
+    const createDeferred = new Promise<Response>((resolve) => {
+      resolveCreate = resolve;
+    });
+
+    const { win, doc } = await mountMockedShell(async (path, init) => {
+      if (path === "/api/v1/me") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          user: { id: userId, email: "alice@example.com", displayName: "Alice" },
+          memberships: [
+            {
+              membershipId: makeMembershipId(160),
+              workspaceId: wksA,
+              workspaceSlug: "ws-a",
+              workspaceName: "WS Alpha",
+              role: "admin",
+            },
+          ],
+        } satisfies MeResponse);
+      }
+      if (path === `/api/v1/workspaces/${wksA}/projects`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, projects: [projectA] });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/settings`) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          settings: {
+            workspaceId: wksA,
+            defaultLocale: "en",
+            devProjectsEnabled: false,
+            updatedAt: "2026-11-28T12:00:00.000Z",
+          } satisfies WorkspaceSettingsDto,
+        });
+      }
+      if (path === `/api/v1/projects/${projA}/tasks` && (init?.method ?? "GET") === "GET") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          tasks: created ? [firstTask] : [],
+        });
+      }
+      if (path === `/api/v1/projects/${projA}/tasks` && init?.method === "POST") {
+        created = true;
+        return createDeferred;
+      }
+      if (path.endsWith("/dev-settings")) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          allowed: false,
+          canManage: true,
+          dev: null,
+          statuses: projectA.statuses,
+        } satisfies ProjectDevSettingsResponse);
+      }
+      throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${path}`);
+    });
+
+    await waitForCondition(
+      () => doc.querySelector("[data-task-title-input]") !== null,
+      "task creation form rendered",
+    );
+
+    const input1 = doc.querySelector<HTMLInputElement>("[data-task-title-input]")!;
+    input1.value = "First task";
+    input1.dispatchEvent(new win.Event("input") as unknown as Event);
+    doc
+      .querySelector<HTMLFormElement>("[data-create-task-form]")!
+      .dispatchEvent(new win.Event("submit", { cancelable: true }) as unknown as Event);
+
+    // Edit draft for a second task before the first POST settles
+    const inputPending = doc.querySelector<HTMLInputElement>("[data-task-title-input]")!;
+    inputPending.value = "Second task draft";
+    inputPending.dispatchEvent(new win.Event("input") as unknown as Event);
+
+    resolveCreate(jsonResponse({ contractVersion: CONTRACT_VERSION, task: firstTask }, 201));
+    await waitForCondition(
+      () => doc.body.textContent?.includes("First task") ?? false,
+      "first task rendered after reload",
+    );
+
+    expect(doc.querySelector<HTMLInputElement>("[data-task-title-input]")!.value).toBe(
+      "Second task draft",
+    );
+  });
 });
 

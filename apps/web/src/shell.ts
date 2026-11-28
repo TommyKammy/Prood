@@ -723,6 +723,7 @@ export class ProodShellElement extends BaseElement {
     if (!workspaceId || !projectId || this.creatingTask) return;
     const seq = ++this.createTaskSeq;
     this.creatingTask = true;
+    this.taskTitleDraft = title;
     this.taskCreateError = "";
     this.taskCreateNotice = "";
     this.render();
@@ -745,7 +746,9 @@ export class ProodShellElement extends BaseElement {
       return;
     }
 
-    this.taskTitleDraft = "";
+    if (this.taskTitleDraft === title) {
+      this.taskTitleDraft = "";
+    }
     this.taskCreateNotice = this.i18n.t("task.created");
     this.highlightedTaskId = res.data.task.id;
     await this.loadProjectData(projectId);
@@ -1228,7 +1231,7 @@ export class ProodShellElement extends BaseElement {
         id: "prood-new-project-name",
         type: "text",
         required: !isPendingDevRetry,
-        disabled: isPendingDevRetry,
+        disabled: isPendingDevRetry || this.creatingProject,
         cls: "prood-input",
         placeholder: t("project.namePlaceholder"),
         val: this.newProjectName,
@@ -1244,7 +1247,7 @@ export class ProodShellElement extends BaseElement {
         {
           id: "prood-new-project-vis",
           cls: "prood-select",
-          disabled: isPendingDevRetry,
+          disabled: isPendingDevRetry || this.creatingProject,
           attrs: { "data-new-project-visibility": true },
         },
         ...(["workspace", "private"] as const).map((v) =>
@@ -1268,7 +1271,8 @@ export class ProodShellElement extends BaseElement {
           cls: "prood-input prood-mono",
           placeholder: t("settings.prefixPlaceholder"),
           val: this.newProjectPrefix,
-          disabled: !isPendingDevRetry && !this.newProjectEnableDev,
+          disabled:
+            this.creatingProject || (!isPendingDevRetry && !this.newProjectEnableDev),
           required: isPendingDevRetry || this.newProjectEnableDev,
           attrs: { minlength: 2, maxlength: 10, "data-new-project-prefix": true },
           on: {
@@ -1280,12 +1284,13 @@ export class ProodShellElement extends BaseElement {
         const devCheck = el("input", {
           type: "checkbox",
           checked: isPendingDevRetry || this.newProjectEnableDev,
-          disabled: isPendingDevRetry,
+          disabled: isPendingDevRetry || this.creatingProject,
           attrs: { "data-new-project-dev-toggle": true },
           on: {
             change: () => {
               this.newProjectEnableDev = devCheck.checked;
-              prefixInput.disabled = !devCheck.checked;
+              prefixInput.disabled =
+                this.creatingProject || !devCheck.checked;
               prefixInput.required = devCheck.checked;
             },
           },
