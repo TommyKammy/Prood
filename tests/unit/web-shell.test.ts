@@ -2609,5 +2609,146 @@ describe("@prood/web async race regressions", () => {
     expect(mem.esInstances).toHaveLength(1);
     mem.shell.remove();
   });
+
+  it("clears stale active workspace projects and tasks immediately when refreshSession switches away from a revoked workspace", async () => {
+    const userId = generateEntityId("usr", 1_795_000_000_000, new Uint8Array(10).fill(51));
+    const wksA = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(52));
+    const wksB = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(53));
+    const projA = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(54));
+    const projB = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(55));
+    const statusTodoA = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(56));
+    const statusTodoB = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(57));
+    const projectA = makeProject(wksA, projA, statusTodoA, "Alpha Secret");
+    const projectB = makeProject(wksB, projB, statusTodoB, "Beta Remaining");
+    const taskA = makeTask(wksA, projA, statusTodoA, 60, "Stale Alpha Task");
+    const taskB = makeTask(wksB, projB, statusTodoB, 61, "Fresh Beta Task");
+
+    let switched = false;
+    let resolveWksBProjects!: () => void;
+    const wksBProjectsReady = new Promise<void>((resolve) => {
+      resolveWksBProjects = resolve;
+    });
+
+    vi.resetModules();
+    const win = new Window({ url: "http://127.0.0.1:3000/" });
+    const doc = win.document as unknown as Document;
+    vi.stubGlobal("window", win);
+    vi.stubGlobal("document", doc);
+    vi.stubGlobal("HTMLElement", win.HTMLElement);
+    vi.stubGlobal("HTMLInputElement", win.HTMLInputElement);
+    vi.stubGlobal("HTMLTextAreaElement", win.HTMLTextAreaElement);
+    vi.stubGlobal("HTMLSelectElement", win.HTMLSelectElement);
+    vi.stubGlobal("HTMLDialogElement", win.HTMLDialogElement);
+    vi.stubGlobal("Element", win.Element);
+    vi.stubGlobal("Node", win.Node);
+    vi.stubGlobal("Event", win.Event);
+    vi.stubGlobal("KeyboardEvent", win.KeyboardEvent);
+    vi.stubGlobal("CustomEvent", win.CustomEvent);
+    vi.stubGlobal("customElements", win.customElements);
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      cb(0);
+      return 1;
+    });
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const raw = typeof input === "string" ? input : input.toString();
+      const parsed = new URL(raw, "http://127.0.0.1:3000");
+      const path = parsed.pathname;
+      if (path === "/api/v1/me") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          user: { id: userId, email: "alice@example.com", displayName: "Alice" },
+          memberships: switched
+            ? [
+                {
+                  membershipId: makeMembershipId(106),
+                  workspaceId: wksB,
+                  workspaceSlug: "beta",
+                  workspaceName: "Beta",
+                  role: "admin",
+                },
+              ]
+            : [
+                {
+                  membershipId: makeMembershipId(105),
+                  workspaceId: wksA,
+                  workspaceSlug: "alpha",
+                  workspaceName: "Alpha",
+                  role: "admin",
+                },
+                {
+                  membershipId: makeMembershipId(106),
+                  workspaceId: wksB,
+                  workspaceSlug: "beta",
+                  workspaceName: "Beta",
+                  role: "admin",
+                },
+              ],
+        });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/projects`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, projects: [projectA] });
+      }
+      if (path === `/api/v1/workspaces/${wksB}/projects`) {
+        await wksBProjectsReady;
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, projects: [projectB] });
+      }
+      if (path.endsWith("/settings")) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          settings: {
+            workspaceId: path.includes(wksA) ? wksA : wksB,
+            defaultLocale: "en",
+            devProjectsEnabled: false,
+            updatedAt: "2026-11-28T12:00:00.000Z",
+          },
+        });
+      }
+      if (path === `/api/v1/projects/${projA}/tasks`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, tasks: [taskA] });
+      }
+      if (path === `/api/v1/projects/${projB}/tasks`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, tasks: [taskB] });
+      }
+      if (path.endsWith("/dev-settings")) {
+        const isA = path.includes(projA);
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          allowed: false,
+          canManage: true,
+          dev: null,
+          statuses: isA ? projectA.statuses : projectB.statuses,
+        } satisfies ProjectDevSettingsResponse);
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    });
+
+    const web = await import("@prood/web");
+    const shell = doc.createElement("prood-shell") as unknown as InstanceType<
+      typeof web.ProodShellElement
+    >;
+    doc.body.appendChild(shell as unknown as Node);
+
+    await waitForCondition(
+      () => doc.querySelector(`[data-task-row="${taskA.id}"]`) !== null,
+      "initial Alpha task rendered",
+    );
+
+    switched = true;
+    const refreshPromise = shell.refreshSession();
+    await waitForCondition(
+      () => shell.getActiveWorkspaceId() === wksB,
+      "activeWorkspaceId switched to Beta while Beta projects are still loading",
+    );
+    expect(doc.querySelector(`[data-task-row="${taskA.id}"]`)).toBeNull();
+    expect(doc.body.textContent).not.toContain("Alpha Secret");
+
+    resolveWksBProjects();
+    await refreshPromise;
+    await waitForCondition(
+      () => doc.querySelector(`[data-task-row="${taskB.id}"]`) !== null,
+      "Beta task rendered after load completes",
+    );
+    shell.remove();
+  });
 });
 

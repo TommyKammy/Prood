@@ -328,6 +328,7 @@ export async function startNodeServer(): Promise<void> {
     idGenerator,
     mcpAuth: auth,
     mcpHandler,
+    trustedOrigins: [origin],
     realtimeHub,
     realtime: {
       shutdownSignal: realtimeShutdown.signal,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { McpTokenVerifier, UnitOfWork } from "@prood/application";
-import { MCP_REQUIRED_WHOAMI_SCOPE } from "@prood/contracts";
+import { CONTRACT_VERSION, MCP_REQUIRED_WHOAMI_SCOPE } from "@prood/contracts";
 import { createProodMcpServer } from "@prood/integration-fastmcp";
 
 function createTestDeps(nowMsRef: { value: number }) {
@@ -477,6 +477,107 @@ describe("@prood/integration-fastmcp bounded session retention", () => {
 
     nowMs.value += 600;
     expect((await listToolsInSession(handler, sessionId)).status).toBe(404);
+
+    await handler.close?.();
+  });
+
+  it("returns structured error.emailVerificationRequired from whoami without leaking email", async () => {
+    const nowMs = { value: 1_795_000_000_000 };
+    const tokenVerifier: McpTokenVerifier = {
+      async verifyBearerToken() {
+        return {
+          ok: true,
+          token: {
+            subject: "ba_unverified_subject",
+            clientId: "client_1",
+            scopes: [MCP_REQUIRED_WHOAMI_SCOPE],
+            audience: "http://127.0.0.1:3000/mcp",
+            expiresAt: Math.floor((nowMs.value + 3_600_000) / 1000),
+            issuer: "http://127.0.0.1:3000/api/auth",
+            email: "collision@example.com",
+            emailVerified: false,
+            name: "Unverified User",
+          },
+        };
+      },
+      getProtectedResourceMetadata: () => ({}),
+      getAuthorizationServerMetadata: async () => ({}),
+    };
+
+    const uow = {
+      run: async (fn: (repos: unknown) => Promise<unknown>) =>
+        fn({
+          users: {
+            findByAuthIdentity: async () => null,
+            findByEmail: async () => ({
+              id: "usr_01jf8x9z2k3m4n5p6q7r8s9t0v",
+              email: "collision@example.com",
+              displayName: "Existing User",
+              createdAt: "2026-11-28T00:00:00.000Z",
+              updatedAt: "2026-11-28T00:00:00.000Z",
+            }),
+          },
+          memberships: {
+            listSummariesForUser: async () => [],
+          },
+        }),
+    } as unknown as UnitOfWork;
+
+    const handler = createProodMcpServer({
+      resource: "http://127.0.0.1:3000/mcp",
+      tokenVerifier,
+      uow,
+      idGenerator: { next: () => "usr_01jf8x9z2k3m4n5p6q7r8s9t0v" as never },
+      clock: { now: () => new Date(nowMs.value) },
+    });
+
+    const sessionId = await initializeMcpSession(handler, "Bearer unverified");
+    const callRes = await handler.handleRequest(
+      new Request("http://127.0.0.1:3000/mcp", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          authorization: "Bearer unverified",
+          "mcp-session-id": sessionId,
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 50,
+          method: "tools/call",
+          params: {
+            name: "whoami",
+            arguments: {},
+          },
+        }),
+      }),
+    );
+    expect(callRes.status).toBe(200);
+    const rawBody = await callRes.text();
+    expect(rawBody).not.toContain("collision@example.com");
+    const dataLine = rawBody
+      .split("\n")
+      .find((line) => line.startsWith("data: "));
+    const payload = JSON.parse(dataLine ? dataLine.slice(6) : rawBody) as {
+      result?: { isError?: boolean; content?: Array<{ text?: string }> };
+    };
+    expect(payload.result?.isError).toBe(true);
+    const toolErr = JSON.parse(payload.result?.content?.[0]?.text ?? "{}") as {
+      contractVersion?: number;
+      error?: {
+        status?: number;
+        code?: string;
+        messageKey?: string;
+      };
+    };
+    expect(toolErr).toEqual({
+      contractVersion: CONTRACT_VERSION,
+      error: {
+        status: 403,
+        code: "FORBIDDEN",
+        messageKey: "error.emailVerificationRequired",
+      },
+    });
 
     await handler.close?.();
   });
