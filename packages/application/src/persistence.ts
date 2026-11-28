@@ -252,6 +252,8 @@ export interface CreateTaskInput {
 export interface UpdateTaskInput {
   title?: string;
   description?: string;
+  projectId?: ProjectId | null;
+  parentTaskId?: TaskPublicId | null;
   statusId?: StatusId | null;
   assigneeId?: UserId | null;
   dueOn?: string | null;
@@ -336,6 +338,10 @@ export interface WorkspaceMembershipRepository {
     workspaceId: WorkspaceId,
     userId: UserId,
   ): Promise<WorkspaceMembershipRecord | null>;
+  deleteByWorkspaceAndUser(
+    workspaceId: WorkspaceId,
+    userId: UserId,
+  ): Promise<boolean>;
   listSummariesForUser(userId: UserId): Promise<WorkspaceMembershipSummary[]>;
 }
 
@@ -357,6 +363,7 @@ export interface ProjectRepository {
     projectId: ProjectId,
     userId: UserId,
   ): Promise<ProjectMembershipRecord | null>;
+  deleteMembership(projectId: ProjectId, userId: UserId): Promise<boolean>;
 }
 
 export interface ProjectStatusRepository {
@@ -368,12 +375,29 @@ export interface ProjectStatusRepository {
 export interface TaskRepository {
   create(input: CreateTaskInput): Promise<TaskRecord>;
   findById(id: TaskPublicId): Promise<TaskRecord | null>;
+  lockByIdsForUpdate(ids: readonly TaskPublicId[]): Promise<TaskRecord[]>;
   listByProject(projectId: ProjectId): Promise<TaskRecord[]>;
   listSubtasks(parentTaskId: TaskPublicId): Promise<TaskRecord[]>;
   listSubtasksByParentIds(
     parentTaskIds: readonly TaskPublicId[],
   ): Promise<TaskRecord[]>;
+  searchInWorkspace(input: {
+    workspaceId: WorkspaceId;
+    allowedProjectIds: readonly ProjectId[];
+    query: string;
+    limit: number;
+    before?: { updatedAt: string; id: TaskPublicId };
+  }): Promise<TaskRecord[]>;
   update(id: TaskPublicId, input: UpdateTaskInput): Promise<TaskRecord | null>;
+  clearParentTaskIds(
+    taskIds: readonly TaskPublicId[],
+    updatedAt: string,
+  ): Promise<void>;
+  updateStatusForTaskIds(
+    taskIds: readonly TaskPublicId[],
+    statusId: StatusId | null,
+    updatedAt: string,
+  ): Promise<void>;
   deleteById(id: TaskPublicId): Promise<boolean>;
 }
 
@@ -404,6 +428,20 @@ export interface IssueKeyRepository {
     workspaceId: WorkspaceId,
     prefix: string,
   ): Promise<IssueKeyPrefixRecord | null>;
+  findProjectIdByWorkspacePrefix(
+    workspaceId: WorkspaceId,
+    prefix: string,
+  ): Promise<ProjectId | null>;
+  findTaskIdByWorkspaceKey(
+    workspaceId: WorkspaceId,
+    prefix: string,
+    issueNumber: number,
+  ): Promise<TaskPublicId | null>;
+  findTaskIdsByWorkspacesAndKey(
+    workspaceIds: readonly WorkspaceId[],
+    prefix: string,
+    issueNumber: number,
+  ): Promise<Array<{ workspaceId: WorkspaceId; taskId: TaskPublicId }>>;
   reservePrefix(
     input: IssueKeyPrefixRecord,
   ): Promise<IssueKeyPrefixRecord | null>;

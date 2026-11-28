@@ -1,4 +1,4 @@
-import type { Kysely, Transaction } from "kysely";
+import { sql, type Kysely, type Transaction } from "kysely";
 import type {
   AppendOutboxEventInput,
   AuthIdentityRecord,
@@ -79,6 +79,24 @@ import type {
 } from "./schema.js";
 
 type DbExecutor = Kysely<ProodDatabase> | Transaction<ProodDatabase>;
+
+/**
+ * Returns true when a trimmed query requires JavaScript Unicode NFC/lowercase
+ * matching rather than SQL `lower()`, because SQLite's built-in `lower()` only
+ * folds ASCII A-Z while PostgreSQL depends on collation.
+ */
+function needsUnicodeJsFilter(query: string): boolean {
+  const nfc = query.normalize("NFC");
+  if (nfc !== query) {
+    return true;
+  }
+  for (const ch of nfc) {
+    if (ch.charCodeAt(0) > 0x7f && ch.toLowerCase() !== ch.toUpperCase()) {
+      return true;
+    }
+  }
+  return false;
+}
 
 function toWorkspaceRecord(row: WorkspaceTable): WorkspaceRecord {
   return {
@@ -583,6 +601,24 @@ export function createKyselyRepositories(
       return row ? toWorkspaceMembershipRecord(row) : null;
     },
 
+    async deleteByWorkspaceAndUser(
+      workspaceId: WorkspaceId,
+      userId: UserId,
+    ): Promise<boolean> {
+      const row = await runQuery(
+        () =>
+          executor
+            .deleteFrom("workspace_memberships")
+            .where("workspace_id", "=", workspaceId)
+            .where("user_id", "=", userId)
+            .returning("id")
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return row !== undefined;
+    },
+
     async listSummariesForUser(
       userId: UserId,
     ): Promise<WorkspaceMembershipSummary[]> {
@@ -781,6 +817,24 @@ export function createKyselyRepositories(
       );
       return row ? toProjectMembershipRecord(row) : null;
     },
+
+    async deleteMembership(
+      projectId: ProjectId,
+      userId: UserId,
+    ): Promise<boolean> {
+      const row = await runQuery(
+        () =>
+          executor
+            .deleteFrom("project_memberships")
+            .where("project_id", "=", projectId)
+            .where("user_id", "=", userId)
+            .returning("id")
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return row !== undefined;
+    },
   };
 
   const statuses: ProjectStatusRepository = {
@@ -882,6 +936,42 @@ export function createKyselyRepositories(
       return row ? toTaskRecord(row) : null;
     },
 
+    async lockByIdsForUpdate(
+      ids: readonly TaskPublicId[],
+    ): Promise<TaskRecord[]> {
+      // Sort ascending to acquire row locks in a canonical order and prevent deadlocks.
+      const sortedUniqueIds = Array.from(new Set(ids)).sort((a, b) =>
+        a < b ? -1 : a > b ? 1 : 0,
+      );
+      if (sortedUniqueIds.length === 0) {
+        return [];
+      }
+
+      const results: TaskRecord[] = [];
+      for (let i = 0; i < sortedUniqueIds.length; i += IN_CLAUSE_BATCH_SIZE) {
+        const chunk = sortedUniqueIds.slice(i, i + IN_CLAUSE_BATCH_SIZE);
+        const rows = await runQuery(
+          () => {
+            let query = executor
+              .selectFrom("tasks")
+              .selectAll()
+              .where("id", "in", chunk)
+              .orderBy("id", "asc");
+            if (driver === "postgres") {
+              query = query.forUpdate();
+            }
+            return query.execute();
+          },
+          mapError,
+          assertActive,
+        );
+        for (const row of rows) {
+          results.push(toTaskRecord(row));
+        }
+      }
+      return results;
+    },
+
     async listByProject(projectId: ProjectId): Promise<TaskRecord[]> {
       const rows = await runQuery(
         () =>
@@ -968,6 +1058,138 @@ export function createKyselyRepositories(
       return results;
     },
 
+    async searchInWorkspace(input: {
+      workspaceId: WorkspaceId;
+      allowedProjectIds: readonly ProjectId[];
+      query: string;
+      limit: number;
+      before?: { updatedAt: string; id: TaskPublicId };
+    }): Promise<TaskRecord[]> {
+      const uniqueProjectIds = Array.from(new Set(input.allowedProjectIds));
+      if (uniqueProjectIds.length === 0 || input.limit <= 0) {
+        return [];
+      }
+
+      const fetchPage = async (
+        beforeCursor: { updatedAt: string; id: TaskPublicId } | undefined,
+        pageLimit: number,
+        sqlLowerPattern: string | null,
+      ): Promise<TaskRecord[]> => {
+        const byId = new Map<TaskPublicId, TaskRecord>();
+        let chunkCount = 0;
+
+        for (let i = 0; i < uniqueProjectIds.length; i += IN_CLAUSE_BATCH_SIZE) {
+          const chunk = uniqueProjectIds.slice(i, i + IN_CLAUSE_BATCH_SIZE);
+          const includeInheritedNulls = i === 0;
+          chunkCount += 1;
+          const rows = await runQuery(
+            () => {
+              let queryBuilder = executor
+                .selectFrom("tasks")
+                .selectAll()
+                .where("workspace_id", "=", input.workspaceId)
+                .where((eb) =>
+                  includeInheritedNulls
+                    ? eb.or([
+                        eb("project_id", "in", chunk),
+                        eb("project_id", "is", null),
+                      ])
+                    : eb("project_id", "in", chunk),
+                );
+              if (sqlLowerPattern !== null) {
+                queryBuilder = queryBuilder.where((eb) =>
+                  eb.or([
+                    sql<boolean>`lower(${eb.ref("title")}) LIKE ${sqlLowerPattern} ESCAPE '\\'`,
+                    sql<boolean>`lower(${eb.ref("description")}) LIKE ${sqlLowerPattern} ESCAPE '\\'`,
+                  ]),
+                );
+              }
+              if (beforeCursor) {
+                const { updatedAt, id } = beforeCursor;
+                queryBuilder = queryBuilder.where((eb) =>
+                  eb.or([
+                    eb("updated_at", "<", updatedAt),
+                    eb.and([
+                      eb("updated_at", "=", updatedAt),
+                      eb("id", "<", id),
+                    ]),
+                  ]),
+                );
+              }
+              return queryBuilder
+                .orderBy("updated_at", "desc")
+                .orderBy("id", "desc")
+                .limit(pageLimit)
+                .execute();
+            },
+            mapError,
+            assertActive,
+          );
+          for (const row of rows) {
+            const rec = toTaskRecord(row);
+            if (!byId.has(rec.id)) {
+              byId.set(rec.id, rec);
+            }
+          }
+        }
+
+        const results = Array.from(byId.values());
+        if (chunkCount > 1) {
+          results.sort((a, b) => {
+            if (a.updatedAt !== b.updatedAt) {
+              return a.updatedAt > b.updatedAt ? -1 : 1;
+            }
+            if (a.id !== b.id) {
+              return a.id > b.id ? -1 : 1;
+            }
+            return 0;
+          });
+        }
+        return results.slice(0, pageLimit);
+      };
+
+      const trimmedQuery = input.query.trim();
+      if (trimmedQuery.length === 0) {
+        return fetchPage(input.before, input.limit, null);
+      }
+
+      if (!needsUnicodeJsFilter(trimmedQuery)) {
+        const folded = trimmedQuery.toLowerCase();
+        const escapedPattern = `%${folded.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
+        return fetchPage(input.before, input.limit, escapedPattern);
+      }
+
+      const needle = trimmedQuery.normalize("NFC").toLowerCase();
+      const matched: TaskRecord[] = [];
+      let scanBefore = input.before;
+      const scanBatchSize = Math.min(Math.max(input.limit * 4, 200), 500);
+
+      while (matched.length < input.limit) {
+        const rawRows = await fetchPage(scanBefore, scanBatchSize, null);
+        if (rawRows.length === 0) {
+          break;
+        }
+        for (const row of rawRows) {
+          if (
+            row.title.normalize("NFC").toLowerCase().includes(needle) ||
+            row.description.normalize("NFC").toLowerCase().includes(needle)
+          ) {
+            matched.push(row);
+            if (matched.length >= input.limit) {
+              break;
+            }
+          }
+        }
+        if (matched.length >= input.limit || rawRows.length < scanBatchSize) {
+          break;
+        }
+        const lastRaw = rawRows[rawRows.length - 1]!;
+        scanBefore = { updatedAt: lastRaw.updatedAt, id: lastRaw.id };
+      }
+
+      return matched;
+    },
+
     async update(
       id: TaskPublicId,
       input: UpdateTaskInput,
@@ -980,6 +1202,12 @@ export function createKyselyRepositories(
       }
       if (input.description !== undefined) {
         patch.description = input.description;
+      }
+      if (input.projectId !== undefined) {
+        patch.project_id = input.projectId;
+      }
+      if (input.parentTaskId !== undefined) {
+        patch.parent_task_id = input.parentTaskId;
       }
       if (input.statusId !== undefined) {
         patch.status_id = input.statusId;
@@ -1005,6 +1233,47 @@ export function createKyselyRepositories(
         assertActive,
       );
       return row ? toTaskRecord(row) : null;
+    },
+
+    async clearParentTaskIds(
+      taskIds: readonly TaskPublicId[],
+      updatedAt: string,
+    ): Promise<void> {
+      const uniqueIds = Array.from(new Set(taskIds));
+      for (let i = 0; i < uniqueIds.length; i += IN_CLAUSE_BATCH_SIZE) {
+        const chunk = uniqueIds.slice(i, i + IN_CLAUSE_BATCH_SIZE);
+        await runQuery(
+          () =>
+            executor
+              .updateTable("tasks")
+              .set({ parent_task_id: null, updated_at: updatedAt })
+              .where("id", "in", chunk)
+              .execute(),
+          mapError,
+          assertActive,
+        );
+      }
+    },
+
+    async updateStatusForTaskIds(
+      taskIds: readonly TaskPublicId[],
+      statusId: StatusId | null,
+      updatedAt: string,
+    ): Promise<void> {
+      const uniqueIds = Array.from(new Set(taskIds));
+      for (let i = 0; i < uniqueIds.length; i += IN_CLAUSE_BATCH_SIZE) {
+        const chunk = uniqueIds.slice(i, i + IN_CLAUSE_BATCH_SIZE);
+        await runQuery(
+          () =>
+            executor
+              .updateTable("tasks")
+              .set({ status_id: statusId, updated_at: updatedAt })
+              .where("id", "in", chunk)
+              .execute(),
+          mapError,
+          assertActive,
+        );
+      }
     },
 
     async deleteById(id: TaskPublicId): Promise<boolean> {
@@ -1215,6 +1484,102 @@ export function createKyselyRepositories(
         assertActive,
       );
       return row ? toIssueKeyPrefixRecord(row) : null;
+    },
+
+    async findProjectIdByWorkspacePrefix(
+      workspaceId: WorkspaceId,
+      prefix: string,
+    ): Promise<ProjectId | null> {
+      const row = await runQuery(
+        () =>
+          executor
+            .selectFrom("issue_key_prefixes")
+            .innerJoin(
+              "issue_key_namespaces",
+              "issue_key_namespaces.id",
+              "issue_key_prefixes.namespace_id",
+            )
+            .innerJoin(
+              "projects",
+              "projects.id",
+              "issue_key_namespaces.project_id",
+            )
+            .select("issue_key_namespaces.project_id")
+            .where("issue_key_prefixes.workspace_id", "=", workspaceId)
+            .where("issue_key_prefixes.prefix", "=", prefix)
+            .where("projects.archived_at", "is", null)
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return row?.project_id ? (row.project_id as ProjectId) : null;
+    },
+
+    async findTaskIdByWorkspaceKey(
+      workspaceId: WorkspaceId,
+      prefix: string,
+      issueNumber: number,
+    ): Promise<TaskPublicId | null> {
+      const row = await runQuery(
+        () =>
+          executor
+            .selectFrom("issue_key_prefixes")
+            .innerJoin(
+              "task_issue_keys",
+              "task_issue_keys.namespace_id",
+              "issue_key_prefixes.namespace_id",
+            )
+            .select("task_issue_keys.task_id")
+            .where("issue_key_prefixes.workspace_id", "=", workspaceId)
+            .where("issue_key_prefixes.prefix", "=", prefix)
+            .where("task_issue_keys.issue_number", "=", issueNumber)
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      return row ? (row.task_id as TaskPublicId) : null;
+    },
+
+    async findTaskIdsByWorkspacesAndKey(
+      workspaceIds: readonly WorkspaceId[],
+      prefix: string,
+      issueNumber: number,
+    ): Promise<Array<{ workspaceId: WorkspaceId; taskId: TaskPublicId }>> {
+      const uniqueWorkspaceIds = Array.from(new Set(workspaceIds));
+      if (uniqueWorkspaceIds.length === 0) {
+        return [];
+      }
+      const results: Array<{ workspaceId: WorkspaceId; taskId: TaskPublicId }> = [];
+      for (let i = 0; i < uniqueWorkspaceIds.length; i += IN_CLAUSE_BATCH_SIZE) {
+        const chunk = uniqueWorkspaceIds.slice(i, i + IN_CLAUSE_BATCH_SIZE);
+        const rows = await runQuery(
+          () =>
+            executor
+              .selectFrom("issue_key_prefixes")
+              .innerJoin(
+                "task_issue_keys",
+                "task_issue_keys.namespace_id",
+                "issue_key_prefixes.namespace_id",
+              )
+              .select([
+                "issue_key_prefixes.workspace_id",
+                "task_issue_keys.task_id",
+              ])
+              .where("issue_key_prefixes.workspace_id", "in", chunk)
+              .where("issue_key_prefixes.prefix", "=", prefix)
+              .where("task_issue_keys.issue_number", "=", issueNumber)
+              .execute(),
+          mapError,
+          assertActive,
+        );
+        for (const row of rows) {
+          results.push({
+            workspaceId: row.workspace_id as WorkspaceId,
+            taskId: row.task_id as TaskPublicId,
+          });
+        }
+      }
+      return results;
     },
 
     async reservePrefix(

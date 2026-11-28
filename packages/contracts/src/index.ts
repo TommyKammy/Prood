@@ -214,6 +214,24 @@ export interface DeleteTaskResponse {
   deletedTaskId: TaskPublicId;
 }
 
+export interface MoveTaskRequest {
+  projectId: ProjectId;
+  statusId?: StatusId | null;
+}
+
+export type TaskSearchMatchKind = "exact_id" | "exact_key" | "text";
+
+export interface TaskSearchItemDto {
+  task: TaskDto;
+  matchKind: TaskSearchMatchKind;
+}
+
+export interface TaskSearchResponse {
+  contractVersion: typeof CONTRACT_VERSION;
+  query: string;
+  items: TaskSearchItemDto[];
+}
+
 export interface TaskResponse {
   contractVersion: typeof CONTRACT_VERSION;
   task: TaskDto;
@@ -237,6 +255,7 @@ export interface CreateTaskRequest {
 export interface UpdateTaskRequest {
   title?: string;
   description?: string;
+  projectId?: ProjectId;
   statusId?: StatusId | null;
   assigneeId?: UserId | null;
   dueOn?: string | null;
