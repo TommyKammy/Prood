@@ -2035,9 +2035,18 @@ describe(`PR 12: SSE Realtime Web Sync & Commit-Order Visibility (${targetDb})`,
       method: "POST",
       jar: alice.jar,
     });
-    const pruneResult = await server.realtimeUseCases.pruneRealtimeEvents({
+    // On shared PostgreSQL clusters running parallel test suites, another worker's
+    // open transaction can temporarily hold `pg_snapshot_xmin` behind our commit;
+    // poll briefly until our events fall below `xmin` and are pruned.
+    let pruneResult = await server.realtimeUseCases.pruneRealtimeEvents({
       keepLast: 0,
     });
+    for (let attempt = 0; attempt < 40 && pruneResult.deletedCount < 2; attempt++) {
+      await new Promise((r) => setTimeout(r, 100));
+      pruneResult = await server.realtimeUseCases.pruneRealtimeEvents({
+        keepLast: 0,
+      });
+    }
     expect(pruneResult.deletedCount).toBeGreaterThanOrEqual(2);
     const listAfterPrune = await db.uow.run((repos) =>
       repos.realtimeEvents.listAfterPosition({
@@ -2048,9 +2057,10 @@ describe(`PR 12: SSE Realtime Web Sync & Commit-Order Visibility (${targetDb})`,
         limit: 50,
       }),
     );
-    expect(listAfterPrune.snapshot.retention.prunedThroughSeq).toBe(
-      pruneResult.prunedThroughSeq,
-    );
+    expect(listAfterPrune.snapshot.retention).toEqual({
+      prunedThroughTxid: pruneResult.prunedThroughTxid,
+      prunedThroughSeq: pruneResult.prunedThroughSeq,
+    });
 
     // Helper to parse SSE frames from a ReadableStreamDefaultReader
     const parseChunks = (raw: string): ParsedSseFrame[] => {
