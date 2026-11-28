@@ -40,10 +40,50 @@ function removeTaskSubtree(tasks: readonly TaskDto[], rootId: TaskPublicId): Tas
   return tasks.filter((item) => !removedIds.has(item.id));
 }
 
+function removeMovedSubtree(
+  tasks: readonly TaskDto[],
+  rootId: TaskPublicId,
+): { tasks: TaskDto[]; changed: boolean } {
+  const removedIds = new Set<TaskPublicId>([rootId]);
+  let added = true;
+  while (added) {
+    added = false;
+    for (const item of tasks) {
+      if (
+        item.projectId === null &&
+        item.parentTaskId &&
+        removedIds.has(item.parentTaskId) &&
+        !removedIds.has(item.id)
+      ) {
+        removedIds.add(item.id);
+        added = true;
+      }
+    }
+  }
+  let changed = false;
+  const next: TaskDto[] = [];
+  for (const item of tasks) {
+    if (removedIds.has(item.id)) {
+      changed = true;
+      continue;
+    }
+    // Mirrors `partitionMovingSubtreeInTx()`: explicitly owned children stay in their
+    // source project with `parentTaskId` detached when a parent moves to another project.
+    if (item.parentTaskId && removedIds.has(item.parentTaskId)) {
+      changed = true;
+      next.push({ ...item, parentTaskId: null });
+      continue;
+    }
+    next.push(item);
+  }
+  return { tasks: next, changed };
+}
+
 /**
  * Applies an incoming SSE task change event onto the currently rendered project's
  * task array without mutating the source array. Cascades parent deletions to any
- * rendered descendants and flags `needsReload` on parent moves affecting the view.
+ * rendered descendants, preserves explicitly owned detached children across moves,
+ * and flags `needsReload` on parent moves/removals affecting the view.
  */
 export function applyRealtimeChangeToTasks(
   tasks: readonly TaskDto[],
@@ -55,7 +95,7 @@ export function applyRealtimeChangeToTasks(
   }
 
   const targetId = event.taskId ?? event.task?.id;
-  if (event.eventType === "task.deleted" || event.eventType === "task.removed") {
+  if (event.eventType === "task.deleted") {
     if (!targetId) {
       return { tasks: [...tasks], changed: false };
     }
@@ -63,6 +103,22 @@ export function applyRealtimeChangeToTasks(
     return {
       tasks: next,
       changed: next.length !== tasks.length,
+    };
+  }
+
+  if (event.eventType === "task.removed") {
+    if (!targetId) {
+      return { tasks: [...tasks], changed: false };
+    }
+    const removed = removeMovedSubtree(tasks, targetId);
+    const shouldReload =
+      removed.changed ||
+      event.projectId === activeProjectId ||
+      tasks.some((item) => item.parentTaskId === targetId);
+    return {
+      tasks: removed.tasks,
+      changed: removed.changed,
+      ...(shouldReload ? { needsReload: true } : {}),
     };
   }
 
@@ -96,7 +152,7 @@ export function applyRealtimeChangeToTasks(
       }
       return {
         tasks: isMove
-          ? removeTaskSubtree(tasks, incoming.id)
+          ? removeMovedSubtree(tasks, incoming.id).tasks
           : tasks.filter((_, idx) => idx !== existingIndex),
         changed: true,
         ...(affectsSubtree ? { needsReload: true } : {}),

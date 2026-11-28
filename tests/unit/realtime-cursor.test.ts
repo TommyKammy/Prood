@@ -299,4 +299,69 @@ describe("realtime cursor codec and visibility watermarks", () => {
     expect(replayedOlder.tasks[0]?.title).toBe("Alpha Edited Later");
     expect(replayedOlder.tasks[0]?.assigneeDisplayName).toBe("Bob");
   });
+
+  it("preserves explicitly owned detached children and their descendants on task.removed and task.moved", () => {
+    const tsk4 = generateEntityId("tsk", 1_795_000_000_000, new Uint8Array(10).fill(9));
+    const parent = makeTaskDto(tsk1, prjA, 0, { title: "Parent" });
+    const inheritedChild = makeTaskDto(tsk2, prjA, 1, {
+      projectId: null,
+      parentTaskId: tsk1,
+      title: "Inherited Child",
+    });
+    const ownedChild = makeTaskDto(tsk3, prjA, 2, {
+      projectId: prjA,
+      parentTaskId: tsk1,
+      title: "Owned Child",
+    });
+    const ownedGrandchild = makeTaskDto(tsk4, prjA, 3, {
+      projectId: null,
+      parentTaskId: tsk3,
+      title: "Owned Grandchild",
+    });
+    const tree = [parent, inheritedChild, ownedChild, ownedGrandchild];
+
+    // Sanitized removal (parent moved to private project) preserves owned child + its subtree and requests reload
+    const removedEv: RealtimeChangeEventDto = {
+      contractVersion: CONTRACT_VERSION,
+      type: "change",
+      eventId: evt1,
+      eventType: "task.removed",
+      workspaceId: wksA,
+      projectId: prjA,
+      taskId: tsk1,
+      occurredAt: "2026-11-28T12:01:00.000Z",
+      cursor: `v1:sq:${wksA}:2`,
+    };
+    const afterRemoved = applyRealtimeChangeToTasks(tree, prjA, removedEv);
+    expect(afterRemoved.changed).toBe(true);
+    expect(afterRemoved.needsReload).toBe(true);
+    expect(afterRemoved.tasks.map((t) => t.id)).toEqual([tsk3, tsk4]);
+    expect(afterRemoved.tasks[0]?.parentTaskId).toBeNull();
+    expect(afterRemoved.tasks[1]?.parentTaskId).toBe(tsk3);
+
+    // Readable cross-project move preserves explicitly owned detached children immediately too
+    const movedEv: RealtimeChangeEventDto = {
+      ...removedEv,
+      eventType: "task.moved",
+      projectId: prjB,
+      fromProjectId: prjA,
+      task: makeTaskDto(tsk1, prjB, 0),
+    };
+    const afterMoved = applyRealtimeChangeToTasks(tree, prjA, movedEv);
+    expect(afterMoved.changed).toBe(true);
+    expect(afterMoved.needsReload).toBe(true);
+    expect(afterMoved.tasks.map((t) => t.id)).toEqual([tsk3, tsk4]);
+    expect(afterMoved.tasks[0]?.parentTaskId).toBeNull();
+    expect(afterMoved.tasks[1]?.parentTaskId).toBe(tsk3);
+
+    // Hard deletion still cascades across all descendants regardless of explicit ownership
+    const deletedEv: RealtimeChangeEventDto = {
+      ...removedEv,
+      eventType: "task.deleted",
+    };
+    const afterDeleted = applyRealtimeChangeToTasks(tree, prjA, deletedEv);
+    expect(afterDeleted.changed).toBe(true);
+    expect(afterDeleted.needsReload).toBeUndefined();
+    expect(afterDeleted.tasks).toEqual([]);
+  });
 });

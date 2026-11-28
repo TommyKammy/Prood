@@ -726,16 +726,21 @@ async function startRealtimeTestServer(
         const rawUrl = typeof input === "string" ? input : input.toString();
         const url = new URL(rawUrl, baseUrl);
         const headers = new Headers(init?.headers);
-        headers.set("origin", baseUrl);
+        if (!headers.has("origin")) {
+          headers.set("origin", baseUrl);
+        }
+        const hadExplicitCookie = headers.has("cookie");
         const cookieHeader = jar.toHeader();
-        if (cookieHeader && !headers.has("authorization")) {
+        if (cookieHeader && !headers.has("authorization") && !hadExplicitCookie) {
           headers.set("cookie", cookieHeader);
         }
         const res = await origFetch(url.toString(), {
           ...init,
           headers,
         });
-        jar.updateFrom(res);
+        if (!hadExplicitCookie) {
+          jar.updateFrom(res);
+        }
         return res;
       },
     );
@@ -1882,6 +1887,90 @@ describe(`PR 12: SSE Realtime Web Sync & Commit-Order Visibility (${targetDb})`,
         browser.doc.querySelector(`[data-task-row="${delChild.id}"]`) === null,
       "deleting parent removes both parent and subtask from Web List",
     );
+
+    // Move parent to private project -> member gets `task.removed`, inherited child disappears,
+    // while explicitly owned child (`inheritParentProject: false`) and its descendant remain visible.
+    const privParent = ((
+      await (
+        await server.apiRequest(`/api/v1/projects/${projA.id}/tasks`, {
+          method: "POST",
+          jar: admin.jar,
+          json: { title: "Priv Move Parent" },
+        })
+      ).json()
+    ) as TaskResponse).task;
+    const privInheritedChild = ((
+      await (
+        await server.apiRequest(`/api/v1/projects/${projA.id}/tasks`, {
+          method: "POST",
+          jar: admin.jar,
+          json: {
+            title: "Priv Inherited Child",
+            parentTaskId: privParent.id,
+            inheritParentProject: true,
+          },
+        })
+      ).json()
+    ) as TaskResponse).task;
+    const detachedOwnedChild = ((
+      await (
+        await server.apiRequest(`/api/v1/projects/${projA.id}/tasks`, {
+          method: "POST",
+          jar: admin.jar,
+          json: {
+            title: "Detached Owned Child",
+            parentTaskId: privParent.id,
+            inheritParentProject: false,
+          },
+        })
+      ).json()
+    ) as TaskResponse).task;
+    const detachedGrandchild = ((
+      await (
+        await server.apiRequest(`/api/v1/projects/${projA.id}/tasks`, {
+          method: "POST",
+          jar: admin.jar,
+          json: {
+            title: "Detached Grandchild",
+            parentTaskId: detachedOwnedChild.id,
+            inheritParentProject: true,
+          },
+        })
+      ).json()
+    ) as TaskResponse).task;
+
+    await waitFor(
+      () =>
+        browser.doc.querySelector(`[data-task-row="${privParent.id}"]`) !== null &&
+        browser.doc.querySelector(`[data-task-row="${privInheritedChild.id}"]`) !== null &&
+        browser.doc.querySelector(`[data-task-row="${detachedOwnedChild.id}"]`) !== null &&
+        browser.doc.querySelector(`[data-task-row="${detachedGrandchild.id}"]`) !== null,
+      "Web List shows private-move parent, inherited child, owned child, and grandchild",
+    );
+
+    expect(
+      (
+        await server.apiRequest(`/api/v1/tasks/${privParent.id}/move`, {
+          method: "POST",
+          jar: admin.jar,
+          json: { projectId: projBPriv.id },
+        })
+      ).status,
+    ).toBe(200);
+
+    await waitFor(
+      () =>
+        browser.doc.querySelector(`[data-task-row="${privParent.id}"]`) === null &&
+        browser.doc.querySelector(`[data-task-row="${privInheritedChild.id}"]`) === null,
+      "moving parent to unreadable private project removes parent and inherited child",
+    );
+    await new Promise((r) => setTimeout(r, 150));
+    expect(
+      browser.doc.querySelector(`[data-task-row="${detachedOwnedChild.id}"]`),
+    ).not.toBeNull();
+    expect(
+      browser.doc.querySelector(`[data-task-row="${detachedGrandchild.id}"]`),
+    ).not.toBeNull();
   }, 25_000);
 
   it("reads retention metadata in the same snapshot and enforces SSE backpressure for slow subscribers", async () => {
