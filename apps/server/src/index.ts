@@ -159,6 +159,26 @@ export function mountWebShellAssets(rootApp: Hono, customWebDistDir?: string): v
       return c.body(readFileSync(fullPath), 200, headers);
     });
   }
+
+  const chunkFilenamePattern = /^[a-zA-Z0-9_-]+-[a-zA-Z0-9]+\.js$/;
+  rootApp.get("/chunks/:file", (c) => {
+    const file = c.req.param("file") ?? "";
+    if (!/^[a-zA-Z0-9._-]+\.js$/.test(file) || file.includes("..")) {
+      return c.text("Not found", 404);
+    }
+    const fullPath = resolve(webDistDir, "chunks", file);
+    if (!existsSync(fullPath)) {
+      return c.text("Not found", 404);
+    }
+    const cacheHeader = chunkFilenamePattern.test(file)
+      ? "public, max-age=31536000, immutable"
+      : "no-store";
+    return c.body(readFileSync(fullPath), 200, {
+      "Content-Type": "application/javascript; charset=utf-8",
+      "X-Content-Type-Options": "nosniff",
+      "Cache-Control": cacheHeader,
+    });
+  });
 }
 
 export interface ShutdownServerOptions {

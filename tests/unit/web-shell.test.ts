@@ -1,13 +1,19 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { Window } from "happy-dom";
 import { CONTRACT_VERSION, type MeResponse } from "@prood/contracts";
 import { generateEntityId } from "@prood/domain";
 import {
+  copyFromTarget,
+  createCopyControl,
+  createI18n,
+  ensureCopyCommandListener,
   extractSignedOAuthQuery,
   isSafeRedirectUrl,
   ProodLoginFormElement,
   ProodShellElement,
+  translateApiError,
 } from "@prood/web";
 
 afterEach(() => {
@@ -238,3 +244,79 @@ describe("@prood/web login & asset paths", () => {
     expect(shell.getConsentError()).toBe("This authorization request is missing or invalid.");
   });
 });
+
+describe("@prood/web i18n error translation & accessible copy control", () => {
+  it("translates known API error keys and falls back to error.generic for unknown keys", () => {
+    const i18n = createI18n({
+      locale: "ja",
+      catalogs: {
+        ja: {
+          "error.prefixAlreadyInUse": "この接頭辞は既に使用中です。",
+          "error.generic": "エラーが発生しました。",
+        },
+      },
+    });
+    expect(translateApiError(i18n, "error.prefixAlreadyInUse")).toBe(
+      "この接頭辞は既に使用中です。",
+    );
+    expect(translateApiError(i18n, "error.unknownServerCode")).toBe(
+      "エラーが発生しました。",
+    );
+  });
+
+  it("copies target text via Clipboard API or legacy fallback and updates status live region cleanly", async () => {
+    const win = new Window({ url: "http://127.0.0.1:3000/" });
+    const doc = win.document as unknown as Document;
+    vi.stubGlobal("window", win);
+    vi.stubGlobal("document", doc);
+    vi.stubGlobal("HTMLElement", win.HTMLElement);
+    vi.stubGlobal("HTMLInputElement", win.HTMLInputElement);
+    vi.stubGlobal("HTMLTextAreaElement", win.HTMLTextAreaElement);
+    vi.stubGlobal("Element", win.Element);
+
+    const writeText = vi.fn(async (_text: string) => {});
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+
+    const code = doc.createElement("code");
+    code.id = "copy-target-1";
+    code.textContent = "tsk_01jf8x9z2k3m4n5p6q7r8s9t0v";
+    const copyControl = createCopyControl({
+      targetId: "copy-target-1",
+      buttonText: "Copy ID",
+      screenReaderSuffix: "tsk_01jf8x9z2k3m4n5p6q7r8s9t0v",
+      copyKind: "id",
+    });
+    doc.body.append(code, copyControl);
+
+    ensureCopyCommandListener(() => ({ copied: "Copied", failed: "Copy failed" }));
+
+    const btn = copyControl.querySelector("button")!;
+    const tip = copyControl.querySelector('[role="status"]')!;
+
+    const firstOk = await copyFromTarget(btn, code, {
+      copied: "Copied",
+      failed: "Copy failed",
+    });
+    expect(firstOk).toBe(true);
+    expect(writeText).toHaveBeenCalledWith("tsk_01jf8x9z2k3m4n5p6q7r8s9t0v");
+    expect(btn.hasAttribute("data-copied")).toBe(true);
+    expect(btn.disabled).toBe(false);
+    expect(tip.textContent).toBe("Copied");
+
+    // Repeated announcement adds NBSP so screen readers re-announce identical status
+    await copyFromTarget(btn, code, { copied: "Copied", failed: "Copy failed" });
+    expect(tip.textContent).toBe("Copied\u00A0");
+
+    // Clipboard failure with failed legacyCopy shows failure message without disabling button
+    writeText.mockRejectedValueOnce(new Error("Permission denied"));
+    const failedOk = await copyFromTarget(btn, code, {
+      copied: "Copied",
+      failed: "Copy failed",
+    });
+    expect(failedOk).toBe(false);
+    expect(btn.hasAttribute("data-failed")).toBe(true);
+    expect(btn.disabled).toBe(false);
+    expect(tip.textContent).toBe("Copy failed");
+  });
+});
+
