@@ -406,6 +406,7 @@ export function createRealtimeController(
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectDelayMs = 1000;
   let closedManually = false;
+  let sessionGen = 0;
 
   const clearTimer = () => {
     if (reconnectTimer !== null) {
@@ -419,6 +420,70 @@ export function createRealtimeController(
       source.close();
       source = null;
     }
+  };
+
+  const handleRevoked = () => {
+    closedManually = true;
+    awaitingInitialReady = false;
+    clearTimer();
+    closeSource();
+    options.onRevoked();
+  };
+
+  const scheduleReconnect = (workspaceId: WorkspaceId) => {
+    if (closedManually || activeWorkspaceId !== workspaceId) {
+      return;
+    }
+    clearTimer();
+    const delay = reconnectDelayMs;
+    reconnectDelayMs = Math.min(reconnectDelayMs * 2, 15_000);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (!closedManually && activeWorkspaceId === workspaceId) {
+        openStream(workspaceId);
+      }
+    }, delay);
+  };
+
+  const reconcileAuthorizationAndRecover = async (
+    workspaceId: WorkspaceId,
+    gen: number,
+  ) => {
+    if (typeof fetch !== "function") {
+      scheduleReconnect(workspaceId);
+      return;
+    }
+    try {
+      const res = await fetch("/api/v1/me", { credentials: "same-origin" });
+      if (gen !== sessionGen || closedManually || activeWorkspaceId !== workspaceId) {
+        return;
+      }
+      if (res.status === 401 || res.status === 403) {
+        handleRevoked();
+        return;
+      }
+      if (res.ok) {
+        const data = (await res.json().catch(() => null)) as {
+          memberships?: Array<{ workspaceId?: string }>;
+        } | null;
+        if (gen !== sessionGen || closedManually || activeWorkspaceId !== workspaceId) {
+          return;
+        }
+        if (
+          Array.isArray(data?.memberships) &&
+          !data.memberships.some((m) => m.workspaceId === workspaceId)
+        ) {
+          handleRevoked();
+          return;
+        }
+      }
+    } catch {
+      // Fall through to transient reconnect backoff when /api/v1/me is unreachable
+    }
+    if (gen !== sessionGen || closedManually || activeWorkspaceId !== workspaceId) {
+      return;
+    }
+    scheduleReconnect(workspaceId);
   };
 
   const openStream = (workspaceId: WorkspaceId) => {
@@ -485,11 +550,7 @@ export function createRealtimeController(
 
     es.addEventListener("revoked", () => {
       if (source !== es) return;
-      closedManually = true;
-      awaitingInitialReady = false;
-      clearTimer();
-      closeSource();
-      options.onRevoked();
+      handleRevoked();
     });
 
     es.addEventListener("error", () => {
@@ -497,14 +558,7 @@ export function createRealtimeController(
       if (es.readyState === 2) {
         closeSource();
         clearTimer();
-        const delay = reconnectDelayMs;
-        reconnectDelayMs = Math.min(reconnectDelayMs * 2, 15_000);
-        reconnectTimer = setTimeout(() => {
-          reconnectTimer = null;
-          if (!closedManually && activeWorkspaceId === workspaceId) {
-            openStream(workspaceId);
-          }
-        }, delay);
+        void reconcileAuthorizationAndRecover(workspaceId, sessionGen);
       }
     });
   };
@@ -514,6 +568,7 @@ export function createRealtimeController(
       if (activeWorkspaceId === workspaceId && source && !closedManually) {
         return;
       }
+      sessionGen += 1;
       closedManually = false;
       activeWorkspaceId = workspaceId;
       lastCursor = null;
@@ -524,6 +579,7 @@ export function createRealtimeController(
     },
 
     close() {
+      sessionGen += 1;
       closedManually = true;
       activeWorkspaceId = null;
       lastCursor = null;

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   advanceRealtimeCursor,
   buildInitialCursor,
@@ -14,6 +14,7 @@ import { CONTRACT_VERSION, type RealtimeChangeEventDto, type TaskDto } from "@pr
 import { generateEntityId } from "@prood/domain";
 import {
   applyRealtimeChangeToTasks,
+  createRealtimeController,
   replayRealtimeEventsOnSnapshot,
 } from "../../apps/web/src/realtime.js";
 
@@ -363,5 +364,134 @@ describe("realtime cursor codec and visibility watermarks", () => {
     expect(afterDeleted.changed).toBe(true);
     expect(afterDeleted.needsReload).toBeUndefined();
     expect(afterDeleted.tasks).toEqual([]);
+  });
+
+  describe("createRealtimeController authorization recovery", () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    });
+
+    function installMockEventSource() {
+      const NativeEventTarget = globalThis.EventTarget;
+      const NativeEvent = globalThis.Event;
+      const opened: Array<{
+        url: string;
+        readyState: number;
+        fail(): void;
+        close(): void;
+      }> = [];
+      class MockEventSource extends NativeEventTarget {
+        readyState = 1;
+        constructor(public url: string) {
+          super();
+          opened.push(this);
+        }
+        fail() {
+          this.readyState = 2;
+          this.dispatchEvent(new NativeEvent("error"));
+        }
+        close() {
+          this.readyState = 2;
+        }
+      }
+      vi.stubGlobal("EventSource", MockEventSource);
+      return opened;
+    }
+
+    it("invokes onRevoked and stops retrying on terminal error when session returns 401", async () => {
+      vi.useFakeTimers();
+      const opened = installMockEventSource();
+      const onRevoked = vi.fn();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => new Response(null, { status: 401 })),
+      );
+
+      const ctrl = createRealtimeController({
+        onChange: () => {},
+        onResync: () => {},
+        onRevoked,
+      });
+      ctrl.connect(wksA);
+      expect(opened).toHaveLength(1);
+
+      opened[0]!.fail();
+      await vi.advanceTimersByTimeAsync(20_000);
+
+      expect(onRevoked).toHaveBeenCalledTimes(1);
+      expect(opened).toHaveLength(1);
+      ctrl.close();
+    });
+
+    it("invokes onRevoked and stops retrying on terminal error when workspace membership is gone", async () => {
+      vi.useFakeTimers();
+      const opened = installMockEventSource();
+      const onRevoked = vi.fn();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async () =>
+            new Response(
+              JSON.stringify({
+                contractVersion: CONTRACT_VERSION,
+                memberships: [{ workspaceId: wksB }],
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            ),
+        ),
+      );
+
+      const ctrl = createRealtimeController({
+        onChange: () => {},
+        onResync: () => {},
+        onRevoked,
+      });
+      ctrl.connect(wksA);
+      expect(opened).toHaveLength(1);
+
+      opened[0]!.fail();
+      await vi.advanceTimersByTimeAsync(20_000);
+
+      expect(onRevoked).toHaveBeenCalledTimes(1);
+      expect(opened).toHaveLength(1);
+      ctrl.close();
+    });
+
+    it("keeps retrying with exponential backoff on transient failures when still authorized", async () => {
+      vi.useFakeTimers();
+      const opened = installMockEventSource();
+      const onRevoked = vi.fn();
+      const fetchMock = vi
+        .fn<() => Promise<Response>>()
+        .mockResolvedValueOnce(new Response(null, { status: 503 }))
+        .mockRejectedValueOnce(new Error("network down"));
+      vi.stubGlobal("fetch", fetchMock);
+
+      const ctrl = createRealtimeController({
+        onChange: () => {},
+        onResync: () => {},
+        onRevoked,
+      });
+      ctrl.connect(wksA);
+      expect(opened).toHaveLength(1);
+
+      // 1st failure -> 503 -> retries after 1000ms
+      opened[0]!.fail();
+      await vi.advanceTimersByTimeAsync(999);
+      expect(opened).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(opened).toHaveLength(2);
+      expect(onRevoked).not.toHaveBeenCalled();
+
+      // 2nd failure -> network error -> backs off to 2000ms
+      opened[1]!.fail();
+      await vi.advanceTimersByTimeAsync(1999);
+      expect(opened).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(opened).toHaveLength(3);
+      expect(onRevoked).not.toHaveBeenCalled();
+      ctrl.close();
+    });
   });
 });

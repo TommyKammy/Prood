@@ -473,6 +473,9 @@ export class ProodShellElement extends BaseElement {
       return;
     }
 
+    if (this.activeWorkspaceId) {
+      this.resetWorkspaceState();
+    }
     this.render();
   }
 
