@@ -462,6 +462,9 @@ export class ProodShellElement extends BaseElement {
         !this.activeWorkspaceId ||
         !memberships.some((m) => m.workspaceId === this.activeWorkspaceId)
       ) {
+        if (this.activeWorkspaceId) {
+          this.resetWorkspaceState();
+        }
         this.activeWorkspaceId = validWs
           ? validWs.workspaceId
           : memberships[0]!.workspaceId;

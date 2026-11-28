@@ -1523,7 +1523,8 @@ describe(`Issue resolution, move visibility & search (${targetDb})`, () => {
         expect(moveRes.ok).toBe(true);
         expect(memberRes.ok).toBe(false);
         if (!memberRes.ok) {
-          expect(memberRes.status).toBe(400);
+          // parentP2 moved into unreadable privateB -> 404 prevents an existence oracle
+          expect(memberRes.status).toBe(404);
         }
       }
     } else {

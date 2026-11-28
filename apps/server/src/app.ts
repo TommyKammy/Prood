@@ -61,6 +61,7 @@ export interface AppDeps {
   idGenerator?: IdGenerator;
   mcpAuth?: McpTokenVerifier;
   mcpHandler?: McpHttpHandler;
+  trustedOrigins?: string[];
   realtimeHub?: RealtimeHub;
   realtime?: RealtimeAppOptions;
 }
@@ -165,6 +166,48 @@ export function createApp(deps: AppDeps): Hono {
       } catch {
         // Keep HTTP error response deterministic even if outbox logging fails
       }
+    }
+
+    const trustedOriginSet = deps.trustedOrigins
+      ? new Set(
+          deps.trustedOrigins
+            .map((origin) => {
+              try {
+                return new URL(origin).origin;
+              } catch {
+                return origin.replace(/\/+$/, "");
+              }
+            })
+            .filter(Boolean),
+        )
+      : null;
+
+    if (trustedOriginSet) {
+      app.use("/api/v1/*", async (c, next) => {
+        const method = c.req.method.toUpperCase();
+        if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
+          return next();
+        }
+        const rawOrigin = c.req.header("origin");
+        if (rawOrigin !== undefined) {
+          let normalizedOrigin: string | null = null;
+          try {
+            normalizedOrigin = new URL(rawOrigin).origin;
+          } catch {
+            normalizedOrigin = null;
+          }
+          if (!normalizedOrigin || !trustedOriginSet.has(normalizedOrigin)) {
+            c.header("Cache-Control", "no-store");
+            await recordAuthFailure(
+              c.req.path,
+              "UNTRUSTED_ORIGIN",
+              "Untrusted Origin header",
+            );
+            return c.json(errorBody("FORBIDDEN", "error.forbidden"), 403);
+          }
+        }
+        return next();
+      });
     }
 
     app.all("/api/auth/*", async (c) => {
@@ -976,7 +1019,7 @@ export function createApp(deps: AppDeps): Hono {
         return parsedWs.response;
       }
       const taskRef = c.req.param("taskRef");
-      const body = await parseJsonBody<CopyTaskRequest & Record<string, unknown>>(c);
+      const body = await parseOptionalJsonBody<CopyTaskRequest & Record<string, unknown>>(c);
       if (!body) {
         return c.json(errorBody("VALIDATION_ERROR", "error.validation"), 400);
       }
@@ -1047,7 +1090,9 @@ export function createApp(deps: AppDeps): Hono {
       }
 
       const requestedCursor =
-        c.req.header("last-event-id") ?? c.req.query("cursor") ?? null;
+        c.req.header("last-event-id")?.trim() ||
+        c.req.query("cursor")?.trim() ||
+        null;
       const open = await realtimeUseCases.openSubscription(
         actorResult.actor,
         workspaceId,

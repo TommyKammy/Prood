@@ -257,8 +257,15 @@ export function createProodMcpServer(deps: ProodMcpServerDeps): McpHttpHandler {
       }
 
       deps.onWhoamiExecuted?.();
-      const profile = await identityUseCase.whoami(sessionAuth, deps.resource);
-      return JSON.stringify(profile);
+      try {
+        const profile = await identityUseCase.whoami(sessionAuth, deps.resource);
+        return JSON.stringify(profile);
+      } catch (error) {
+        if (isEmailVerificationRequiredError(error)) {
+          throwMcpToolError(403, "FORBIDDEN", "error.emailVerificationRequired");
+        }
+        throw error;
+      }
     },
   });
 
