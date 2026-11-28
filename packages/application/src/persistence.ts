@@ -556,7 +556,7 @@ export interface RealtimeSnapshotState {
   xmin: string;
   xmax: string;
   maxSeq: number;
-  visibleAtOrAboveXmin: Array<{ txid: string; seq: number }>;
+  activeXips: string[];
   retention: RealtimeRetentionState;
 }
 
@@ -565,9 +565,9 @@ export interface RealtimeEventsRepository {
   readSnapshotState(workspaceId: WorkspaceId): Promise<RealtimeSnapshotState>;
   listAfterPosition(input: {
     workspaceId: WorkspaceId;
-    safeTxid: string;
-    safeSeq: number;
-    excludeSeqs: readonly number[];
+    watermarkTxid: string;
+    watermarkSeq: number;
+    pendingTxids: ReadonlyArray<{ txid: string; afterSeq: number }>;
     limit: number;
   }): Promise<{
     snapshot: RealtimeSnapshotState;

@@ -235,7 +235,7 @@ describe("@prood/server Web-Standard app", () => {
               xmin: "0",
               xmax: "0",
               maxSeq: 0,
-              visibleAtOrAboveXmin: [],
+              activeXips: [],
               retention: { prunedThroughTxid: "0", prunedThroughSeq: 0 },
             }),
             listAfterPosition: async () => ({
@@ -244,7 +244,7 @@ describe("@prood/server Web-Standard app", () => {
                 xmin: "0",
                 xmax: "0",
                 maxSeq: 0,
-                visibleAtOrAboveXmin: [],
+                activeXips: [],
                 retention: { prunedThroughTxid: "0", prunedThroughSeq: 0 },
               },
               events: [],

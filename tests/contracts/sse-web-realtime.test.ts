@@ -1302,7 +1302,8 @@ describe(`PR 12: SSE Realtime Web Sync & Commit-Order Visibility (${targetDb})`,
 
       await tx1Written;
 
-      // Tx2 runs via db2 and commits FIRST
+      // Tx2 runs via db2 and commits FIRST, followed by 550+ committed transactions
+      // while Tx1 continues to hold PostgreSQL's `xmin` open.
       const useCases2 = createWorkUseCases({
         uow: db2.uow,
         idGenerator: ids,
@@ -1317,21 +1318,61 @@ describe(`PR 12: SSE Realtime Web Sync & Commit-Order Visibility (${targetDb})`,
       expect(tx2Res.ok).toBe(true);
       const task2Id = tx2Res.ok ? tx2Res.data.task.id : ("" as TaskPublicId);
 
-      // Live SSE receives Tx2 immediately while Tx1 is still uncommitted
-      const frameTx2 = await sse.stream.waitForFrame(
+      // Commit 550 independent transactions (> MAX_PENDING_XIPS 512) while Tx1 holds xmin
+      const burstCount = 550;
+      const workers = 10;
+      const perWorker = burstCount / workers;
+      await Promise.all(
+        Array.from({ length: workers }, async () => {
+          for (let i = 0; i < perWorker; i += 1) {
+            await db2.uow.run(async (repos) => {
+              await repos.realtimeEvents.append({
+                workspaceId: wksId,
+                projectId: null,
+                eventId: ids.next("evt"),
+                eventType: "workspace.settings.updated",
+                targetType: "workspace",
+                targetId: wksId,
+                payload: {},
+                occurredAt: now,
+                createdAt: now,
+              });
+            });
+          }
+        }),
+      );
+      server.realtimeHub.notify(wksId);
+
+      // Live SSE receives Tx2 plus all 550 burst events across multi-page batches without overflow/resync
+      await sse.stream.waitForFrame(
         (f) =>
           f.event === "change" &&
           (f.data as RealtimeChangeEventDto).taskId === task2Id,
         "live SSE receives Tx2 before Tx1 commits",
       );
-      const cursorAfterTx2 = (frameTx2.data as RealtimeChangeEventDto).cursor;
+      await waitFor(
+        () =>
+          sse.stream.frames.filter(
+            (f) =>
+              f.event === "change" &&
+              (f.data as RealtimeChangeEventDto).eventType ===
+                "workspace.settings.updated",
+          ).length === burstCount,
+        "live SSE drains all 550 committed events while xmin is pinned",
+        15_000,
+      );
+      expect(sse.stream.frames.some((f) => f.event === "resync")).toBe(false);
+      const lastBurstFrame = sse.stream.frames
+        .filter((f) => f.event === "change")
+        .at(-1)!;
+      const cursorAfterBurst = (lastBurstFrame.data as RealtimeChangeEventDto).cursor;
 
       // Now commit Tx1!
       resolveTx1Release();
       await tx1Promise;
       server.realtimeHub.notify(wksId);
 
-      // Both live stream AND fresh reconnect from cursorAfterTx2 must receive Tx1 without duplicating Tx2!
+      // Both live stream AND fresh reconnect from cursorAfterBurst must receive Tx1 without duplicating Tx2 or burst!
       await sse.stream.waitForFrame(
         (f) =>
           f.event === "change" &&
@@ -1347,13 +1388,13 @@ describe(`PR 12: SSE Realtime Web Sync & Commit-Order Visibility (${targetDb})`,
 
       const sseResume = await connectSseClient(
         `${server.baseUrl}/api/v1/workspaces/${wksId}/events`,
-        { jar: admin.jar, lastEventId: cursorAfterTx2 },
+        { jar: admin.jar, lastEventId: cursorAfterBurst },
       );
       await sseResume.stream.waitForFrame(
         (f) =>
           f.event === "change" &&
           (f.data as RealtimeChangeEventDto).taskId === task1Id,
-        "resumed SSE from cursorAfterTx2 also delivers Tx1",
+        "resumed SSE from cursorAfterBurst also delivers Tx1",
       );
       expect(
         sseResume.stream.frames.filter(
@@ -1601,4 +1642,242 @@ describe(`PR 12: SSE Realtime Web Sync & Commit-Order Visibility (${targetDb})`,
     await sse.stream.waitUntilClosed(3000);
     expect(Date.now() - t0).toBeLessThan(2000);
   }, 15_000);
+
+  it("emits task.removed when moved task is deleted before poll and syncs subtask deletes/moves on Web List", async () => {
+    const isolated = await createIsolatedDb();
+    const db = isolated.openClient();
+    await db.migrate();
+    const server = await startRealtimeTestServer(db, {
+      realtime: { pollIntervalMs: 40 },
+    });
+    const ids = createSystemIdGenerator();
+    const now = server.clock.now().toISOString();
+
+    const wksId = ids.next("wks");
+    await db.uow.run(async (repos) => {
+      await repos.workspaces.create({
+        id: wksId,
+        slug: "subtree-ws",
+        name: "Subtree WS",
+        createdAt: now,
+      });
+    });
+
+    const admin = await server.signUpUser("sub-admin@example.com", "Admin");
+    const member = await server.signUpUser("sub-member@example.com", "Member");
+    await db.uow.run(async (repos) => {
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: admin.userId,
+        role: "admin",
+        createdAt: now,
+      });
+      await repos.memberships.create({
+        id: ids.next("mbr"),
+        workspaceId: wksId,
+        userId: member.userId,
+        role: "member",
+        createdAt: now,
+      });
+    });
+
+    const projA = ((
+      await (
+        await server.apiRequest(`/api/v1/workspaces/${wksId}/projects`, {
+          method: "POST",
+          jar: admin.jar,
+          json: { name: "Source Shared", visibility: "workspace" },
+        })
+      ).json()
+    ) as ProjectResponse).project;
+    const projBPriv = ((
+      await (
+        await server.apiRequest(`/api/v1/workspaces/${wksId}/projects`, {
+          method: "POST",
+          jar: admin.jar,
+          json: { name: "Target Secret", visibility: "private" },
+        })
+      ).json()
+    ) as ProjectResponse).project;
+    const projCShared = ((
+      await (
+        await server.apiRequest(`/api/v1/workspaces/${wksId}/projects`, {
+          method: "POST",
+          jar: admin.jar,
+          json: { name: "Target Shared", visibility: "workspace" },
+        })
+      ).json()
+    ) as ProjectResponse).project;
+
+    // 1. Moved-to-private then deleted before SSE poll: both workspace-wide member
+    //    and `?projectId=projA` scoped admin receive sanitized `task.removed`.
+    const movedThenDeleted = ((
+      await (
+        await server.apiRequest(`/api/v1/projects/${projA.id}/tasks`, {
+          method: "POST",
+          jar: admin.jar,
+          json: { title: "Move Then Delete" },
+        })
+      ).json()
+    ) as TaskResponse).task;
+
+    const memberSseInit = await connectSseClient(
+      `${server.baseUrl}/api/v1/workspaces/${wksId}/events`,
+      { jar: member.jar },
+    );
+    const memberReady = await memberSseInit.stream.waitForFrame(
+      (f) => f.event === "ready",
+      "member initial ready",
+    );
+    const memberCursor = (memberReady.data as RealtimeReadyEventDto).cursor;
+    memberSseInit.stream.close();
+
+    const adminScopedInit = await connectSseClient(
+      `${server.baseUrl}/api/v1/workspaces/${wksId}/events?projectId=${projA.id}`,
+      { jar: admin.jar },
+    );
+    const adminReady = await adminScopedInit.stream.waitForFrame(
+      (f) => f.event === "ready",
+      "admin projA scoped ready",
+    );
+    const adminCursor = (adminReady.data as RealtimeReadyEventDto).cursor;
+    adminScopedInit.stream.close();
+
+    expect(
+      (
+        await server.apiRequest(`/api/v1/tasks/${movedThenDeleted.id}/move`, {
+          method: "POST",
+          jar: admin.jar,
+          json: { projectId: projBPriv.id },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await server.apiRequest(`/api/v1/tasks/${movedThenDeleted.id}`, {
+          method: "DELETE",
+          jar: admin.jar,
+        })
+      ).status,
+    ).toBe(200);
+
+    const memberResume = await connectSseClient(
+      `${server.baseUrl}/api/v1/workspaces/${wksId}/events`,
+      { jar: member.jar, lastEventId: memberCursor },
+    );
+    const memberRemoved = await memberResume.stream.waitForFrame(
+      (f) =>
+        f.event === "change" &&
+        (f.data as RealtimeChangeEventDto).eventType === "task.removed" &&
+        (f.data as RealtimeChangeEventDto).taskId === movedThenDeleted.id,
+      "member receives sanitized task.removed for moved+deleted task",
+    );
+    expect((memberRemoved.data as RealtimeChangeEventDto).projectId).toBe(projA.id);
+    expect(JSON.stringify(memberResume.stream.frames)).not.toContain(projBPriv.id);
+    memberResume.stream.close();
+
+    const adminScopedResume = await connectSseClient(
+      `${server.baseUrl}/api/v1/workspaces/${wksId}/events?projectId=${projA.id}`,
+      { jar: admin.jar, lastEventId: adminCursor },
+    );
+    const adminRemoved = await adminScopedResume.stream.waitForFrame(
+      (f) =>
+        f.event === "change" &&
+        (f.data as RealtimeChangeEventDto).eventType === "task.removed" &&
+        (f.data as RealtimeChangeEventDto).taskId === movedThenDeleted.id,
+      "scoped admin receives task.removed for projA",
+    );
+    expect((adminRemoved.data as RealtimeChangeEventDto).projectId).toBe(projA.id);
+    adminScopedResume.stream.close();
+
+    // 2. Web UI subtask synchronization: deleting or moving a parent updates/removes descendants
+    const moveParent = ((
+      await (
+        await server.apiRequest(`/api/v1/projects/${projA.id}/tasks`, {
+          method: "POST",
+          jar: admin.jar,
+          json: { title: "Move Parent" },
+        })
+      ).json()
+    ) as TaskResponse).task;
+    const moveChild = ((
+      await (
+        await server.apiRequest(`/api/v1/projects/${projA.id}/tasks`, {
+          method: "POST",
+          jar: admin.jar,
+          json: {
+            title: "Inherited Move Child",
+            parentTaskId: moveParent.id,
+            inheritParentProject: true,
+          },
+        })
+      ).json()
+    ) as TaskResponse).task;
+    const delParent = ((
+      await (
+        await server.apiRequest(`/api/v1/projects/${projA.id}/tasks`, {
+          method: "POST",
+          jar: admin.jar,
+          json: { title: "Delete Parent" },
+        })
+      ).json()
+    ) as TaskResponse).task;
+    const delChild = ((
+      await (
+        await server.apiRequest(`/api/v1/projects/${projA.id}/tasks`, {
+          method: "POST",
+          jar: admin.jar,
+          json: {
+            title: "Cascade Delete Child",
+            parentTaskId: delParent.id,
+            inheritParentProject: true,
+          },
+        })
+      ).json()
+    ) as TaskResponse).task;
+
+    const browser = await server.mountBrowserShell(member.jar);
+    await waitFor(
+      () =>
+        browser.doc.querySelector(`[data-task-row="${moveParent.id}"]`) !== null &&
+        browser.doc.querySelector(`[data-task-row="${moveChild.id}"]`) !== null &&
+        browser.doc.querySelector(`[data-task-row="${delParent.id}"]`) !== null &&
+        browser.doc.querySelector(`[data-task-row="${delChild.id}"]`) !== null,
+      "Web List shows both parents and subtasks",
+    );
+
+    // Move parent out to projCShared -> BOTH moveParent & moveChild disappear from Source Shared
+    expect(
+      (
+        await server.apiRequest(`/api/v1/tasks/${moveParent.id}/move`, {
+          method: "POST",
+          jar: admin.jar,
+          json: { projectId: projCShared.id },
+        })
+      ).status,
+    ).toBe(200);
+    await waitFor(
+      () =>
+        browser.doc.querySelector(`[data-task-row="${moveParent.id}"]`) === null &&
+        browser.doc.querySelector(`[data-task-row="${moveChild.id}"]`) === null,
+      "moving parent removes both parent and inherited subtask from Source Shared list",
+    );
+
+    // Delete parent -> BOTH delParent & delChild disappear from Web List
+    expect(
+      (
+        await server.apiRequest(`/api/v1/tasks/${delParent.id}`, {
+          method: "DELETE",
+          jar: admin.jar,
+        })
+      ).status,
+    ).toBe(200);
+    await waitFor(
+      () =>
+        browser.doc.querySelector(`[data-task-row="${delParent.id}"]`) === null &&
+        browser.doc.querySelector(`[data-task-row="${delChild.id}"]`) === null,
+      "deleting parent removes both parent and subtask from Web List",
+    );
+  }, 25_000);
 });

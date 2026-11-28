@@ -2,6 +2,7 @@ import type {
   MeResponse,
   ProjectDevSettingsResponse,
   ProjectDto,
+  RealtimeChangeEventDto,
   TaskDto,
   WorkspaceSettingsDto,
 } from "@prood/contracts";
@@ -137,7 +138,9 @@ export class ProodShellElement extends BaseElement {
   private renderTaskListFn: typeof renderTaskListView | null = null;
   private taskListLoadPromise: Promise<void> | null = null;
   private realtime: RealtimeController | null = null;
+  private rtMod: typeof import("./realtime.js") | null = null;
   private realtimeLoadPromise: Promise<void> | null = null;
+  private pendingRtEvents: RealtimeChangeEventDto[] | null = null;
   private liveNotice = "";
 
   connectedCallback(): void {
@@ -258,8 +261,10 @@ export class ProodShellElement extends BaseElement {
     if (!this.realtimeLoadPromise && typeof EventSource === "function") {
       this.realtimeLoadPromise = import("./realtime.js")
         .then((mod) => {
+          this.rtMod = mod;
           this.realtime = mod.createRealtimeController({
             onChange: (ev) => {
+              this.pendingRtEvents?.push(ev);
               const applied = mod.applyRealtimeChangeToTasks(
                 this.tasks,
                 this.activeProjectId,
@@ -278,6 +283,9 @@ export class ProodShellElement extends BaseElement {
                 this.render();
               } else if (ev.eventType.indexOf("task.") !== 0 && this.activeWorkspaceId) {
                 void this.loadWorkspaceData(this.activeWorkspaceId, true);
+              }
+              if (applied.needsReload && this.activeProjectId) {
+                void this.loadProjectData(this.activeProjectId);
               }
             },
             onResync: () => {
@@ -398,6 +406,7 @@ export class ProodShellElement extends BaseElement {
 
   private clearWorkspaceScopedData(): void {
     this.projectDataSeq += 1;
+    this.pendingRtEvents = null;
     this.activeProjectId = null;
     this.projects = [];
     this.workspaceSettings = null;
@@ -628,6 +637,7 @@ export class ProodShellElement extends BaseElement {
 
   private async loadProjectData(projectId: ProjectId): Promise<void> {
     const seq = ++this.projectDataSeq;
+    this.pendingRtEvents = [];
     this.taskLoadError = "";
     const project = this.projects.find((p) => p.id === projectId) ?? null;
     if (project && !project.statuses.some((s) => s.id === this.taskStatusDraft)) {
@@ -640,8 +650,25 @@ export class ProodShellElement extends BaseElement {
     ]);
     if (seq !== this.projectDataSeq || this.activeProjectId !== projectId) return;
 
+    const buffered = this.pendingRtEvents;
+    this.pendingRtEvents = null;
+    let shouldReload = false;
+
     if (tasksRes.ok) {
-      this.tasks = tasksRes.data.tasks;
+      if (this.rtMod && buffered && buffered.length > 0) {
+        const replayed = this.rtMod.replayRealtimeEventsOnSnapshot(
+          tasksRes.data.tasks,
+          projectId,
+          buffered,
+        );
+        this.tasks = replayed.tasks;
+        if (replayed.highlightedTaskId !== undefined) {
+          this.highlightedTaskId = replayed.highlightedTaskId;
+        }
+        shouldReload = replayed.needsReload;
+      } else {
+        this.tasks = tasksRes.data.tasks;
+      }
       this.taskLoadError = "";
     } else {
       this.tasks = [];
@@ -664,6 +691,9 @@ export class ProodShellElement extends BaseElement {
     }
     this.searchPalette?.syncLabels();
     this.render();
+    if (shouldReload) {
+      void this.loadProjectData(projectId);
+    }
   }
 
   private async selectWorkspace(workspaceId: WorkspaceId): Promise<void> {

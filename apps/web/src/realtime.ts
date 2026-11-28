@@ -9,6 +9,7 @@ import type {
 export interface RealtimeApplyResult {
   tasks: TaskDto[];
   changed: boolean;
+  needsReload?: boolean;
   highlightedTaskId?: TaskPublicId | null;
 }
 
@@ -20,9 +21,29 @@ function compareTasks(a: TaskDto, b: TaskDto): number {
   );
 }
 
+function removeTaskSubtree(tasks: readonly TaskDto[], rootId: TaskPublicId): TaskDto[] {
+  const removedIds = new Set<TaskPublicId>([rootId]);
+  let added = true;
+  while (added) {
+    added = false;
+    for (const item of tasks) {
+      if (
+        item.parentTaskId &&
+        removedIds.has(item.parentTaskId) &&
+        !removedIds.has(item.id)
+      ) {
+        removedIds.add(item.id);
+        added = true;
+      }
+    }
+  }
+  return tasks.filter((item) => !removedIds.has(item.id));
+}
+
 /**
  * Applies an incoming SSE task change event onto the currently rendered project's
- * task array without mutating the source array.
+ * task array without mutating the source array. Cascades parent deletions to any
+ * rendered descendants and flags `needsReload` on parent moves affecting the view.
  */
 export function applyRealtimeChangeToTasks(
   tasks: readonly TaskDto[],
@@ -38,7 +59,7 @@ export function applyRealtimeChangeToTasks(
     if (!targetId) {
       return { tasks: [...tasks], changed: false };
     }
-    const next = tasks.filter((item) => item.id !== targetId);
+    const next = removeTaskSubtree(tasks, targetId);
     return {
       tasks: next,
       changed: next.length !== tasks.length,
@@ -52,17 +73,33 @@ export function applyRealtimeChangeToTasks(
     event.eventType === "task.moved"
   ) {
     const incoming = event.task;
+    const isMove = event.eventType === "task.moved";
     if (!incoming) {
       return { tasks: [...tasks], changed: false };
     }
     const existingIndex = tasks.findIndex((item) => item.id === incoming.id);
+    const affectsSubtree =
+      isMove &&
+      (incoming.effectiveProjectId === activeProjectId ||
+        event.projectId === activeProjectId ||
+        event.fromProjectId === activeProjectId ||
+        existingIndex >= 0 ||
+        tasks.some((item) => item.parentTaskId === incoming.id));
+
     if (incoming.effectiveProjectId !== activeProjectId) {
       if (existingIndex === -1) {
-        return { tasks: [...tasks], changed: false };
+        return {
+          tasks: [...tasks],
+          changed: false,
+          ...(affectsSubtree ? { needsReload: true } : {}),
+        };
       }
       return {
-        tasks: tasks.filter((_, idx) => idx !== existingIndex),
+        tasks: isMove
+          ? removeTaskSubtree(tasks, incoming.id)
+          : tasks.filter((_, idx) => idx !== existingIndex),
         changed: true,
+        ...(affectsSubtree ? { needsReload: true } : {}),
       };
     }
 
@@ -74,10 +111,55 @@ export function applyRealtimeChangeToTasks(
       tasks: updated,
       changed: true,
       highlightedTaskId: incoming.id,
+      ...(affectsSubtree ? { needsReload: true } : {}),
     };
   }
 
   return { tasks: [...tasks], changed: false };
+}
+
+/**
+ * Replays buffered SSE events onto a freshly loaded REST task-list snapshot so
+ * concurrent SSE mutations that arrived while `listProjectTasks` was in flight
+ * are preserved instead of overwritten by stale snapshot rows.
+ */
+export function replayRealtimeEventsOnSnapshot(
+  snapshotTasks: readonly TaskDto[],
+  activeProjectId: ProjectId | null,
+  buffered: readonly RealtimeChangeEventDto[],
+): { tasks: TaskDto[]; needsReload: boolean; highlightedTaskId?: TaskPublicId | null } {
+  let current = [...snapshotTasks];
+  let needsReload = false;
+  let highlightedTaskId: TaskPublicId | null | undefined;
+
+  for (const event of buffered) {
+    if (event.task) {
+      const existing = current.find((item) => item.id === event.task!.id);
+      if (existing && existing.updatedAt > event.task.updatedAt) {
+        if (
+          event.eventType === "task.moved" &&
+          (event.projectId === activeProjectId || event.fromProjectId === activeProjectId)
+        ) {
+          needsReload = true;
+        }
+        continue;
+      }
+    }
+    const applied = applyRealtimeChangeToTasks(current, activeProjectId, event);
+    current = applied.tasks;
+    if (applied.needsReload) {
+      needsReload = true;
+    }
+    if (applied.highlightedTaskId !== undefined) {
+      highlightedTaskId = applied.highlightedTaskId;
+    }
+  }
+
+  return {
+    tasks: current,
+    needsReload,
+    ...(highlightedTaskId !== undefined ? { highlightedTaskId } : {}),
+  };
 }
 
 export interface RealtimeControllerOptions {

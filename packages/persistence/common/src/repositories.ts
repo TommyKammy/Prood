@@ -2501,46 +2501,40 @@ export function createKyselyRepositories(
           xmin: "0",
           xmax: "0",
           maxSeq,
-          visibleAtOrAboveXmin: [],
+          activeXips: [],
           retention,
         };
       }
 
       const snapRes = await runQuery(
         () =>
-          sql<{ xmin: string; xmax: string }>`
+          sql<{ xmin: string; xmax: string; active_xips: string[] | null }>`
+            WITH snap AS (
+              SELECT pg_current_snapshot() AS s
+            )
             SELECT
-              pg_snapshot_xmin(pg_current_snapshot())::text AS xmin,
-              pg_snapshot_xmax(pg_current_snapshot())::text AS xmax
+              pg_snapshot_xmin(s)::text AS xmin,
+              pg_snapshot_xmax(s)::text AS xmax,
+              COALESCE(
+                (SELECT array_agg(x::text ORDER BY x) FROM pg_snapshot_xip(s) AS x),
+                ARRAY[]::text[]
+              ) AS active_xips
+            FROM snap
           `.execute(executor),
         mapError,
         assertActive,
       );
       const xmin = snapRes.rows[0]!.xmin;
       const xmax = snapRes.rows[0]!.xmax;
-
-      const visibleRes = await runQuery(
-        () =>
-          sql<{ txid: string; seq: number | string }>`
-            SELECT txid::text AS txid, seq
-            FROM realtime_events
-            WHERE workspace_id = ${workspaceId}
-              AND txid >= CAST(${xmin} AS xid8)
-            ORDER BY txid ASC, seq ASC
-          `.execute(executor),
-        mapError,
-        assertActive,
-      );
+      const rawXips = snapRes.rows[0]?.active_xips;
+      const activeXips = Array.isArray(rawXips) ? rawXips.map(String) : [];
 
       return {
         driver,
         xmin,
         xmax,
         maxSeq,
-        visibleAtOrAboveXmin: visibleRes.rows.map((r) => ({
-          txid: String(r.txid),
-          seq: Number(r.seq),
-        })),
+        activeXips,
         retention,
       };
     },
@@ -2549,16 +2543,13 @@ export function createKyselyRepositories(
       snapshot: RealtimeSnapshotState;
       events: RealtimeEventRecord[];
     }> {
-      const snapshot = await realtimeEvents.readSnapshotState(input.workspaceId);
       const limit = Math.max(1, Math.min(500, Math.trunc(input.limit)));
-      const uniqueExcludes = Array.from(
-        new Set(input.excludeSeqs.map((n) => Math.trunc(n)).filter((n) => n > 0)),
-      );
 
       if (driver !== "postgres") {
+        const snapshot = await realtimeEvents.readSnapshotState(input.workspaceId);
         const res = await runQuery(
-          () => {
-            let query = executor
+          () =>
+            executor
               .selectFrom("realtime_events")
               .select([
                 "seq",
@@ -2574,63 +2565,151 @@ export function createKyselyRepositories(
                 "created_at",
               ])
               .where("workspace_id", "=", input.workspaceId)
-              .where("seq", ">", input.safeSeq);
-            if (uniqueExcludes.length > 0) {
-              query = query.where("seq", "not in", uniqueExcludes);
-            }
-            return query.orderBy("seq", "asc").limit(limit).execute();
-          },
+              .where("seq", ">", input.watermarkSeq)
+              .orderBy("seq", "asc")
+              .limit(limit)
+              .execute(),
           mapError,
           assertActive,
         );
         return { snapshot, events: res.map(toRealtimeEventRecord) };
       }
 
-      const excludeClause =
-        uniqueExcludes.length > 0
-          ? sql` AND seq NOT IN (${sql.join(uniqueExcludes.map((s) => sql`${s}`))})`
-          : sql``;
+      const retentionRow = await runQuery(
+        () =>
+          executor
+            .selectFrom("realtime_retention_state")
+            .select(["pruned_through_txid", "pruned_through_seq"])
+            .where("id", "=", 1)
+            .executeTakeFirst(),
+        mapError,
+        assertActive,
+      );
+      const retention = {
+        prunedThroughTxid: String(retentionRow?.pruned_through_txid ?? "0"),
+        prunedThroughSeq: Number(retentionRow?.pruned_through_seq ?? 0),
+      };
+
+      const pendingClauses = input.pendingTxids.map(
+        (entry) =>
+          sql`(e.txid = CAST(${entry.txid} AS xid8) AND e.seq > ${Math.max(0, Math.trunc(entry.afterSeq))})`,
+      );
+      const positionFilter =
+        pendingClauses.length > 0
+          ? sql`(
+              e.txid > CAST(${input.watermarkTxid} AS xid8)
+              OR (e.txid = CAST(${input.watermarkTxid} AS xid8) AND e.seq > ${Math.max(0, Math.trunc(input.watermarkSeq))})
+              OR ${sql.join(pendingClauses, sql` OR `)}
+            )`
+          : sql`(
+              e.txid > CAST(${input.watermarkTxid} AS xid8)
+              OR (e.txid = CAST(${input.watermarkTxid} AS xid8) AND e.seq > ${Math.max(0, Math.trunc(input.watermarkSeq))})
+            )`;
+
+      // Single-statement CTE guarantees `pg_current_snapshot()` (xmin, xmax, active_xips)
+      // and the visibility of `realtime_events` rows are evaluated on the same MVCC snapshot.
       const res = await runQuery(
         () =>
           sql<{
-            seq: number | string;
-            txid: string;
-            workspace_id: string;
+            xmin: string;
+            xmax: string;
+            active_xips: string[] | null;
+            max_seq: number | string;
+            seq: number | string | null;
+            txid: string | null;
+            workspace_id: string | null;
             project_id: string | null;
-            event_id: string;
-            event_type: string;
-            target_type: string;
+            event_id: string | null;
+            event_type: string | null;
+            target_type: string | null;
             target_id: string | null;
-            payload_json: string;
-            occurred_at: string;
-            created_at: string;
+            payload_json: string | null;
+            occurred_at: string | null;
+            created_at: string | null;
           }>`
+            WITH snap AS (
+              SELECT pg_current_snapshot() AS s
+            ),
+            meta AS (
+              SELECT
+                pg_snapshot_xmin(s)::text AS xmin,
+                pg_snapshot_xmax(s)::text AS xmax,
+                COALESCE(
+                  (SELECT array_agg(x::text ORDER BY x) FROM pg_snapshot_xip(s) AS x),
+                  ARRAY[]::text[]
+                ) AS active_xips,
+                COALESCE((SELECT MAX(seq) FROM realtime_events), 0) AS max_seq
+              FROM snap
+            ),
+            matched AS (
+              SELECT
+                e.seq,
+                e.txid::text AS txid,
+                e.workspace_id,
+                e.project_id,
+                e.event_id,
+                e.event_type,
+                e.target_type,
+                e.target_id,
+                e.payload_json,
+                e.occurred_at,
+                e.created_at
+              FROM realtime_events e
+              WHERE e.workspace_id = ${input.workspaceId}
+                AND ${positionFilter}
+              ORDER BY e.txid ASC, e.seq ASC
+              LIMIT ${limit}
+            )
             SELECT
-              seq,
-              txid::text AS txid,
-              workspace_id,
-              project_id,
-              event_id,
-              event_type,
-              target_type,
-              target_id,
-              payload_json,
-              occurred_at,
-              created_at
-            FROM realtime_events
-            WHERE workspace_id = ${input.workspaceId}
-              AND (
-                txid > CAST(${input.safeTxid} AS xid8)
-                OR (txid = CAST(${input.safeTxid} AS xid8) AND seq > ${input.safeSeq})
-              )
-              ${excludeClause}
-            ORDER BY txid ASC, seq ASC
-            LIMIT ${limit}
+              meta.xmin,
+              meta.xmax,
+              meta.active_xips,
+              meta.max_seq,
+              matched.seq,
+              matched.txid,
+              matched.workspace_id,
+              matched.project_id,
+              matched.event_id,
+              matched.event_type,
+              matched.target_type,
+              matched.target_id,
+              matched.payload_json,
+              matched.occurred_at,
+              matched.created_at
+            FROM meta
+            LEFT JOIN matched ON TRUE
+            ORDER BY CAST(matched.txid AS xid8) ASC NULLS LAST, matched.seq ASC NULLS LAST
           `.execute(executor),
         mapError,
         assertActive,
       );
-      return { snapshot, events: res.rows.map(toRealtimeEventRecord) };
+
+      const first = res.rows[0]!;
+      const rawXips = first.active_xips;
+      const snapshot: RealtimeSnapshotState = {
+        driver,
+        xmin: String(first.xmin),
+        xmax: String(first.xmax),
+        maxSeq: Math.max(Number(first.max_seq ?? 0), retention.prunedThroughSeq),
+        activeXips: Array.isArray(rawXips) ? rawXips.map(String) : [],
+        retention,
+      };
+      const events = res.rows
+        .filter(
+          (row): row is typeof row & {
+            seq: number | string;
+            txid: string;
+            workspace_id: string;
+            event_id: string;
+            event_type: string;
+            target_type: string;
+            payload_json: string;
+            occurred_at: string;
+            created_at: string;
+          } => row.seq !== null,
+        )
+        .map(toRealtimeEventRecord);
+      return { snapshot, events };
     },
 
     async prune(input): Promise<{

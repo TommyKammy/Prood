@@ -1912,5 +1912,199 @@ describe("@prood/web async race regressions", () => {
 
     expect(doc.querySelector<HTMLInputElement>("[data-ws-dev-toggle]")!.checked).toBe(true);
   });
+
+  it("preserves SSE task.started updates that arrive while listProjectTasks is in flight", async () => {
+    const userId = generateEntityId("usr", 1_795_000_000_000, new Uint8Array(10).fill(11));
+    const wksA = generateEntityId("wks", 1_795_000_000_000, new Uint8Array(10).fill(12));
+    const projA = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(13));
+    const projB = generateEntityId("prj", 1_795_000_000_000, new Uint8Array(10).fill(14));
+    const statusA = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(15));
+    const statusTodoB = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(16));
+    const statusProgB = generateEntityId("sts", 1_795_000_000_000, new Uint8Array(10).fill(17));
+    const evtId = generateEntityId("evt", 1_795_000_000_000, new Uint8Array(10).fill(18));
+
+    const projectA = makeProject(wksA, projA, statusA, "Alpha");
+    const projectB: ProjectDto = {
+      ...makeProject(wksA, projB, statusTodoB, "Beta"),
+      statuses: [
+        { id: statusTodoB, projectId: projB, name: "To Do", category: "todo", position: 0 },
+        {
+          id: statusProgB,
+          projectId: projB,
+          name: "In Progress",
+          category: "in_progress",
+          position: 1,
+        },
+      ],
+    };
+    const taskA = makeTask(wksA, projA, statusA, 20, "Task A");
+    const staleTaskB = makeTask(wksA, projB, statusTodoB, 21, "Race Target");
+
+    const NativeEventTarget = globalThis.EventTarget;
+    const NativeMessageEvent = globalThis.MessageEvent;
+    const esInstances: Array<{
+      emit(eventName: string, payload: unknown): void;
+      close(): void;
+    }> = [];
+    class MockEventSource extends NativeEventTarget {
+      readyState = 1;
+      constructor(public url: string) {
+        super();
+        esInstances.push(this);
+      }
+      emit(eventName: string, payload: unknown) {
+        this.dispatchEvent(
+          new NativeMessageEvent(eventName, { data: JSON.stringify(payload) }),
+        );
+      }
+      close() {
+        this.readyState = 2;
+      }
+    }
+
+    let resolveBetaTasks: ((res: Response) => void) | null = null;
+
+    vi.resetModules();
+    const win = new Window({ url: "http://127.0.0.1:3000/" });
+    const doc = win.document as unknown as Document;
+    vi.stubGlobal("window", win);
+    vi.stubGlobal("document", doc);
+    vi.stubGlobal("HTMLElement", win.HTMLElement);
+    vi.stubGlobal("HTMLInputElement", win.HTMLInputElement);
+    vi.stubGlobal("HTMLTextAreaElement", win.HTMLTextAreaElement);
+    vi.stubGlobal("HTMLSelectElement", win.HTMLSelectElement);
+    vi.stubGlobal("HTMLDialogElement", win.HTMLDialogElement);
+    vi.stubGlobal("Element", win.Element);
+    vi.stubGlobal("Node", win.Node);
+    vi.stubGlobal("Event", win.Event);
+    vi.stubGlobal("KeyboardEvent", win.KeyboardEvent);
+    vi.stubGlobal("CustomEvent", win.CustomEvent);
+    vi.stubGlobal("customElements", win.customElements);
+    vi.stubGlobal("EventSource", MockEventSource);
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      cb(0);
+      return 1;
+    });
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const raw = typeof input === "string" ? input : input.toString();
+      const path =
+        new URL(raw, "http://127.0.0.1:3000").pathname +
+        new URL(raw, "http://127.0.0.1:3000").search;
+      if (path === "/api/v1/me") {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          user: { id: userId, email: "alice@example.com", displayName: "Alice" },
+          memberships: [
+            {
+              membershipId: makeMembershipId(101),
+              workspaceId: wksA,
+              workspaceSlug: "alpha",
+              workspaceName: "Alpha",
+              role: "admin",
+            },
+          ],
+        });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/projects`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, projects: [projectA, projectB] });
+      }
+      if (path === `/api/v1/workspaces/${wksA}/settings`) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          settings: {
+            workspaceId: wksA,
+            defaultLocale: "en",
+            devProjectsEnabled: false,
+            updatedAt: "2026-11-28T12:00:00.000Z",
+          },
+        });
+      }
+      if (path === `/api/v1/projects/${projA}/tasks`) {
+        return jsonResponse({ contractVersion: CONTRACT_VERSION, tasks: [taskA] });
+      }
+      if (path === `/api/v1/projects/${projB}/tasks`) {
+        return new Promise<Response>((resolve) => {
+          resolveBetaTasks = resolve;
+        });
+      }
+      if (path.endsWith("/dev-settings")) {
+        return jsonResponse({
+          contractVersion: CONTRACT_VERSION,
+          allowed: false,
+          canManage: true,
+          dev: null,
+          statuses: projectA.statuses,
+        } satisfies ProjectDevSettingsResponse);
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    });
+
+    const web = await import("@prood/web");
+    const shell = doc.createElement("prood-shell") as unknown as InstanceType<
+      typeof web.ProodShellElement
+    >;
+    doc.body.appendChild(shell as unknown as Node);
+
+    await waitForCondition(
+      () =>
+        doc.querySelector(`[data-task-row="${taskA.id}"]`) !== null &&
+        esInstances.length === 1,
+      "initial shell and SSE controller ready",
+    );
+
+    esInstances[0]!.emit("ready", {
+      contractVersion: CONTRACT_VERSION,
+      type: "ready",
+      workspaceId: wksA,
+      projectId: null,
+      cursor: `v1:sq:${wksA}:1`,
+    });
+
+    // Switch to Project Beta while its REST /tasks call remains pending
+    doc.querySelector<HTMLButtonElement>(`[data-project-id="${projB}"]`)!.click();
+    await waitForCondition(
+      () => resolveBetaTasks !== null,
+      "Project Beta task load in flight",
+    );
+
+    // Emit SSE task.started for staleTaskB BEFORE the stale REST response resolves
+    esInstances[0]!.emit("change", {
+      contractVersion: CONTRACT_VERSION,
+      type: "change",
+      eventId: evtId,
+      eventType: "task.started",
+      workspaceId: wksA,
+      projectId: projB,
+      taskId: staleTaskB.id,
+      task: {
+        ...staleTaskB,
+        statusId: statusProgB,
+        assigneeId: userId,
+        assigneeDisplayName: "Alice",
+        updatedAt: "2026-11-28T12:05:00.000Z",
+      },
+      occurredAt: "2026-11-28T12:05:00.000Z",
+      cursor: `v1:sq:${wksA}:2`,
+    });
+
+    // Delayed stale REST response resolves with old unstarted state -> SSE change must win!
+    resolveBetaTasks!(
+      jsonResponse({ contractVersion: CONTRACT_VERSION, tasks: [staleTaskB] }),
+    );
+    await waitForCondition(
+      () => doc.querySelector(`[data-task-row="${staleTaskB.id}"]`) !== null,
+      "Project Beta task rendered",
+    );
+
+    const row = doc.querySelector(`[data-task-row="${staleTaskB.id}"]`)!;
+    expect(
+      row.querySelector("[data-task-status]")?.getAttribute("data-task-status"),
+    ).toBe(statusProgB);
+    expect(
+      row.querySelector("[data-task-assignee]")?.getAttribute("data-task-assignee"),
+    ).toBe(userId);
+    expect(row.querySelector("[data-task-assignee]")?.textContent?.trim()).toBe("Alice");
+    shell.remove();
+  });
 });
 

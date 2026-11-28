@@ -5,20 +5,20 @@ import type {
   RealtimeSnapshotState,
 } from "./persistence.js";
 
-export interface SeenRealtimeEntry {
+export interface PendingRealtimeTx {
   txid: bigint;
-  seq: number;
+  afterSeq: number;
 }
 
 export interface ParsedRealtimeCursor {
   driver: DbDriverKind;
   workspaceId: WorkspaceId;
-  safeTxid: bigint;
-  safeSeq: number;
-  seen: SeenRealtimeEntry[];
+  watermarkTxid: bigint;
+  watermarkSeq: number;
+  pending: PendingRealtimeTx[];
 }
 
-const MAX_SEEN_ENTRIES = 512;
+export const MAX_PENDING_XIPS = 512;
 const NON_NEG_INT_REGEX = /^(?:0|[1-9]\d*)$/;
 
 function comparePos(aTxid: bigint, aSeq: number, bTxid: bigint, bSeq: number): number {
@@ -28,21 +28,23 @@ function comparePos(aTxid: bigint, aSeq: number, bTxid: bigint, bSeq: number): n
   return aSeq - bSeq;
 }
 
-function normalizeSeen(
-  entries: readonly SeenRealtimeEntry[],
-  safeTxid: bigint,
-  safeSeq: number,
-): SeenRealtimeEntry[] {
-  const bySeq = new Map<number, SeenRealtimeEntry>();
+function normalizePending(
+  entries: readonly PendingRealtimeTx[],
+  watermarkTxid: bigint,
+): PendingRealtimeTx[] {
+  const byTxid = new Map<bigint, number>();
   for (const entry of entries) {
-    if (comparePos(entry.txid, entry.seq, safeTxid, safeSeq) <= 0) {
+    if (entry.txid >= watermarkTxid) {
       continue;
     }
-    bySeq.set(entry.seq, entry);
+    const prev = byTxid.get(entry.txid) ?? 0;
+    if (entry.afterSeq > prev || !byTxid.has(entry.txid)) {
+      byTxid.set(entry.txid, Math.max(0, entry.afterSeq));
+    }
   }
-  return Array.from(bySeq.values())
-    .sort((a, b) => comparePos(a.txid, a.seq, b.txid, b.seq))
-    .slice(0, MAX_SEEN_ENTRIES);
+  return Array.from(byTxid.entries())
+    .map(([txid, afterSeq]) => ({ txid, afterSeq }))
+    .sort((a, b) => (a.txid < b.txid ? -1 : a.txid > b.txid ? 1 : 0));
 }
 
 /**
@@ -50,16 +52,16 @@ function normalizeSeen(
  */
 export function encodeRealtimeCursor(cursor: ParsedRealtimeCursor): string {
   if (cursor.driver === "sqlite") {
-    return `v1:sq:${cursor.workspaceId}:${cursor.safeSeq}`;
+    return `v1:sq:${cursor.workspaceId}:${cursor.watermarkSeq}`;
   }
-  const base = `v1:pg:${cursor.workspaceId}:${cursor.safeTxid.toString()}:${cursor.safeSeq}`;
-  if (cursor.seen.length === 0) {
+  const base = `v1:pg:${cursor.workspaceId}:${cursor.watermarkTxid.toString()}:${cursor.watermarkSeq}`;
+  if (cursor.pending.length === 0) {
     return base;
   }
-  const encodedSeen = cursor.seen
-    .map((entry) => `${entry.txid.toString()}.${entry.seq}`)
+  const encodedPending = cursor.pending
+    .map((entry) => `${entry.txid.toString()}.${entry.afterSeq}`)
     .join(",");
-  return `${base}:${encodedSeen}`;
+  return `${base}:${encodedPending}`;
 }
 
 /**
@@ -81,7 +83,11 @@ export function parseRealtimeCursor(
 
   const tag = parts[1];
   const workspaceId = parts[2];
-  if (!workspaceId || !isValidEntityId("wks", workspaceId) || workspaceId !== expectedWorkspaceId) {
+  if (
+    !workspaceId ||
+    !isValidEntityId("wks", workspaceId) ||
+    workspaceId !== expectedWorkspaceId
+  ) {
     return null;
   }
 
@@ -93,16 +99,16 @@ export function parseRealtimeCursor(
     if (!NON_NEG_INT_REGEX.test(seqStr)) {
       return null;
     }
-    const safeSeq = Number(seqStr);
-    if (!Number.isSafeInteger(safeSeq) || safeSeq < 0) {
+    const watermarkSeq = Number(seqStr);
+    if (!Number.isSafeInteger(watermarkSeq) || watermarkSeq < 0) {
       return null;
     }
     return {
       driver: "sqlite",
       workspaceId,
-      safeTxid: 0n,
-      safeSeq,
-      seen: [],
+      watermarkTxid: 0n,
+      watermarkSeq,
+      pending: [],
     };
   }
 
@@ -115,19 +121,19 @@ export function parseRealtimeCursor(
     if (!NON_NEG_INT_REGEX.test(txidStr) || !NON_NEG_INT_REGEX.test(seqStr)) {
       return null;
     }
-    const safeTxid = BigInt(txidStr);
-    const safeSeq = Number(seqStr);
-    if (!Number.isSafeInteger(safeSeq) || safeSeq < 0) {
+    const watermarkTxid = BigInt(txidStr);
+    const watermarkSeq = Number(seqStr);
+    if (!Number.isSafeInteger(watermarkSeq) || watermarkSeq < 0) {
       return null;
     }
 
-    const seen: SeenRealtimeEntry[] = [];
+    const pending: PendingRealtimeTx[] = [];
     if (parts.length === 6) {
       if (!parts[5]) {
         return null;
       }
       const tokens = parts[5].split(",");
-      if (tokens.length > MAX_SEEN_ENTRIES) {
+      if (tokens.length > MAX_PENDING_XIPS) {
         return null;
       }
       for (const token of tokens) {
@@ -136,24 +142,28 @@ export function parseRealtimeCursor(
           return null;
         }
         const entryTx = token.slice(0, dotIdx);
-        const entrySeqStr = token.slice(dotIdx + 1);
-        if (!NON_NEG_INT_REGEX.test(entryTx) || !NON_NEG_INT_REGEX.test(entrySeqStr)) {
+        const afterSeqStr = token.slice(dotIdx + 1);
+        if (!NON_NEG_INT_REGEX.test(entryTx) || !NON_NEG_INT_REGEX.test(afterSeqStr)) {
           return null;
         }
-        const entrySeq = Number(entrySeqStr);
-        if (!Number.isSafeInteger(entrySeq) || entrySeq <= 0) {
+        const afterSeq = Number(afterSeqStr);
+        if (!Number.isSafeInteger(afterSeq) || afterSeq < 0) {
           return null;
         }
-        seen.push({ txid: BigInt(entryTx), seq: entrySeq });
+        pending.push({ txid: BigInt(entryTx), afterSeq });
       }
     }
 
+    const normalized = normalizePending(pending, watermarkTxid);
+    if (normalized.length > MAX_PENDING_XIPS) {
+      return null;
+    }
     return {
       driver: "postgres",
       workspaceId,
-      safeTxid,
-      safeSeq,
-      seen: normalizeSeen(seen, safeTxid, safeSeq),
+      watermarkTxid,
+      watermarkSeq,
+      pending: normalized,
     };
   }
 
@@ -162,9 +172,9 @@ export function parseRealtimeCursor(
 
 /**
  * Builds an initial snapshot-safe cursor at subscription open or full resync.
- * On PostgreSQL, transactions with `txid >= xmin` that already committed are recorded
- * in `seen` so concurrent uncommitted transactions with smaller txids are still
- * delivered once they commit.
+ * On PostgreSQL, `watermarkTxid` starts at `xmax` and only in-progress active
+ * transaction IDs (`pg_snapshot_xip`) are retained in `pending`. If active
+ * transactions exceed `MAX_PENDING_XIPS`, falls back safely to `(xmin, 0, [])`.
  */
 export function buildInitialCursor(
   workspaceId: WorkspaceId,
@@ -174,32 +184,37 @@ export function buildInitialCursor(
     return {
       driver: "sqlite",
       workspaceId,
-      safeTxid: 0n,
-      safeSeq: snapshot.maxSeq,
-      seen: [],
+      watermarkTxid: 0n,
+      watermarkSeq: snapshot.maxSeq,
+      pending: [],
     };
   }
-  const safeTxid = BigInt(snapshot.xmin);
-  const seen = normalizeSeen(
-    snapshot.visibleAtOrAboveXmin.map((entry) => ({
-      txid: BigInt(entry.txid),
-      seq: entry.seq,
-    })),
-    safeTxid,
-    0,
+  const xmax = BigInt(snapshot.xmax);
+  const rawPending = normalizePending(
+    snapshot.activeXips.map((txid) => ({ txid: BigInt(txid), afterSeq: 0 })),
+    xmax,
   );
+  if (rawPending.length > MAX_PENDING_XIPS) {
+    return {
+      driver: "postgres",
+      workspaceId,
+      watermarkTxid: BigInt(snapshot.xmin),
+      watermarkSeq: 0,
+      pending: [],
+    };
+  }
   return {
     driver: "postgres",
     workspaceId,
-    safeTxid,
-    safeSeq: 0,
-    seen,
+    watermarkTxid: xmax,
+    watermarkSeq: 0,
+    pending: rawPending,
   };
 }
 
 /**
- * Returns true if the cursor points before pruned retention history or ahead of
- * the current snapshot horizon.
+ * Returns true if the cursor points before pruned retention history, ahead of
+ * the current snapshot horizon, or exceeds pending xip capacity.
  */
 export function isCursorExpired(
   cursor: ParsedRealtimeCursor,
@@ -207,35 +222,48 @@ export function isCursorExpired(
 ): boolean {
   if (cursor.driver === "sqlite") {
     const horizonSeq = Math.max(snapshot.maxSeq, snapshot.retention.prunedThroughSeq);
-    if (cursor.safeSeq > horizonSeq) {
+    if (cursor.watermarkSeq > horizonSeq) {
       return true;
     }
     if (
       snapshot.retention.prunedThroughSeq > 0 &&
-      cursor.safeSeq < snapshot.retention.prunedThroughSeq
+      cursor.watermarkSeq < snapshot.retention.prunedThroughSeq
     ) {
       return true;
     }
     return false;
   }
 
-  const xmax = BigInt(snapshot.xmax);
-  if (cursor.safeTxid > xmax) {
+  if (cursor.pending.length > MAX_PENDING_XIPS) {
     return true;
   }
-  for (const entry of cursor.seen) {
+
+  const xmax = BigInt(snapshot.xmax);
+  if (cursor.watermarkTxid > xmax) {
+    return true;
+  }
+  for (const entry of cursor.pending) {
     if (entry.txid > xmax) {
       return true;
     }
   }
+
   const prunedTxid = BigInt(snapshot.retention.prunedThroughTxid);
   const prunedSeq = snapshot.retention.prunedThroughSeq;
-  if (
-    prunedTxid > 0n &&
-    comparePos(cursor.safeTxid, cursor.safeSeq, prunedTxid, prunedSeq) < 0
-  ) {
-    return true;
+  if (prunedTxid > 0n) {
+    let earliestTxid = cursor.watermarkTxid;
+    let earliestSeq = cursor.watermarkSeq;
+    for (const entry of cursor.pending) {
+      if (comparePos(entry.txid, entry.afterSeq, earliestTxid, earliestSeq) < 0) {
+        earliestTxid = entry.txid;
+        earliestSeq = entry.afterSeq;
+      }
+    }
+    if (comparePos(earliestTxid, earliestSeq, prunedTxid, prunedSeq) < 0) {
+      return true;
+    }
   }
+
   return false;
 }
 
@@ -251,96 +279,121 @@ export function stepRealtimeCursorForEvent(
   if (cursor.driver === "sqlite") {
     return {
       ...cursor,
-      safeSeq: Math.max(cursor.safeSeq, event.seq),
-      seen: [],
+      watermarkSeq: Math.max(cursor.watermarkSeq, event.seq),
+      pending: [],
     };
   }
 
-  const xmin = BigInt(snapshot.xmin);
   const evTxid = BigInt(event.txid);
-  if (
-    evTxid < xmin &&
-    comparePos(evTxid, event.seq, cursor.safeTxid, cursor.safeSeq) > 0
-  ) {
+  const activeSet = new Set(snapshot.activeXips.map((x) => BigInt(x)));
+
+  if (evTxid < cursor.watermarkTxid) {
+    // Drop non-active pending entries earlier than `evTxid` because their
+    // committed rows would already have been ordered ahead of `evTxid`.
+    const retained = cursor.pending.filter(
+      (entry) =>
+        entry.txid === evTxid ||
+        entry.txid > evTxid ||
+        activeSet.has(entry.txid),
+    );
+    const nextPending = retained.some((e) => e.txid === evTxid)
+      ? retained.map((e) =>
+          e.txid === evTxid
+            ? { txid: evTxid, afterSeq: Math.max(e.afterSeq, event.seq) }
+            : e,
+        )
+      : [...retained, { txid: evTxid, afterSeq: event.seq }];
     return {
       driver: "postgres",
       workspaceId: cursor.workspaceId,
-      safeTxid: evTxid,
-      safeSeq: event.seq,
-      seen: normalizeSeen(cursor.seen, evTxid, event.seq),
+      watermarkTxid: cursor.watermarkTxid,
+      watermarkSeq: cursor.watermarkSeq,
+      pending: normalizePending(nextPending, cursor.watermarkTxid),
     };
   }
 
+  if (evTxid === cursor.watermarkTxid) {
+    const nextWatermarkSeq = Math.max(cursor.watermarkSeq, event.seq);
+    const retained = cursor.pending.filter((entry) => activeSet.has(entry.txid));
+    return {
+      driver: "postgres",
+      workspaceId: cursor.workspaceId,
+      watermarkTxid: cursor.watermarkTxid,
+      watermarkSeq: nextWatermarkSeq,
+      pending: normalizePending(retained, cursor.watermarkTxid),
+    };
+  }
+
+  // `evTxid > cursor.watermarkTxid`: any transaction `< evTxid` not in `activeSet`
+  // has either already had all committed rows read before this event or rolled back.
+  const crossedActive: PendingRealtimeTx[] = [];
+  for (const xip of activeSet) {
+    if (xip >= cursor.watermarkTxid && xip < evTxid) {
+      crossedActive.push({ txid: xip, afterSeq: 0 });
+    }
+  }
+  const prevActive = cursor.pending.filter((entry) => activeSet.has(entry.txid));
   return {
     driver: "postgres",
     workspaceId: cursor.workspaceId,
-    safeTxid: cursor.safeTxid,
-    safeSeq: cursor.safeSeq,
-    seen: normalizeSeen(
-      [...cursor.seen, { txid: evTxid, seq: event.seq }],
-      cursor.safeTxid,
-      cursor.safeSeq,
-    ),
+    watermarkTxid: evTxid,
+    watermarkSeq: event.seq,
+    pending: normalizePending([...prevActive, ...crossedActive], evTxid),
   };
 }
 
 /**
  * Advances the subscription's polling cursor after processing a batch, promoting
- * the watermark to `xmin` when all visible rows below `xmin` have been drained.
+ * the watermark to `xmax` when all visible rows below `xmax` have been drained.
+ * Reports `overflow: true` if concurrent uncommitted transactions exceed
+ * `MAX_PENDING_XIPS` so callers can trigger an explicit resync instead of truncating.
  */
 export function advanceRealtimeCursor(
   cursor: ParsedRealtimeCursor,
   batch: readonly RealtimeEventRecord[],
   snapshot: RealtimeSnapshotState,
   limit: number,
-): ParsedRealtimeCursor {
-  if (cursor.driver === "sqlite") {
-    if (batch.length === 0) {
-      return cursor;
+): { cursor: ParsedRealtimeCursor; overflow: boolean } {
+  let current = cursor;
+  for (const ev of batch) {
+    current = stepRealtimeCursorForEvent(current, ev, snapshot);
+  }
+
+  if (current.driver === "sqlite") {
+    return { cursor: current, overflow: false };
+  }
+
+  if (batch.length < limit) {
+    const xmax = BigInt(snapshot.xmax);
+    const nextWatermarkTxid = xmax > current.watermarkTxid ? xmax : current.watermarkTxid;
+    const nextWatermarkSeq =
+      nextWatermarkTxid === current.watermarkTxid ? current.watermarkSeq : 0;
+
+    const existingByTx = new Map(current.pending.map((p) => [p.txid, p.afterSeq]));
+    const nextPending: PendingRealtimeTx[] = [];
+    for (const rawXip of snapshot.activeXips) {
+      const xip = BigInt(rawXip);
+      if (xip < nextWatermarkTxid) {
+        const preservedAfter =
+          xip < current.watermarkTxid ? (existingByTx.get(xip) ?? 0) : 0;
+        nextPending.push({ txid: xip, afterSeq: preservedAfter });
+      }
     }
+    const normalized = normalizePending(nextPending, nextWatermarkTxid);
     return {
-      driver: "sqlite",
-      workspaceId: cursor.workspaceId,
-      safeTxid: 0n,
-      safeSeq: Math.max(cursor.safeSeq, batch[batch.length - 1]!.seq),
-      seen: [],
+      cursor: {
+        driver: "postgres",
+        workspaceId: current.workspaceId,
+        watermarkTxid: nextWatermarkTxid,
+        watermarkSeq: nextWatermarkSeq,
+        pending: normalized,
+      },
+      overflow: normalized.length > MAX_PENDING_XIPS,
     };
   }
 
-  const xmin = BigInt(snapshot.xmin);
-  if (batch.length >= limit) {
-    const last = batch[batch.length - 1]!;
-    const lastTxid = BigInt(last.txid);
-    if (
-      lastTxid < xmin &&
-      comparePos(lastTxid, last.seq, cursor.safeTxid, cursor.safeSeq) > 0
-    ) {
-      return {
-        driver: "postgres",
-        workspaceId: cursor.workspaceId,
-        safeTxid: lastTxid,
-        safeSeq: last.seq,
-        seen: normalizeSeen(cursor.seen, lastTxid, last.seq),
-      };
-    }
-  }
-
-  let nextSafeTxid = cursor.safeTxid;
-  let nextSafeSeq = cursor.safeSeq;
-  if (xmin > cursor.safeTxid) {
-    nextSafeTxid = xmin;
-    nextSafeSeq = 0;
-  }
-
-  const combinedSeen = [
-    ...cursor.seen,
-    ...batch.map((ev) => ({ txid: BigInt(ev.txid), seq: ev.seq })),
-  ];
   return {
-    driver: "postgres",
-    workspaceId: cursor.workspaceId,
-    safeTxid: nextSafeTxid,
-    safeSeq: nextSafeSeq,
-    seen: normalizeSeen(combinedSeen, nextSafeTxid, nextSafeSeq),
+    cursor: current,
+    overflow: current.pending.length > MAX_PENDING_XIPS,
   };
 }

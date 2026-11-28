@@ -25,6 +25,7 @@ import {
   buildInitialCursor,
   encodeRealtimeCursor,
   isCursorExpired,
+  MAX_PENDING_XIPS,
   parseRealtimeCursor,
   stepRealtimeCursorForEvent,
   type ParsedRealtimeCursor,
@@ -367,9 +368,12 @@ export function createRealtimeUseCases(deps: RealtimeUseCaseDeps) {
 
         const { snapshot, events } = await repos.realtimeEvents.listAfterPosition({
           workspaceId,
-          safeTxid: parsedCursor.safeTxid.toString(),
-          safeSeq: parsedCursor.safeSeq,
-          excludeSeqs: parsedCursor.seen.map((entry) => entry.seq),
+          watermarkTxid: parsedCursor.watermarkTxid.toString(),
+          watermarkSeq: parsedCursor.watermarkSeq,
+          pendingTxids: parsedCursor.pending.map((entry) => ({
+            txid: entry.txid.toString(),
+            afterSeq: entry.afterSeq,
+          })),
           limit,
         });
 
@@ -388,6 +392,15 @@ export function createRealtimeUseCases(deps: RealtimeUseCaseDeps) {
 
         for (const ev of events) {
           runningCursor = stepRealtimeCursorForEvent(runningCursor, ev, snapshot);
+          if (runningCursor.pending.length > MAX_PENDING_XIPS) {
+            const fresh = buildInitialCursor(workspaceId, snapshot);
+            return {
+              status: "resync",
+              reason: "cursor_expired",
+              cursor: encodeRealtimeCursor(fresh),
+              parsedCursor: fresh,
+            };
+          }
           const itemCursor = encodeRealtimeCursor(runningCursor);
 
           if (ev.eventType === "workspace.settings.updated") {
@@ -476,8 +489,29 @@ export function createRealtimeUseCases(deps: RealtimeUseCaseDeps) {
                 : null;
 
             if (!task || task.workspaceId !== workspaceId) {
-              // If the task was subsequently deleted before streaming, check if subscriber
-              // can still read source/event project so we only drop safely without leaking.
+              // If a moved task was subsequently deleted before streaming, authorize
+              // against its `fromProjectId` so readable source projects still remove it
+              // without disclosing anything about an inaccessible target project.
+              if (ev.eventType === "task.moved" && rawFromProjectId) {
+                const fromAccess = await getProjectAccess(rawFromProjectId);
+                if (
+                  fromAccess.readable &&
+                  fromAccess.project &&
+                  (!requestedProjectId || fromAccess.project.id === requestedProjectId)
+                ) {
+                  items.push({
+                    contractVersion: CONTRACT_VERSION,
+                    type: "change",
+                    eventId: ev.eventId,
+                    eventType: "task.removed",
+                    workspaceId,
+                    projectId: fromAccess.project.id,
+                    taskId,
+                    occurredAt: ev.occurredAt,
+                    cursor: itemCursor,
+                  });
+                }
+              }
               continue;
             }
 
@@ -555,12 +589,21 @@ export function createRealtimeUseCases(deps: RealtimeUseCaseDeps) {
           }
         }
 
-        const nextCursor = advanceRealtimeCursor(parsedCursor, events, snapshot, limit);
+        const advanced = advanceRealtimeCursor(parsedCursor, events, snapshot, limit);
+        if (advanced.overflow) {
+          const fresh = buildInitialCursor(workspaceId, snapshot);
+          return {
+            status: "resync",
+            reason: "cursor_expired",
+            cursor: encodeRealtimeCursor(fresh),
+            parsedCursor: fresh,
+          };
+        }
         return {
           status: "ok",
           items,
-          nextCursor,
-          nextCursorEncoded: encodeRealtimeCursor(nextCursor),
+          nextCursor: advanced.cursor,
+          nextCursorEncoded: encodeRealtimeCursor(advanced.cursor),
           hasMore: events.length === limit,
         };
       });
